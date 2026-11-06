@@ -64,8 +64,9 @@ def check_sample(record):
         if fields.get('ActiveState') != 'active' or fields.get('Result') != 'success':
             raise ValueError('a benchmark service is not healthy')
         services[fields['Id']] = int(fields['NRestarts'])
-    if len(services) != 5:
-        raise ValueError('expected five benchmark services')
+    expected_services = 4 if (DEPLOY / 'external-maas-db.env').is_file() else 5
+    if len(services) != expected_services:
+        raise ValueError(f'expected {expected_services} benchmark services')
     return services
 
 

@@ -4,17 +4,19 @@ import argparse
 import copy
 import json
 import os
+import shlex
 from pathlib import Path
 import pwd
 import re
 import secrets
 import shutil
 import subprocess
+from urllib.parse import parse_qsl, quote, unquote, urlsplit, urlunsplit
 
 from gateway import render
 
 ROOT = Path(__file__).resolve().parents[2]
-POSTGRES = 'docker.io/library/postgres@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea'
+POSTGRES = 'docker.io/library/postgres@sha256:996e9dc583ba9f0265a2c75547a9c95fb22c251e394749cab205a0a00e1856a1'
 PYTHON = 'docker.io/library/python@sha256:519591d6871b7bc437060736b9f7456b8731f1499a57e22e6c285135ae657bf7'
 
 
@@ -66,6 +68,97 @@ def postgres_bootstrap(metering_password, maas_password):
     return '\n'.join(statements) + '\n'
 
 
+def validate_external_database_url(url_text, ca_file=None, ca_required=True):
+    """Validate a private application URI without logging its credentials."""
+    parsed = urlsplit(url_text.strip())
+    if parsed.scheme not in ('postgres', 'postgresql'):
+        raise ValueError('external database URL must use postgres:// or postgresql://')
+    if not parsed.hostname or not parsed.port or not parsed.username or not parsed.password:
+        raise ValueError('external database URL must include host, port, username and password')
+    database = parsed.path.lstrip('/')
+    if not re.fullmatch(r'[A-Za-z0-9_.-]+', database):
+        raise ValueError('external database URL must name a single maintenance database')
+    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    hostaddr = query.get('hostaddr')
+    if 'hostaddr' in query and not hostaddr:
+        raise ValueError('external database URL hostaddr must not be empty')
+    sslmode = query.get('sslmode', '').lower()
+    if sslmode not in ('require', 'verify-full'):
+        raise ValueError('external database URL must set sslmode=require or sslmode=verify-full')
+    if sslmode == 'verify-full' and ca_required:
+        if ca_file is None:
+            raise ValueError('sslmode=verify-full requires --external-database-ca-file')
+        if not ca_file.is_absolute() or not ca_file.is_file():
+            raise ValueError('external database CA file must be an existing absolute path')
+    elif ca_file is not None:
+        raise ValueError('external database CA file requires sslmode=verify-full')
+    return {
+        'scheme': parsed.scheme,
+        'host': parsed.hostname,
+        'hostaddr': hostaddr,
+        'port': parsed.port,
+        'username': unquote(parsed.username),
+        'password': unquote(parsed.password),
+        'database': database,
+        'sslmode': sslmode,
+    }
+
+
+def external_database_server(config):
+    return config['hostaddr'] or config['host'], config['port']
+
+
+def validate_external_database_urls(maas_url, metering_url, ca_file=None):
+    external_database = {
+        'maas': validate_external_database_url(maas_url, ca_file),
+        'metering': validate_external_database_url(metering_url, ca_file),
+    }
+    if external_database_server(external_database['maas']) != \
+            external_database_server(external_database['metering']):
+        raise ValueError('external maas and metering URLs must use the same effective database server address and port')
+    return external_database
+
+
+def external_application_url(url_text, ca_configured):
+    config = validate_external_database_url(url_text, ca_required=False)
+    query = [(key, value.lower() if key == 'sslmode' else value)
+             for key, value in parse_qsl(urlsplit(url_text).query,
+                                         keep_blank_values=True)
+             if key != 'sslrootcert']
+    if ca_configured:
+        query.append(('sslrootcert', '/etc/pricetag-external-ca.crt'))
+    host = f'[{config["host"]}]' if ':' in config['host'] else config['host']
+    authority = (f'{quote(config["username"], safe="")}:{quote(config["password"], safe="")}'
+                 f'@{host}:{config["port"]}')
+    return urlunsplit((config['scheme'], authority, '/' + config['database'], '&'.join(
+        f'{quote(key, safe="")}={quote(value, safe="")}' for key, value in query), ''))
+
+
+def external_client_environment(url_text, expected_database, ca_configured):
+    config = validate_external_database_url(url_text, ca_required=False)
+    if config['database'] != expected_database:
+        raise ValueError(f'external {expected_database} URL must target the {expected_database} database')
+    if config['username'] != expected_database:
+        raise ValueError(f'external {expected_database} URL must use the {expected_database} role')
+    values = {
+        'PGHOST': config['host'],
+        **({'PGHOSTADDR': config['hostaddr']} if config['hostaddr'] else {}),
+        'PGPORT': str(config['port']),
+        'PGUSER': config['username'],
+        'PGDATABASE': config['database'],
+        'PGSSLMODE': config['sslmode'],
+    }
+    if ca_configured:
+        values['PGSSLROOTCERT'] = '/etc/pricetag-external-ca.crt'
+    return values
+
+
+def external_password_file(password):
+    if '\x00' in password:
+        raise ValueError('external database password must not contain a NUL byte')
+    return 'export PGPASSWORD=' + shlex.quote(password) + '\n'
+
+
 def gateway_quadlet_body(image, provider_secrets, mount, mock_provider):
     mock_network = 'Network=pricetag-mock.network\n' if mock_provider else ''
     return (
@@ -97,6 +190,12 @@ def main():
     parser.add_argument('--sample-users', action=argparse.BooleanOptionalAction, default=True,
                         help='create sample users on start; admin is always created')
     parser.add_argument('--monthly-usd', type=int, default=5)
+    parser.add_argument('--maas-database-url-file', type=Path,
+                        help='private file containing a URL to the existing external maas database')
+    parser.add_argument('--metering-database-url-file', type=Path,
+                        help='private file containing a URL to the existing external metering database')
+    parser.add_argument('--external-database-ca-file', type=Path,
+                        help='CA certificate used when the external URL sets sslmode=verify-full')
     parser.add_argument('--price-sources', type=Path, required=True,
                         help='JSON mapping gateway aliases to reviewed PriceTag pricing model IDs')
     parser.add_argument('--directory', type=Path, default=Path('/etc/praxis-pricetag'))
@@ -115,6 +214,15 @@ def main():
         parser.error('image arguments must be immutable local sha256 image IDs')
     if not 1 <= args.monthly_usd <= 10000:
         parser.error('monthly-usd must be 1–10000')
+    if args.maas_database_url_file is not None or args.metering_database_url_file is not None:
+        if args.maas_database_url_file is None or args.metering_database_url_file is None:
+            parser.error('external database installation requires both --maas-database-url-file and --metering-database-url-file')
+        if not args.maas_database_url_file.is_absolute() or not args.metering_database_url_file.is_absolute():
+            parser.error('external database URL file paths must be absolute')
+        if args.external_database_ca_file is not None and not args.external_database_ca_file.is_absolute():
+            parser.error('--external-database-ca-file must be an absolute path')
+    elif args.external_database_ca_file is not None:
+        parser.error('--external-database-ca-file requires both external database URL files')
     for directory in (args.directory, args.admin_directory):
         if not directory.is_absolute() or re.search(r'[\s%]', str(directory)) or directory.exists():
             parser.error('use new absolute directories without whitespace or percent signs')
@@ -144,6 +252,15 @@ def main():
     if not needed <= supplied:
         parser.error('provider Quadlet does not supply every required API-key secret')
     provider_secrets = [line for line in provider_secrets if line.rsplit('=', 1)[1] in needed]
+    external_database = None
+    if args.maas_database_url_file is not None:
+        try:
+            maas_url = args.maas_database_url_file.read_text().strip()
+            metering_url = args.metering_database_url_file.read_text().strip()
+            external_database = validate_external_database_urls(
+                maas_url, metering_url, args.external_database_ca_file)
+        except (OSError, ValueError) as error:
+            parser.error(str(error))
     os.umask(0o077)
     args.admin_directory.mkdir(mode=0o700)
     args.directory.mkdir(mode=0o750)
@@ -163,20 +280,39 @@ def main():
         shutil.copyfile(source, bundle / target)
     (bundle / 'gateway.json').write_text(json.dumps(config, indent=2) + '\n')
     shutil.copyfile(args.admin_directory / 'tls/ca.pem', args.directory / 'ca.pem')
-    postgres_password, metering_password, maas_password = (secrets.token_urlsafe(32) for _ in range(3))
+    if external_database is None:
+        postgres_password, metering_password, maas_password = (
+            secrets.token_urlsafe(32) for _ in range(3))
+    else:
+        postgres_password = metering_password = maas_password = ''
 
     def env(name, values):
         (args.directory / name).write_text(''.join(f'{k}={v}\n' for k, v in values.items()))
 
     initdb = args.directory / 'initdb'
-    initdb.mkdir(mode=0o750)
-    env('postgres.env', {'POSTGRES_USER': 'postgres', 'POSTGRES_DB': 'postgres',
-                        'POSTGRES_PASSWORD': postgres_password, 'TZ': 'UTC', 'PGTZ': 'UTC'})
-    (initdb / '10-create-databases.sql').write_text(
-        postgres_bootstrap(metering_password, maas_password))
+    if external_database is None:
+        initdb.mkdir(mode=0o750)
+        (initdb / '10-create-databases.sql').write_text(
+            postgres_bootstrap(metering_password, maas_password))
+        env('postgres.env', {'POSTGRES_USER': 'postgres', 'POSTGRES_DB': 'postgres',
+                            'POSTGRES_PASSWORD': postgres_password, 'TZ': 'UTC', 'PGTZ': 'UTC'})
+    else:
+        ca_configured = args.external_database_ca_file is not None
+        if ca_configured:
+            shutil.copyfile(args.external_database_ca_file, args.directory / 'external-ca.crt')
+        env('external-metering-db.env', external_client_environment(metering_url, 'metering', ca_configured))
+        env('external-maas-db.env', external_client_environment(maas_url, 'maas', ca_configured))
+        (args.directory / 'external-metering-db.password').write_text(
+            external_password_file(external_database['metering']['password']))
+        (args.directory / 'external-maas-db.password').write_text(
+            external_password_file(external_database['maas']['password']))
+        metering_url = external_application_url(metering_url, ca_configured)
+        maas_url = external_application_url(maas_url, ca_configured)
     m2m_secret = secrets.token_urlsafe(48)
     management_secret = secrets.token_urlsafe(48)
-    env('metering.env', {'DATABASE_URL': f'postgres://metering:{metering_password}@pricetag-db:5432/metering?sslmode=disable',
+    metering_url = (metering_url if external_database else
+                    f'postgres://metering:{metering_password}@pricetag-db:5432/metering?sslmode=disable')
+    env('metering.env', {'DATABASE_URL': metering_url,
         'M2M_AUTH_REQUIRED': 'true', 'M2M_SHARED_SECRET': m2m_secret,
         'SESSION_SECRET': secrets.token_urlsafe(48),
         'MANAGEMENT_API_SECRET': management_secret,
@@ -190,8 +326,9 @@ def main():
         'SUPERADMIN_USERS': 'admin', 'MONTHLY_TOKEN_QUOTA': '10000000000', 'TZ': 'UTC',
         'MAAS_VALIDATE_URL': 'http://pricetag-maas:8080/internal/v1/api-keys/validate'})
     (args.directory / 'm2m-secret').write_text(m2m_secret + '\n')
-    (args.directory / 'maas-db-url').write_text(
-        f'postgres://maas:{maas_password}@pricetag-db:5432/maas?sslmode=disable\n')
+    maas_url = (maas_url if external_database else
+                f'postgres://maas:{maas_password}@pricetag-db:5432/maas?sslmode=disable')
+    (args.directory / 'maas-db-url').write_text(maas_url + '\n')
     (args.directory / 'sample-users').write_text('yes\n' if args.sample_users else 'no\n')
     (args.directory / 'admin-directory').write_text(str(args.admin_directory) + '\n')
     (args.directory / 'management-secret').write_text(management_secret + '\n')
@@ -203,7 +340,6 @@ def main():
     (args.directory / 'price-sources.json').write_text(json.dumps(sources, indent=2) + '\n')
     (units / 'pricetag.network').write_text(
         '[Network]\nNetworkName=pricetag-private\nDriver=bridge\nSubnet=10.77.0.0/24\n')
-    (units / 'pricetag-db.volume').write_text('[Volume]\nVolumeName=pricetag-data\n')
     common = 'ReadOnly=true\nNoNewPrivileges=true\n'
     app = common + 'User=1001\nGroup=1001\nUserNS=keep-id:uid=1001,gid=1001\nDropCapability=all\n'
     mount = f'Volume={bundle}:/etc/praxis:ro\n'
@@ -215,26 +351,33 @@ def main():
             f'{body}\n[Service]\nRestart=on-failure\nRestartSec=5\nTimeoutStartSec=900\n'
             f'MemoryMax={memory}\n\n[Install]\nWantedBy=default.target\n')
 
-    container('pricetag-db', 'MaaS and PriceTag PostgreSQL', '',
-        f'Image={POSTGRES}\nEnvironmentFile={args.directory}/postgres.env\n'
-        'Volume=pricetag-db.volume:/var/lib/postgresql/data\n'
-        'Tmpfs=/var/run/postgresql:rw,mode=3775\nTmpfs=/tmp\n'
-        'HealthCmd=pg_isready -U postgres -d postgres\nHealthInterval=10s\n' + common, '1G')
-    container('pricetag-maas', 'MaaS standalone key API', 'pricetag-db.service',
+    database_dependency = '' if external_database else 'pricetag-db.service'
+    application_dependency = database_dependency or 'pricetag-network.service'
+    external_ca_mount = (f'Volume={args.directory}/external-ca.crt:/etc/pricetag-external-ca.crt:ro\n'
+                         if external_database and ca_configured else '')
+    if external_database is None:
+        (units / 'pricetag-db.volume').write_text('[Volume]\nVolumeName=pricetag-data\n')
+        container('pricetag-db', 'MaaS and PriceTag PostgreSQL', '',
+            f'Image={POSTGRES}\nEnvironmentFile={args.directory}/postgres.env\n'
+            'Volume=pricetag-db.volume:/var/lib/postgresql/data\n'
+            'Tmpfs=/var/run/postgresql:rw,mode=3775\nTmpfs=/tmp\n'
+            'HealthCmd=pg_isready -U postgres -d postgres\nHealthInterval=10s\n' + common, '1G')
+    container('pricetag-maas', 'MaaS standalone key API', application_dependency,
         f'Image={args.maas_image}\nPull=never\nNetworkAlias=pricetag-maas\n'
         'IP=10.77.0.10\n'
         'PublishPort=127.0.0.1:18086:8080\n'
         f'Volume={args.directory}/maas-db-url:/run/secrets/maas-db-url:ro\n'
+        + external_ca_mount +
         'Environment=MAAS_RUNTIME_MODE=standalone\nEnvironment=MAAS_SUBSCRIPTION_MODE=standalone\n'
         'Environment=ADDRESS=:8080\nEnvironment=SECURE=false\n'
         'Environment=DB_CONNECTION_URL_FILE=/run/secrets/maas-db-url\n'
         'Environment=API_KEY_MAX_EXPIRATION_DAYS=90\nEnvironment=MAAS_ADMIN_GROUPS=single-server-admin\n'
         'Environment=MAAS_TRUSTED_PROXY_CIDRS=127.0.0.1/32,10.77.0.10/32,10.77.0.11/32,10.77.0.12/32\n'
         'Environment=METRICS_SECURE=false\nEnvironment=METRICS_ADDRESS=127.0.0.1:9090\n' + app, '1G')
-    container('pricetag-metering', 'PriceTag metering and dashboards', 'pricetag-db.service',
+    container('pricetag-metering', 'PriceTag metering and dashboards', application_dependency,
         f'Image={args.metering_image}\nPull=never\nNetworkAlias=pricetag-metering\n'
         f'EnvironmentFile={args.directory}/metering.env\nPublishPort=127.0.0.1:18087:8080\n'
-        f'Volume={args.directory}/catalog:/etc/gateway-catalog:ro\n' + app, '2G',
+        f'Volume={args.directory}/catalog:/etc/gateway-catalog:ro\n' + external_ca_mount + app, '2G',
         network='pricetag.network:ip=10.77.0.12')
     dependencies = 'pricetag-metering.service'
     if args.mock_provider:

@@ -1,10 +1,13 @@
 # Remote gateway with PriceTag
 
-Run Praxis, MaaS, PriceTag and PostgreSQL on one RHEL host. Connect local
+Run Praxis, MaaS and PriceTag on one RHEL host, with either the default local
+PostgreSQL deployment or two pre-provisioned external databases. Connect local
 OpenCode with a user key and a monthly USD budget.
 
 [Architecture and OpenShift comparison](architecture.md) explains the services,
 authentication, routing and current boundaries.
+[External PostgreSQL databases](external-database.md) explains the required
+`maas` and `metering` databases, TLS settings, and installer flags.
 
 **Needs:** a fresh RHEL 9.6 x86_64 host with sudo, outbound HTTPS, and inbound
 SSH/8443 from your IP; Git, Python 3 and OpenCode on your workstation.
@@ -81,6 +84,8 @@ administration tables and impersonation confirmation dialog. Choose
 | `--monthly-usd 10` | Set the default per-user monthly allowance. |
 | `--image-mode source` | Build application images; see [image options](images.md). |
 | `--mode mock` | Use synthetic providers for [benchmarks](../../testing/pricetag-perf.md). |
+| `--maas-database-url-file PATH` | Use an existing external MaaS database; see [external PostgreSQL](external-database.md). |
+| `--metering-database-url-file PATH` | Use an existing external metering database; both database flags are required together. |
 
 External setup accepts one or both APIs; one key must cover the selected APIs.
 Credentials and model presets are checked before installation. Prices are loaded

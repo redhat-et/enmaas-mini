@@ -123,12 +123,19 @@ sudo scripts/pricetag/start
 This creates the administrator only. [Create an inference user](users.md#create-a-user)
 next, or omit `--no-sample-users` during preparation to create Alice and Bob.
 
+To use an external PostgreSQL server, first review the required `maas` and
+`metering` databases in [external PostgreSQL databases](external-database.md),
+then add `--maas-database-url-file` and `--metering-database-url-file` to the
+`prepare.py` command. Both URLs must use the same server address and port.
+Preparation omits the local PostgreSQL container in that mode.
+
 Missing prices do not block startup; PriceTag uses [fallback estimates](pricing.md#missing-price-fallback).
 Inspect the rates before real-provider inference.
 
 Preparation refuses existing directories. Startup installs persistent systemd
-Quadlets for PostgreSQL, MaaS, PriceTag and Praxis. Do not rerun preparation over
-an existing deployment; upgrades require separate qualification.
+Quadlets for the application containers and, in the default mode, PostgreSQL.
+Do not rerun preparation over an existing deployment; upgrades require separate
+qualification.
 
 <details markdown="1">
 <summary>Private network and trusted services</summary>
@@ -142,7 +149,7 @@ Host administrators and these service peers remain privileged.
 ## 4. Verify services
 
 ```console
-svc systemctl --user status pricetag-db.service pricetag-maas.service \
+svc systemctl --user status pricetag-maas.service \
   pricetag-metering.service pricetag-gateway.service --no-pager
 loginctl show-user praxis-svc -p Linger
 sudo curl --fail --cacert /etc/praxis-pricetag/ca.pem https://localhost:8443/login >/dev/null

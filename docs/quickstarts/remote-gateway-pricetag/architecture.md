@@ -1,7 +1,7 @@
 # Remote gateway with PriceTag — architecture
 
 The [quickstart](README.md) runs **Praxis Experimental, Models as a Service,
-PriceTag Metering and PostgreSQL on one RHEL host**. Clients use native inference
+PriceTag Metering and persisted state on one RHEL host**. Clients use native inference
 APIs and scoped dashboards through one HTTPS endpoint. Models run at external
 providers or on a separately managed inference server; this gateway needs no GPU,
 Kubernetes cluster or identity provider.
@@ -32,7 +32,7 @@ flowchart TB
       Keys[Models as a Service]
       Metering[PriceTag Metering]
     end
-    subgraph Database[One PostgreSQL container]
+    subgraph Database[PostgreSQL - default local container or external server]
       KeyDB[(Key database)]
       MeterDB[(Metering database)]
     end
@@ -58,12 +58,13 @@ flowchart TB
 | **Praxis Experimental / Praxis AI** | Terminate HTTPS, contain public routes, validate inference identity through Models as a Service, request admission, route requests and report usage. |
 | **Models as a Service** | Issue, validate, expire and revoke user API keys; retain key ownership and lifecycle metadata. Its standalone runtime removes the Kubernetes runtime dependency. |
 | **PriceTag Metering** | Own identities/teams, browser sessions, authorization, USD policy, prices, usage records and scoped dashboards; delegate key operations to Models as a Service. |
-| **PostgreSQL** | Persist application state in separate databases with separate database roles. One container serves both applications. |
+| **PostgreSQL** | Persist application state in separate databases with separate database roles. The default is one local container; the documented external mode requires two pre-provisioned databases on the same server. |
 
 Services run as rootless Podman containers under the `praxis-svc` systemd user,
 managed by Quadlets. They are not launched with `--privileged`. The application
-containers use non-root users, dropped capabilities and read-only roots;
-PostgreSQL has its own image startup behavior and a writable data volume.
+containers use non-root users, dropped capabilities and read-only roots. The
+default PostgreSQL container has its own image startup behavior and a writable
+data volume; external mode does not manage that server.
 Rootless execution does **not** remove the trusted-service boundary described below.
 
 ## Listeners and trust boundaries
@@ -225,7 +226,7 @@ responsibilities in either environment.
 | Configuration and secrets | Protected host files, Podman secrets and generated gateway configuration. | ConfigMaps, Secrets and deployment configuration; operators may reconcile application-specific resources. Secret storage alone does not define application authorization. |
 | Identity and keys | Models as a Service standalone runtime, manually managed users and API-key browser login. | Applications can integrate with cluster authorization and an external identity provider. OIDC is an optional application integration, not a requirement imposed by Kubernetes. |
 | Provider/model management | SSH helpers validate configuration, regenerate routes and restart with readiness/rollback checks. | APIs/controllers can reconcile model and provider resources when that integration is implemented. Kubernetes does not automatically supply a provider-management UI or routing policy. |
-| Storage and availability | One PostgreSQL container, separate application databases and a host-local volume. The host is a single failure domain. | Persistent volumes or external database services can support different availability designs. Replication, backup and application recovery still require explicit configuration. |
+| Storage and availability | Default: one PostgreSQL container, separate application databases and a host-local volume. Optional: two pre-provisioned external databases on one user-managed PostgreSQL server. | Persistent volumes or external database services can support different availability designs. Replication, backup and application recovery still require explicit configuration. |
 | Budgets, pricing and sessions | The pinned application images provide the documented APIs, UI and authorization behavior. | The same concerns depend on application versions and configuration. Cluster deployment does not itself add budget enforcement, session invalidation or pricing management. |
 
 A future standalone provider UI needs a narrow adapter for validated changes,

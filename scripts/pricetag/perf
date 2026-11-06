@@ -165,8 +165,12 @@ def verify(args):
     query = "SELECT username,count(*),sum(prompt_tokens),sum(completion_tokens),sum(total_tokens) FROM usage_events WHERE username IN (" + ','.join("'" + s + "'" for s in counts) + ') GROUP BY username;'
     expected = {s: [n, n * 2, n * 3, n * 5] for s, n in counts.items() if n}
     for _ in range(30):
-        raw = subprocess.check_output(prefix + ['podman', 'exec', args.database, 'psql', '-U', 'metering',
-            '-d', 'metering', '-At', '-c', query], text=True, cwd='/tmp')
+        if (ROOT / 'scripts/pricetag/external-database').exists() and Path('/etc/praxis-pricetag/external-maas-db.env').is_file():
+            raw = subprocess.check_output(['python3', str(ROOT / 'scripts/pricetag/external-database'),
+                                           'query', query], text=True, cwd='/tmp')
+        else:
+            raw = subprocess.check_output(prefix + ['podman', 'exec', args.database, 'psql', '-U', 'metering',
+                '-d', 'metering', '-At', '-c', query], text=True, cwd='/tmp')
         actual = {parts[0]: list(map(int, parts[1:])) for parts in (line.split('|') for line in raw.splitlines())}
         if actual == expected:
             print('PASS: exact per-user event and token totals match completed mock requests')

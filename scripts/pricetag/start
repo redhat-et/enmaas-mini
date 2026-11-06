@@ -18,7 +18,13 @@ fi
 uid="$(service_uid)"
 units="/etc/containers/systemd/users/${uid}"
 install -d -m 0755 "${units}"
-for unit in pricetag.network pricetag-db.volume pricetag-db.container pricetag-maas.container pricetag-metering.container pricetag-gateway.container; do
+external_database=0
+[[ -f "${DEPLOY_DIR}/external-maas-db.env" ]] && external_database=1
+database_units=(pricetag-db.volume pricetag-db.container)
+if [[ "${external_database}" == 1 ]]; then
+  database_units=()
+fi
+for unit in pricetag.network "${database_units[@]}" pricetag-maas.container pricetag-metering.container pricetag-gateway.container; do
   install -m 0644 "${DEPLOY_DIR}/quadlets/${unit}" "${units}/${unit}"
 done
 if [[ -f "${DEPLOY_DIR}/quadlets/pricetag-mock.network" ]]; then
@@ -34,16 +40,20 @@ as_service systemctl --user daemon-reload
 if ! as_service podman secret inspect pricetag-m2m >/dev/null 2>&1; then
   as_service podman secret create pricetag-m2m "${DEPLOY_DIR}/m2m-secret" >/dev/null
 fi
-as_service systemctl --user start pricetag-db.service
-ready=0
-for ((attempt=0; attempt<60; attempt++)); do
-  if as_service podman exec pricetag-db pg_isready >/dev/null 2>&1; then
-    ready=1
-    break
-  fi
-  sleep 1
-done
-[[ "${ready}" == 1 ]] || die 'PostgreSQL did not become ready'
+if [[ "${external_database}" == 1 ]]; then
+  as_service systemctl --user start pricetag-network.service
+else
+  as_service systemctl --user start pricetag-db.service
+  ready=0
+  for ((attempt=0; attempt<60; attempt++)); do
+    if as_service podman exec pricetag-db pg_isready >/dev/null 2>&1; then
+      ready=1
+      break
+    fi
+    sleep 1
+  done
+  [[ "${ready}" == 1 ]] || die 'PostgreSQL did not become ready'
+fi
 network_json="$(as_service podman network inspect --format json pricetag-private)" ||
   die 'could not inspect the private MaaS network'
 service_addresses="$(printf '%s' "${network_json}" | python3 "${SCRIPT_DIR}/private-network.py" addresses)" ||
@@ -53,19 +63,24 @@ printf '%s' "${service_addresses}" | python3 "${SCRIPT_DIR}/private-network.py" 
   "${units}/pricetag-metering.container" ||
   die 'could not restrict MaaS trusted peers to the host and required services'
 as_service systemctl --user daemon-reload
-pg_admin_user=postgres
-pg_admin_database=postgres
-if ! as_service podman exec pricetag-db psql -X -qAt -U postgres -d postgres -c 'SELECT 1' >/dev/null 2>&1; then
-  pg_admin_user=metering
-  pg_admin_database=metering
-  is_superuser="$(as_service podman exec pricetag-db psql -X -qAt -U "${pg_admin_user}" \
-    -d "${pg_admin_database}" -c 'SELECT rolsuper FROM pg_roles WHERE rolname=current_user' 2>/dev/null || true)"
-  [[ "${is_superuser}" == t ]] || die 'PostgreSQL has neither the fresh-install admin nor the supported metering-superuser layout'
-fi
-if [[ ! -f "${DEPLOY_DIR}/postgres-bootstrap.done" ]]; then
-  as_service podman exec -i pricetag-db psql -X -U "${pg_admin_user}" -d "${pg_admin_database}" -v ON_ERROR_STOP=1 \
-    < "${DEPLOY_DIR}/initdb/10-create-databases.sql"
-  install -m 0600 /dev/null "${DEPLOY_DIR}/postgres-bootstrap.done"
+if [[ "${external_database}" == 1 ]]; then
+  python3 "${SCRIPT_DIR}/external-database" check ||
+    die 'could not connect to the external PostgreSQL databases'
+else
+  pg_admin_user=postgres
+  pg_admin_database=postgres
+  if ! as_service podman exec pricetag-db psql -X -qAt -U postgres -d postgres -c 'SELECT 1' >/dev/null 2>&1; then
+    pg_admin_user=metering
+    pg_admin_database=metering
+    is_superuser="$(as_service podman exec pricetag-db psql -X -qAt -U "${pg_admin_user}" \
+      -d "${pg_admin_database}" -c 'SELECT rolsuper FROM pg_roles WHERE rolname=current_user' 2>/dev/null || true)"
+    [[ "${is_superuser}" == t ]] || die 'PostgreSQL has neither the fresh-install admin nor the supported metering-superuser layout'
+  fi
+  if [[ ! -f "${DEPLOY_DIR}/postgres-bootstrap.done" ]]; then
+    as_service podman exec -i pricetag-db psql -X -U "${pg_admin_user}" -d "${pg_admin_database}" -v ON_ERROR_STOP=1 \
+      < "${DEPLOY_DIR}/initdb/10-create-databases.sql"
+    install -m 0600 /dev/null "${DEPLOY_DIR}/postgres-bootstrap.done"
+  fi
 fi
 as_service systemctl --user restart pricetag-maas.service
 python3 - <<'PY'
@@ -103,7 +118,11 @@ else:
 '
 python3 "${SCRIPT_DIR}/user" --subject admin --name Administrator --no-key --bootstrap-admin
 if [[ ! -f "${DEPLOY_DIR}/bootstrap.done" ]]; then
-  rows="$(as_service podman exec pricetag-db psql -X -qAt -U metering -d metering -c 'SELECT count(*) FROM usage_events;')"
+  if [[ "${external_database}" == 1 ]]; then
+    rows="$(python3 "${SCRIPT_DIR}/external-database" usage-count)"
+  else
+    rows="$(as_service podman exec pricetag-db psql -X -qAt -U metering -d metering -c 'SELECT count(*) FROM usage_events;')"
+  fi
   if [[ "${rows}" != 0 && "${adopt_existing_database}" != 1 ]]; then
     die 'database already has usage; back it up, review schema and model prices, then use --adopt-existing-database'
   fi

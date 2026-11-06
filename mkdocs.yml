@@ -74,6 +74,7 @@ nav:
           - Guided installation: docs/quickstarts/remote-gateway-pricetag/README.md
           - Architecture and OpenShift comparison: docs/quickstarts/remote-gateway-pricetag/architecture.md
           - Manual installation: docs/quickstarts/remote-gateway-pricetag/manual.md
+          - External PostgreSQL databases: docs/quickstarts/remote-gateway-pricetag/external-database.md
           - Providers and models: docs/quickstarts/remote-gateway-pricetag/providers.md
           - Users, keys and budgets: docs/quickstarts/remote-gateway-pricetag/users.md
           - OpenCode CLI and desktop: docs/quickstarts/remote-gateway-pricetag/clients.md

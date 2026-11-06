@@ -274,6 +274,33 @@ class InstallTest(unittest.TestCase):
             self.assertEqual(args.external_api, 'anthropic')
             self.assertEqual(args.provider, ['external'])
 
+    def test_external_database_files_must_be_supplied_together_and_absolute(self):
+        base = ['--mode', 'mock', '--hostname', 'gateway.example', '--plan']
+        with patch.object(installer.sys.stdin, 'isatty', return_value=False):
+            with self.assertRaises(SystemExit):
+                installer.parse_args(base + ['--maas-database-url-file', '/root/maas.url'])
+            with self.assertRaises(SystemExit):
+                installer.parse_args(base + ['--maas-database-url-file', 'maas.url',
+                                             '--metering-database-url-file', '/root/metering.url'])
+            with self.assertRaises(SystemExit):
+                installer.parse_args(base + ['--external-database-ca-file', '/root/ca.crt'])
+            args = installer.parse_args(base + ['--maas-database-url-file', '/root/maas.url',
+                                                '--metering-database-url-file', '/root/metering.url'])
+            self.assertEqual(args.maas_database_url_file, Path('/root/maas.url'))
+            self.assertEqual(args.metering_database_url_file, Path('/root/metering.url'))
+
+    def test_external_database_plan_does_not_read_credentials_or_show_local_database(self):
+        args = installer.parse_args(['--mode', 'mock', '--hostname', 'gateway.example', '--plan',
+                                     '--maas-database-url-file', '/root/does-not-exist.url',
+                                     '--metering-database-url-file', '/root/does-not-exist.url'])
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            installer.install(args)
+        text = output.getvalue()
+        self.assertIn('PostgreSQL external (pre-provisioned)', text)
+        self.assertNotIn('does-not-exist.url', text)
+        self.assertNotIn('docker.io/library/postgres@', text)
+
     def test_plan_runs_without_privileges_and_does_not_invoke_commands(self):
         with patch.object(sys, 'argv', ['install', '--mode', 'mock', '--hostname', 'gateway.example', '--plan']), \
                 patch.object(installer, 'run', side_effect=AssertionError('mutation')), \

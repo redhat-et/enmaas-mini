@@ -1,0 +1,66 @@
+#!/usr/bin/env python3
+"""Validate connections to prepared external PostgreSQL databases without logging credentials."""
+import argparse
+from pathlib import Path
+import pwd
+import shlex
+import subprocess
+import sys
+
+POSTGRES = 'docker.io/library/postgres@sha256:996e9dc583ba9f0265a2c75547a9c95fb22c251e394749cab205a0a00e1856a1'
+DEPLOY = Path('/etc/praxis-pricetag')
+
+
+def service_prefix():
+    uid = pwd.getpwnam('praxis-svc').pw_uid
+    return ['sudo', '-u', 'praxis-svc', 'env', f'XDG_RUNTIME_DIR=/run/user/{uid}',
+            f'DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{uid}/bus']
+
+
+def client_command(environment_file, command='SELECT 1'):
+    password_file = environment_file.with_suffix('.password')
+    arguments = service_prefix() + ['podman', 'run', '--rm', '--network', 'pricetag-private',
+                                    '--env-file', environment_file]
+    if (DEPLOY / 'external-ca.crt').is_file():
+        arguments += ['-v', f'{DEPLOY / "external-ca.crt"}:/etc/pricetag-external-ca.crt:ro']
+    arguments += ['-v', f'{password_file}:/run/secrets/external-db-password:ro']
+    shell_command = (
+        '. /run/secrets/external-db-password\n'
+        'exec psql -X -qAt -v ON_ERROR_STOP=1 '
+        f'-c {shlex.quote(command)}'
+    )
+    arguments += [POSTGRES, 'sh', '-c', shell_command]
+    return arguments
+
+
+def psql(environment_file, command='SELECT 1'):
+    arguments = client_command(environment_file, command)
+    return subprocess.run(arguments, check=True, text=True, stdout=subprocess.PIPE,
+                          cwd='/tmp').stdout.strip()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('action', choices=('check', 'usage-count', 'query'))
+    parser.add_argument('sql', nargs='?')
+    args = parser.parse_args()
+    if args.action == 'query' and not args.sql:
+        parser.error('query requires SQL')
+    if args.action == 'check':
+        for name in ('metering', 'maas'):
+            result = psql(DEPLOY / f'external-{name}-db.env',
+                          command=f"SELECT current_user || ':' || current_database()")
+            if result != f'{name}:{name}':
+                raise RuntimeError(f'external {name} database connection did not use the expected database and role')
+    else:
+        sql = args.sql if args.action == 'query' else 'SELECT count(*) FROM usage_events'
+        result = psql(DEPLOY / 'external-metering-db.env', command=sql)
+        print(result)
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (OSError, KeyError, RuntimeError, subprocess.CalledProcessError) as error:
+        print(str(error) or type(error).__name__, file=sys.stderr)
+        sys.exit(1)

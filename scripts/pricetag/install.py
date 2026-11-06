@@ -193,6 +193,12 @@ def parse_args(argv=None):
     p.add_argument('--pricetag-messages-url', help=argparse.SUPPRESS)
     p.add_argument('--pricetag-openai-url', help=argparse.SUPPRESS)
     p.add_argument('--monthly-usd', type=int, default=5, help='default per-user monthly USD allowance; default 5')
+    p.add_argument('--maas-database-url-file', type=Path,
+                   help='private URL file for the existing external maas database')
+    p.add_argument('--metering-database-url-file', type=Path,
+                   help='private URL file for the existing external metering database')
+    p.add_argument('--external-database-ca-file', type=Path,
+                   help='CA certificate required for sslmode=verify-full')
     p.add_argument('--sample-users', action=argparse.BooleanOptionalAction, default=None,
                    help='create Alice and Bob in addition to the required administrator')
     p.add_argument('--yes', action='store_true', help='skip final confirmation, not missing setup prompts')
@@ -214,6 +220,15 @@ def parse_args(argv=None):
         p.error('provide --hostname with a valid IPv4 or DNS name')
     if not 1 <= args.monthly_usd <= 10000:
         p.error('--monthly-usd must be 1–10000')
+    if args.maas_database_url_file is not None or args.metering_database_url_file is not None:
+        if args.maas_database_url_file is None or args.metering_database_url_file is None:
+            p.error('external databases require both --maas-database-url-file and --metering-database-url-file')
+        if not args.maas_database_url_file.is_absolute() or not args.metering_database_url_file.is_absolute():
+            p.error('external database URL file paths must be absolute')
+        if args.external_database_ca_file is not None and not args.external_database_ca_file.is_absolute():
+            p.error('external database CA file path must be absolute')
+    elif args.external_database_ca_file is not None:
+        p.error('--external-database-ca-file requires both external database URL files')
     if args.mode == 'real' and not args.provider:
         if interactive:
             selected = choice('At least one provider is required:', {
@@ -380,7 +395,7 @@ def acquire_images(args, arch):
 
 def install(args):
     sys.path.insert(0, str(ROOT / 'scripts/pricetag'))
-    from prepare import POSTGRES
+    from prepare import POSTGRES, validate_external_database_url
     apis = {'openai': 'OpenAI-compatible', 'anthropic': 'Anthropic Messages',
             'both': 'OpenAI-compatible + Anthropic Messages'}
     providers = {'openai': 'OpenAI', 'external': 'External (' + apis.get(args.external_api, 'both APIs') + ')',
@@ -391,7 +406,7 @@ def install(args):
                             ', '.join(providers[name] for name in args.provider)))
     print(f'  Images     {args.image_mode}')
     print('  Praxis     ' + PRAXIS_IMAGE)
-    print('  PostgreSQL ' + POSTGRES)
+    print('  PostgreSQL ' + ('external (pre-provisioned)' if args.maas_database_url_file else POSTGRES))
     if args.image_mode == 'published':
         print('  MaaS       ' + args.maas_image)
         print('  PriceTag   ' + args.metering_image)
@@ -409,6 +424,20 @@ def install(args):
         if args.image_mode == 'published':
             print('Expected MaaS commit: ' + args.maas_revision + '\nExpected PriceTag commit: ' + args.metering_revision)
         return
+    if args.maas_database_url_file is not None:
+        try:
+            maas_url = validate_external_database_url(args.maas_database_url_file.read_text(),
+                                                      args.external_database_ca_file)
+            metering_url = validate_external_database_url(args.metering_database_url_file.read_text(),
+                                                          args.external_database_ca_file)
+            if maas_url['database'] != 'maas' or maas_url['username'] != 'maas':
+                raise ValueError('external MaaS URL must target the maas database and role')
+            if metering_url['database'] != 'metering' or metering_url['username'] != 'metering':
+                raise ValueError('external metering URL must target the metering database and role')
+            if (maas_url['host'], maas_url['port']) != (metering_url['host'], metering_url['port']):
+                raise ValueError('external MaaS and metering URLs must use the same database server address and port')
+        except (OSError, ValueError) as error:
+            raise ValueError(str(error)) from None
     preflight(args.mode)
     helper = provider_module()
     stage(1, 'Validate provider setup')
@@ -427,7 +456,8 @@ def install(args):
     run([ROOT / 'scripts/common/install', '--prepare'])
     prefix = service_prefix()
     # Refuse retained data or Quadlets even if someone removed the config directory.
-    if subprocess.run(prefix + ['podman', 'volume', 'exists', 'pricetag-data'], cwd='/tmp').returncode != 1:
+    if (args.maas_database_url_file is None and subprocess.run(
+            prefix + ['podman', 'volume', 'exists', 'pricetag-data'], cwd='/tmp').returncode != 1):
         raise ValueError('existing data volume or storage error; review the host instead of reinstalling')
     uid = pwd.getpwnam('praxis-svc').pw_uid
     units = Path(f'/etc/containers/systemd/users/{uid}')
@@ -444,6 +474,11 @@ def install(args):
     command = [sys.executable, ROOT / 'scripts/pricetag/prepare.py', '--hostname', args.hostname,
                '--praxis-image', ids[0], '--maas-image', ids[1], '--metering-image', ids[2],
                '--monthly-usd', str(args.monthly_usd)]
+    if args.maas_database_url_file is not None:
+        command += ['--maas-database-url-file', args.maas_database_url_file,
+                    '--metering-database-url-file', args.metering_database_url_file]
+        if args.external_database_ca_file is not None:
+            command += ['--external-database-ca-file', args.external_database_ca_file]
     if not args.sample_users:
         command += ['--no-sample-users']
     if args.mode == 'mock':
