@@ -88,7 +88,12 @@ def temporary_limits(config, manifest, recovery, gid, *, activate=restart):
 
 
 def body(gateway, path, stream=False):
-    return {"model": gateway.model, "input": "hello", "messages": [], "stream": stream, "max_tokens": 4}
+    request = {"model": gateway.model, "input": "hello", "messages": [], "stream": stream, "max_tokens": 4}
+    # These legacy quota profiles do not inject stream_options. Ask for usage
+    # explicitly so this test measures settlement, not reservation fallback.
+    if stream and path == '/v1/chat/completions':
+        request['stream_options'] = {'include_usage': True}
+    return request
 
 
 def exhaust(gateway, path, stream=False):

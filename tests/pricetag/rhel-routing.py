@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Verify native routing, alias boundaries and accounting on a mock deployment."""
 import http.cookiejar
+import http.client
 import importlib.machinery
 import importlib.util
 import json
@@ -15,6 +16,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from decimal import Decimal, ROUND_HALF_UP
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path[:0] = [str(ROOT / 'scripts/pricetag'), str(ROOT / 'tests/common')]
@@ -86,6 +88,8 @@ def main():
     subject = 'routing-' + uuid.uuid4().hex[:12]
     successful = 0
     counted = 0
+    prices = {row['Model']: row for row in metering_admin.request('GET', 'prices')}
+    expected_cost = Decimal(0)
     os.umask(0o077)
     try:
         with tempfile.TemporaryDirectory(prefix='pricetag-routing-', dir='/root') as directory:
@@ -94,7 +98,30 @@ def main():
                             '--monthly-usd', '100', '--key-lifetime', '1h', '--output', keyfile],
                            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
             key = keyfile.read_text().strip()
+            # Real WebSocket GETs and upgrade-bearing POSTs must be rejected at
+            # the public edge, including discovery and dashboard routes. Test
+            # anonymous and valid callers; no upstream or ledger event is due.
+            for auth in ({}, {'Authorization': 'Bearer ' + key, 'x-api-key': key}):
+                for path in ('/v1/models', '/v1/responses', '/v1/chat/completions',
+                             '/v1/messages', '/v1/messages/count_tokens', '/login'):
+                    for method in ('GET', 'POST'):
+                        for protocol in ('websocket', 'h2c', 'custom/1', 'h2c, WebSocket'):
+                            connection = http.client.HTTPSConnection('localhost', 8443, context=tls, timeout=10)
+                            try:
+                                connection.request(method, path,
+                                    json.dumps({'model': models[0]['id']}) if method == 'POST' else None,
+                                    {**auth, 'Content-Type': 'application/json',
+                                     'Connection': 'keep-alive, Upgrade', 'Upgrade': protocol,
+                                     'Sec-WebSocket-Version': '13', 'Sec-WebSocket-Key': 'dGhlIHNhbXBsZSBub25jZQ=='})
+                                response = connection.getresponse()
+                                payload = response.read()
+                                assert response.status == 400, ('public upgrade', path, method, protocol, response.status)
+                                assert json.loads(payload)['error']['code'] == 'upgrade_not_supported'
+                            finally:
+                                connection.close()
+            print('PASS: public upgrade attempts rejected for anonymous and authenticated callers', flush=True)
             for model in models:
+                before_model = successful
                 for api in model['apis']:
                     public_aliases = {m['id'] for m in models if api in m['apis']}
                     headers = ({'Authorization': 'Bearer ' + key} if api == 'openai' else
@@ -123,14 +150,32 @@ def main():
                             assert code in (400, 403, 404), ('invalid alias/body', path, code)
                         assert request(path, body)[0] == 401
                         assert request(path, headers=headers, method='GET')[0] == 404
+                    if api == 'openai':
+                        for options in (None, {}, {'include_usage': False}, {'include_usage': True},
+                                        {'include_usage': False, 'include_obfuscation': False}):
+                            body = {'model': model['id'], 'stream': True,
+                                    'messages': [{'role': 'user', 'content': 'streaming accounting'}]}
+                            if options is not None:
+                                body['stream_options'] = options
+                            code, payload = request('/v1/chat/completions', body, headers)
+                            assert code == 200, ('streaming accounting', options, code)
+                            check('/v1/chat/completions', payload.decode(), True, tool=False, model=model['model'])
+                            successful += 1
                     if api == 'anthropic':
                         code, payload = request('/v1/messages/count_tokens', {
                             'model': model['id'], 'messages': [{'role': 'user', 'content': 'count'}]}, headers)
                         assert code == 200 and json.loads(payload)['input_tokens'] == 2
                         counted += 1
+                # The pinned PriceTag ledger uses $15/$75 per million when no
+                # price row exists. Mock setup intentionally allows that path;
+                # do not mutate shared prices merely to make this test pass.
+                price = prices.get(model['model'], {'InputCost': 15, 'OutputCost': 75})
+                unit_cost = ((2 * Decimal(str(price['InputCost'])) + 3 * Decimal(str(price['OutputCost'])))
+                             / Decimal(1000000)).quantize(Decimal('0.00000001'))
+                expected_cost += (successful - before_model) * unit_cost
             assert request('/v1/not-inference', {'model': models[0]['id']},
                            {'Authorization': 'Bearer ' + key})[0] == 404
-            print('PASS: catalog limits, native protocols, streaming, count-tokens and forged/invalid aliases', flush=True)
+            print('PASS: catalog limits, native protocols, streaming opt-in variants, count-tokens and forged/invalid aliases', flush=True)
 
             jar = http.cookiejar.CookieJar()
             browser = urllib.request.build_opener(urllib.request.ProxyHandler({}), metering_admin.NoRedirect(),
@@ -149,11 +194,20 @@ def main():
             assert overview['total_requests'] == successful + counted, ('accounting count', overview['total_requests'], successful + counted)
             assert overview['total_tokens'] == successful * 5
             assert overview['active_users'] == 1
+            # The overview rounds dollars to cents for display. The user's
+            # quota view exposes the unrounded spend used for enforcement.
+            assert Decimal(str(overview['total_cost_usd'])) == expected_cost.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+            code, raw = request('/api/v1/whoami', opener=browser)
+            assert code == 200
+            quota = json.loads(raw)['quota']
+            assert quota['username'] == subject
+            assert abs(Decimal(str(quota['spent_usd'])) - expected_cost) <= Decimal('0.0000001'), (
+                'USD accounting differs from configured/fallback rates', quota['spent_usd'], str(expected_cost))
             code, raw = request('/api/v1/me/usage/recent?range=mtd', opener=browser)
             rows = json.loads(raw)
             assert code == 200 and rows and all(row['username'] == subject for row in rows)
             assert all(row['model'] in {m['model'] for m in models} for row in rows)
-            print('PASS: usage stays on the authenticated identity and upstream model IDs; count-tokens contributes zero usage; denials not recorded', flush=True)
+            print('PASS: exact request/token/USD accounting on the authenticated identity and upstream IDs; count-tokens contributes zero usage; denials not recorded', flush=True)
     finally:
         metering_admin.request('POST', 'key-revocations', {'subject': subject})
         metering_admin.request('PUT', 'users', {'subject': subject, 'active': False})

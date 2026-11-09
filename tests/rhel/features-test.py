@@ -9,10 +9,21 @@ import tempfile
 import unittest
 from unittest.mock import Mock
 
-from features import quota_config, temporary_limits, restore_limits, require_mock
+from features import body, quota_config, temporary_limits, restore_limits, require_mock
 
 
 class FeaturesTest(unittest.TestCase):
+    def test_settlement_requests_usage_only_for_streamed_chat(self):
+        gateway = Mock(model='fixture')
+        for path in ('/v1/chat/completions', '/v1/responses', '/v1/messages'):
+            for stream in (False, True):
+                with self.subTest(path=path, stream=stream):
+                    request = body(gateway, path, stream)
+                    if path == '/v1/chat/completions' and stream:
+                        self.assertEqual(request['stream_options'], {'include_usage': True})
+                    else:
+                        self.assertNotIn('stream_options', request)
+
     def test_lab_limits_use_separate_namespaces_without_changing_routes_or_auth(self):
         original = {"listeners": ["private"], "filter_chains": [{"filters": [
             {"filter": "policy", "config_path": "identity"},

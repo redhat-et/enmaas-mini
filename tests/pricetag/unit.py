@@ -74,6 +74,25 @@ class PreparationTest(unittest.TestCase):
         self.assertNotIn({'model': 'model'}, routing.invalid_bodies(body, 'model', {'provider/model', 'model'}))
         self.assertIn({'model': 'model'}, routing.invalid_bodies(body, 'model', {'provider/model'}))
 
+    def test_metered_http_guards_cover_edge_and_native_listeners(self):
+        original, models = prepare.mock_inputs(managed=True)
+        result = prepare.render(original, models)
+        for chain in result['filter_chains']:
+            filters = chain['filters']
+            guards = [f for f in filters if f['filter'] == 'reject_upgrade']
+            if chain['name'] == 'dashboard':
+                self.assertEqual(guards, [])  # Public edge rejects before proxying.
+                continue
+            self.assertEqual(guards, [{'filter': 'reject_upgrade', 'status': 400, 'protocols': []}])
+            names = [f['filter'] for f in filters]
+            self.assertLess(names.index('reject_upgrade'), names.index('load_balancer'))
+            usage = [f for f in filters if f['filter'] == 'stream_usage_inject']
+            self.assertEqual(len(usage), int(chain['name'] == 'openai'))
+            if usage:
+                self.assertEqual(usage[0]['conditions'],
+                                 [{'when': {'methods': ['POST'], 'path': '/v1/chat/completions'}}])
+                self.assertEqual(usage[0]['max_body_bytes'], 10485760)
+
     def test_alias_candidates_select_native_clusters_without_changing_models(self):
         original, models = prepare.mock_inputs(managed=True)
         result = prepare.render(original, models)

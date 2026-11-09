@@ -6,7 +6,9 @@ PriceTag or MaaS upgrade is required for this routing change.
 
 ## Request path
 
-1. The HTTPS edge routes supported paths to the private OpenAI or Anthropic listener.
+1. The HTTPS edge rejects connection upgrades and routes supported HTTP paths
+   to the private OpenAI or Anthropic listener. Native listeners also reject
+   upgrades before forwarding to a provider.
 2. MaaS validates the user key; identity guards reject untrusted identity headers.
 3. The body classifier captures the public alias in `X-Gateway-Model`. Explicit
    method, path and alias checks reject unsupported requests.
@@ -16,6 +18,14 @@ PriceTag or MaaS upgrade is required for this routing change.
    authenticated user.
 6. Credential injection supplies the selected provider's server-held key and
    the load balancer forwards the request.
+
+Streaming Chat Completions requests have `stream_options.include_usage` set to
+`true`, even if the caller omits it or sets it to `false`. This requests the
+usage event needed for accounting; it preserves other options and does not add
+Chat-specific fields to Responses or Messages requests. A provider that ignores
+the option, or a disconnected stream without final usage, still requires
+separate missing-usage handling. Successful text delivery alone is not proof of
+complete accounting.
 
 These are logical responsibilities, not a promise that every filter runs only
 in textual order: JSON extraction/rewriting also uses body pre-read hooks.

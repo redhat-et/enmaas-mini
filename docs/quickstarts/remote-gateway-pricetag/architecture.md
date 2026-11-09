@@ -209,10 +209,10 @@ alone does not describe the complete request lifecycle.
 
 | Location | Filters and responsibility |
 | --- | --- |
-| Public edge | `request_id`, `static_response`, `rate_limit`, `router`, `load_balancer`: correlation, route/method containment, catalog, global request protection and dispatch. |
-| Native inference | `api_key_auth`, `identity_header_guard`, `model_access`: external key validation, identity protection and configured upstream-model checks. The first and third are supplied by the pinned Red Hat ET Praxis AI fork. |
+| Public edge | `reject_upgrade`, `request_id`, `static_response`, `rate_limit`, `router`, `load_balancer`: reject HTTP upgrades, correlate requests, contain routes/methods, serve the catalog, apply global request protection and dispatch. |
+| Native inference | `reject_upgrade` rejects upgrades again at each native listener; `api_key_auth`, `identity_header_guard`, `model_access`: external key validation, identity protection and configured upstream-model checks. `api_key_auth` and `model_access` are supplied by the pinned Red Hat ET Praxis AI fork. |
 | Model selection | `model_to_header`, `json_body`, `static_response`, `intelligent_route`: preserve the body-derived alias, reject unsupported choices, select a connection and rewrite the model. |
-| Metering | `external_metering`, `token_count`: admission and usage reporting/extraction. Messages token-count requests are excluded from usage extraction. |
+| Metering | `external_metering`, `token_count`: admission and usage reporting/extraction. `stream_usage_inject` requests usage on streamed Chat Completions with a 10 MiB request-body limit; Responses and Messages retain their native behavior. Messages token-count requests are excluded from usage extraction. |
 | Provider forwarding | `credential_injection`, `headers`, `load_balancer`; `anthropic_messages_protocol` on Messages: select credentials/headers and handle the native upstream protocol. |
 | Dashboard proxy | `headers`, `router`, `load_balancer`: remove caller identity headers and forward allowed browser/API routes. PriceTag owns session and role checks. |
 

@@ -217,6 +217,10 @@ class Provider:
                             "provider": "anthropic" if anthropic else "openai",
                             "credential_ok": credential_ok, "classification_clean": clean,
                             "stream": bool(body.get("stream")), "continuation": continuation(self.path, body)})
+                        options = body.get('stream_options')
+                        fixture.records[-1]['stream_options'] = ({k: options[k]
+                            for k in ('include_usage', 'include_obfuscation')
+                            if isinstance(options.get(k), bool)} if isinstance(options, dict) else None)
                         if isinstance(body.get('include_reasoning'), bool):
                             fixture.records[-1]['include_reasoning'] = body['include_reasoning']
                         if fixture.record_limit is not None:
@@ -269,6 +273,15 @@ class Provider:
                         result = completion(self.path, body, mode == "missing_usage")
                     if not body.get("stream"):
                         return self.reply(200, result)
+                    # Like OpenAI Chat Completions, return streamed usage only
+                    # when requested. Always returning it concealed missing
+                    # gateway injection in the accounting tests.
+                    if self.path == '/v1/chat/completions':
+                        options = body.get('stream_options', {})
+                        if not isinstance(options, dict):
+                            return self.reply(400, {'error': 'stream_options must be an object'})
+                        if options.get('include_usage') is not True:
+                            result.pop('usage', None)
                     self.send_response(200)
                     self.send_header("Content-Type", "text/event-stream")
                     self.send_header("Connection", "close")

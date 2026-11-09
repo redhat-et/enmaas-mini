@@ -25,6 +25,15 @@ DASHBOARD = ['/', '/login', '/logout', '/dashboard', '/admin', '/manager', '/me'
 DASHBOARD_PREFIXES = ['/api/v1/management/', '/me/keys/', '/api/v1/me/keys/', '/api/v1/admin/partner-users/', '/api/v1/admin/pricing/reprice/']
 
 
+def inference_guards(api):
+    """Keep inference on metered HTTP and request Chat streaming usage."""
+    filters = [{'filter': 'reject_upgrade', 'status': 400, 'protocols': []}]
+    if api == 'openai':
+        filters.append({'filter': 'stream_usage_inject', 'max_body_bytes': 10485760,
+                        'conditions': [{'when': {'methods': ['POST'], 'path': '/v1/chat/completions'}}]})
+    return filters
+
+
 def render(original, models, origins=None):
     models = validate(models)
     public_catalog = catalog(models, 'openai')
@@ -78,6 +87,7 @@ def render(original, models, origins=None):
             load_balancer = next((i for i, item in enumerate(filters)
                                   if item['filter'] == 'load_balancer'), len(filters))
             filters.insert(load_balancer, request_headers)
+        filters[2:2] = inference_guards(api)
         chain['filters'] = filters
 
     allowed = [{'path': p} for p in DASHBOARD] + [{'path_prefix': p} for p in DASHBOARD_PREFIXES] + [
@@ -88,6 +98,7 @@ def render(original, models, origins=None):
     # separate private chains. The public model catalog contains no secrets.
     public = [
         {'filter': 'request_id'},
+        {'filter': 'reject_upgrade', 'status': 400, 'protocols': []},
         {'filter': 'static_response', 'status': 404, 'body': 'Route not available',
          'conditions': [{'unless': match} for match in allowed]},
         {'filter': 'rate_limit', 'mode': 'global', 'rate': 30, 'burst': 120},

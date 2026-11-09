@@ -106,8 +106,13 @@ def main():
                 assert not gateway.provider_records(provider), "rejected caller reached the model"
                 for path in paths:
                     for stream in (False, True):
-                        status, body = remote.request(path, {"model": model, "input": "hello", "messages": [],
-                                                            "max_tokens": 4, "stream": stream})
+                        request = {"model": model, "input": "hello", "messages": [],
+                                   "max_tokens": 4, "stream": stream}
+                        # These legacy JWT profiles do not inject stream options.
+                        # Chat usage is opt-in; the contract below verifies it.
+                        if path == "/v1/chat/completions" and stream:
+                            request["stream_options"] = {"include_usage": True}
+                        status, body = remote.request(path, request)
                         assert status == 200, (provider, path, status)
                         check(path, body, stream, model=model)
                         report["apis"][path + ":stream=" + str(stream)] = "passed"

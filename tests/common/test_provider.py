@@ -24,7 +24,8 @@ class ProviderTest(unittest.TestCase):
                 ('/v1/messages', {'name': 'bash', 'input_schema': {}}, 1)):
             for stream in (False, True):
                 with self.subTest(route=route, stream=stream):
-                    with self.request(route, {'model': 'fixture', 'tools': [tool], 'stream': stream},
+                    with self.request(route, {'model': 'fixture', 'tools': [tool], 'stream': stream,
+                                             'stream_options': {'include_usage': True}},
                                       provider=provider) as response:
                         check(route, response.read().decode(), stream)
             if 'function' in tool:
@@ -96,7 +97,8 @@ class ProviderTest(unittest.TestCase):
         for path in ("/v1/chat/completions", "/v1/responses", "/v1/messages"):
             for stream in (False, True):
                 with self.subTest(path=path, stream=stream):
-                    with self.request(path, {"model": "fixture", "stream": stream},
+                    with self.request(path, {"model": "fixture", "stream": stream,
+                                             "stream_options": {"include_usage": True}},
                                       provider=int(path == "/v1/messages")) as response:
                         body = response.read().decode()
                     self.assertIn("mock answer", body)
@@ -109,6 +111,16 @@ class ProviderTest(unittest.TestCase):
                         self.assertEqual(json.loads(body)["model"], "fixture")
         self.assertEqual(len(self.fixture.records), 6)
         self.assertTrue(all(record["credential_ok"] for record in self.fixture.records))
+
+    def test_chat_stream_usage_requires_opt_in(self):
+        for options in (None, {}, {'include_usage': False}, {'include_usage': True}):
+            body = {'model': 'fixture', 'stream': True}
+            if options is not None:
+                body['stream_options'] = options
+            with self.request('/v1/chat/completions', body) as response:
+                payload = response.read().decode()
+            self.assertIn('mock answer', payload)
+            self.assertEqual('"usage"' in payload, options == {'include_usage': True})
 
     def test_errors_and_missing_usage_are_controlled(self):
         for mode, status in (("http429", 429), ("http500", 500)):
