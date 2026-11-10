@@ -54,6 +54,7 @@ jobs:
       - name: Qualify isolated PostgreSQL runtime
         run: sudo python3 tests/pricetag/database-smoke.py
       - name: Build pinned application sources
+        id: praxis
         shell: bash
         run: |
           set -euo pipefail
@@ -84,15 +85,26 @@ jobs:
           sudo python3 tests/pricetag/metering-unit.py --source "$RUNNER_TEMP/metering"
           sudo scripts/pricetag/build-maas --source "$RUNNER_TEMP/maas" --expected-commit "$maas" --tag localhost/maas:demo-ci
           sudo python3 scripts/pricetag/build-metering --source "$RUNNER_TEMP/metering" --revision "$metering" --tag localhost/metering:demo-ci
-          sudo podman pull quay.io/opendatahub/praxis-experimental@sha256:502f120fed7b8e516ce1d78396045c8f72673672351432b9dc2e61baf5c13ac8
+          praxis_image="$(python3 - <<'PY'
+          import importlib.util
+          from pathlib import Path
+          module_spec = importlib.util.spec_from_file_location(
+              'installer', Path('scripts/pricetag/install.py'))
+          installer = importlib.util.module_from_spec(module_spec)
+          module_spec.loader.exec_module(installer)
+          print(installer.PRAXIS_IMAGE)
+          PY
+          )"
+          echo "praxis-image=$praxis_image" >> "$GITHUB_OUTPUT"
+          sudo podman pull "$praxis_image"
       - name: Deploy and test the demo with mock inference
         run: |
-          sudo env PRAXIS_IMAGE=quay.io/opendatahub/praxis-experimental@sha256:502f120fed7b8e516ce1d78396045c8f72673672351432b9dc2e61baf5c13ac8 \
+          sudo env PRAXIS_IMAGE="${{ steps.praxis.outputs.praxis-image }}" \
             python3 tests/pricetag/routing-image.py
           sudo python3 tests/pricetag/container-demo.py \
             --maas-image localhost/maas:demo-ci \
             --metering-image localhost/metering:demo-ci \
-            --praxis-image quay.io/opendatahub/praxis-experimental@sha256:502f120fed7b8e516ce1d78396045c8f72673672351432b9dc2e61baf5c13ac8 \
+            --praxis-image "${{ steps.praxis.outputs.praxis-image }}" \
             --node-modules "$PWD/tests/pricetag/browser/node_modules" \
             --output "$RUNNER_TEMP/pricetag-demo"
       - name: Collect sanitized results
