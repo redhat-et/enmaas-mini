@@ -25,6 +25,48 @@ DASHBOARD = ['/', '/login', '/logout', '/dashboard', '/admin', '/manager', '/me'
 DASHBOARD_PREFIXES = ['/api/v1/management/', '/me/keys/', '/api/v1/me/keys/', '/api/v1/admin/partner-users/', '/api/v1/admin/pricing/reprice/']
 
 
+def policy_document(api):
+    """Render the upstream-native MaaS identity policy for one API credential."""
+    credential = {'kind': 'header', 'name': 'Authorization' if api == 'openai' else 'x-api-key'}
+    return {
+        'engine_settings': {'dispatch': 'policy'},
+        'plugins': [{
+            'name': 'maas-api-keys',
+            'kind': 'identity/api-key',
+            'hooks': ['identity.resolve'],
+            'capabilities': ['perform_http'],
+            'on_error': 'fail',
+            'config': {
+                'credential': credential,
+                **({} if api == 'anthropic' else {'prefix': 'Bearer '}),
+                'provider': {
+                    'kind': 'http',
+                    'url': 'http://pricetag-maas:8080/internal/v1/api-keys/validate',
+                    'timeout_secs': 5,
+                },
+                'record_map': {'subject': {'id': 'username', 'roles': 'groups'}},
+            },
+        }],
+        'global': {
+            'authentication': ['maas-api-keys'],
+            'authorization': {'pre_invocation': ['require(authenticated)']},
+            'assertions': {
+                'request': {
+                    'headers': [
+                        {'name': 'x-tenant-username', 'from': 'subject.id'},
+                        {'name': 'x-tenant-group', 'from': 'subject.roles', 'encode': 'csv'},
+                    ],
+                    'strip': ['authorization' if api == 'openai' else 'x-api-key'],
+                },
+            },
+        },
+        'routes': [{
+            'llm': '*',
+            'authorization': {'pre_invocation': ['require(authenticated)']},
+        }],
+    }
+
+
 def render(original, models, origins=None):
     models = validate(models)
     public_catalog = catalog(models, 'openai')
@@ -46,32 +88,23 @@ def render(original, models, origins=None):
         request_headers = next((f for f in filters if f['filter'] == 'headers'), None)
         if request_headers is not None:
             filters.remove(request_headers)
-        key_filter = {'filter': 'api_key_auth',
-            'validate_url': 'http://pricetag-maas:8080/internal/v1/api-keys/validate',
-            'token_header': 'authorization' if api == 'openai' else 'x-api-key',
-            'cache_ttl_seconds': 0, 'timeout_seconds': 5}
-        filters.insert(0, key_filter)
+        policy = {'filter': 'policy',
+                  'config_path': f'/etc/praxis/policy-{api}.yaml',
+                  'trusted_private_endpoints': ['pricetag-maas'],
+                  'llm': {'require_model': True, 'provider': api}}
+        filters.insert(0, policy)
         filters.insert(1, {'filter': 'identity_header_guard', 'prefix': 'x-tenant-'})
         selected = active(models, original, api)
         # The unified renderer already denies inference for an unused API.
         # model_access rejects an empty allowlist at startup; retain auth and
         # the terminal 404 instead of constructing an invalid filter.
-        if selected:
-            # json_body rewrites during body pre-read, before model_access's
-            # request hook. Check upstream IDs here; the unified renderer
-            # separately rejects any unregistered client alias using the
-            # original, body-derived X-Gateway-Model header.
-            filters.insert(2, {'filter': 'model_access', 'mode': 'allowlist',
-                               'models': sorted({model['model'] for model in selected}),
-                               'group_metadata_key': 'x-tenant-group', 'max_body_bytes': 33554432})
         for i, item in enumerate(filters):
             if item['filter'] == 'token_count':
                 filters.insert(i, {'filter': 'external_metering',
                     'metering_url': 'http://pricetag-metering:8080', 'allow_private_endpoint': True,
-                    'internal_auth_file': '/run/secrets/pricetag-m2m',
+                    'internal_auth_token': {'file': '/run/secrets/pricetag-m2m'},
                     'fail_open': False, 'timeout_seconds': 5, 'source': 'secure-single-server',
                     'default_username': '', 'default_model': 'unknown',
-                    'model_policy_check': True,
                     'identity_header_prefix': 'x-tenant-', 'feature_key': 'inference-tokens'})
                 break
         if request_headers is not None and selected:

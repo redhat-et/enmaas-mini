@@ -102,7 +102,7 @@ class PreparationTest(unittest.TestCase):
             self.assertEqual(replacements, [{'pointer': '/model', 'value': m['model']}
                                             for m in models])
             names = [f['filter'] for f in filters]
-            for guard in ('api_key_auth', 'identity_header_guard', 'model_access'):
+            for guard in ('policy', 'identity_header_guard'):
                 self.assertLess(names.index(guard), names.index('intelligent_route'))
             self.assertLess(names.index('intelligent_route'), names.index('credential_injection'))
             self.assertLess(names.index('external_metering'), names.index('load_balancer'))
@@ -123,8 +123,10 @@ class PreparationTest(unittest.TestCase):
         credentials = next(f for f in chain['filters'] if f['filter'] == 'credential_injection')
         self.assertEqual([(c['name'], c['env_var']) for c in credentials['clusters']],
                          [('first-openai', 'CUSTOM_FIRST_API_KEY'), ('second-openai', 'CUSTOM_SECOND_API_KEY')])
-        access = next(f for f in chain['filters'] if f['filter'] == 'model_access')
-        self.assertEqual(access['models'], ['shared'])
+        rejection = next(f for f in chain['filters'] if f.get('body') == 'Unknown model')
+        self.assertEqual(rejection['conditions'],
+                         [{'unless': {'headers': {'X-Gateway-Model': 'first/shared'}}},
+                          {'unless': {'headers': {'X-Gateway-Model': 'second/shared'}}}])
 
     def test_demo_installer_plan_and_input_validation(self):
         command = [sys.executable, str(ROOT / 'scripts/pricetag/install-demo'), '--plan',
@@ -159,8 +161,6 @@ class PreparationTest(unittest.TestCase):
         for chain in result['filter_chains']:
             if chain['name'] not in ('openai', 'anthropic'):
                 continue
-            access = next(f for f in chain['filters'] if f['filter'] == 'model_access')
-            self.assertEqual(access['models'], ['fixture'])
             rejection = next(f for f in chain['filters'] if f.get('body') == 'Unknown model')
             self.assertEqual(rejection['conditions'],
                              [{'unless': {'headers': {'X-Gateway-Model': 'mock/fixture'}}}])
@@ -170,9 +170,9 @@ class PreparationTest(unittest.TestCase):
         result = prepare.render(original, models)
         for chain in result['filter_chains']:
             if chain['name'] in ('openai', 'anthropic'):
-                metering = next(f for f in chain['filters'] if f['filter'] == 'external_metering')
-                self.assertTrue(metering['model_policy_check'])
-                self.assertFalse(metering['fail_open'])
+                rejection = next(f for f in chain['filters'] if f.get('body') == 'Unknown model')
+                self.assertEqual(rejection['conditions'],
+                                 [{'unless': {'headers': {'X-Gateway-Model': 'fixture'}}}])
 
     def test_admin_model_suggestions_use_dashboard_boundary(self):
         original, models = prepare.mock_inputs()
@@ -425,7 +425,7 @@ class PreparationTest(unittest.TestCase):
         rendered = prepare.render(original, models)
         self.assertEqual(models[0]['id'], 'fixture')
         serialized = json.dumps(rendered)
-        self.assertIn('api_key_auth', serialized)
+        self.assertIn('policy', serialized)
         self.assertIn('external_metering', serialized)
         self.assertNotIn('manual_jwt', serialized)
         self.assertNotIn('M2M_SHARED_SECRET', serialized)
@@ -435,12 +435,21 @@ class PreparationTest(unittest.TestCase):
         original, models = prepare.mock_inputs()
         rendered = prepare.render(original, models)
         chains = {chain['name']: chain['filters'] for chain in rendered['filter_chains']}
-        for name, header in (('openai', 'authorization'), ('anthropic', 'x-api-key')):
-            auth = next(f for f in chains[name] if f['filter'] == 'api_key_auth')
-            self.assertEqual(auth['token_header'], header)
-            self.assertEqual(auth['cache_ttl_seconds'], 0)
+        for name, header in (('openai', 'Authorization'), ('anthropic', 'x-api-key')):
+            auth = next(f for f in chains[name] if f['filter'] == 'policy')
+            self.assertEqual(auth['config_path'], f'/etc/praxis/policy-{name}.yaml')
+            self.assertEqual(auth['trusted_private_endpoints'], ['pricetag-maas'])
+            policy = prepare.policy_document(name)
+            credential = policy['plugins'][0]['config']['credential']
+            self.assertEqual(credential['name'], header)
+            if name == 'openai':
+                self.assertEqual(policy['plugins'][0]['config']['prefix'], 'Bearer ')
+            else:
+                self.assertNotIn('prefix', policy['plugins'][0]['config'])
+            self.assertEqual(policy['plugins'][0]['capabilities'], ['perform_http'])
             meter = next(f for f in chains[name] if f['filter'] == 'external_metering')
-            self.assertEqual(meter['internal_auth_file'], '/run/secrets/pricetag-m2m')
+            self.assertEqual(meter['internal_auth_token'],
+                             {'file': '/run/secrets/pricetag-m2m'})
             self.assertFalse(meter['fail_open'])
         edge = next(f for f in chains['edge'] if f['filter'] == 'router')
         routes = {route['path']: route['cluster'] for route in edge['routes'] if 'path' in route}
@@ -458,12 +467,13 @@ class PreparationTest(unittest.TestCase):
                 chains = {c['name']: c['filters'] for c in rendered['filter_chains']}
                 for api in ('openai', 'anthropic'):
                     filters = chains[api]
-                    self.assertEqual(filters[0]['filter'], 'api_key_auth')
-                    access = [f for f in filters if f['filter'] == 'model_access']
+                    self.assertEqual(filters[0]['filter'], 'policy')
                     if api == enabled:
-                        self.assertEqual(access[0]['models'], [m['id'] for m in models])
+                        rejection = next(f for f in filters if f.get('body') == 'Unknown model')
+                        self.assertEqual([condition['unless']['headers']['X-Gateway-Model']
+                                           for condition in rejection['conditions']],
+                                         [m['id'] for m in models])
                     else:
-                        self.assertEqual(access, [])
                         self.assertEqual(filters[-1]['filter'], 'static_response')
                         self.assertEqual(filters[-1]['status'], 404)
                         self.assertTrue(any(f['filter'] == 'static_response' and

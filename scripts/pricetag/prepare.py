@@ -15,7 +15,9 @@ import subprocess
 import unicodedata
 from urllib.parse import parse_qsl, quote, unquote, urlsplit, urlunsplit
 
-from gateway import render
+import yaml
+
+from gateway import policy_document, render
 
 ROOT = Path(__file__).resolve().parents[2]
 POSTGRES = 'docker.io/library/postgres@sha256:996e9dc583ba9f0265a2c75547a9c95fb22c251e394749cab205a0a00e1856a1'
@@ -218,7 +220,7 @@ def main():
     parser.add_argument('--providers', type=Path, default=Path('/etc/praxis/shared-gateway.yaml'))
     parser.add_argument('--models', type=Path, default=Path('/etc/praxis/unified-models.json'))
     parser.add_argument('--provider-unit', type=Path)
-    parser.add_argument('--praxis-image', required=True, help='local immutable image ID containing MaaS auth and metering filters')
+    parser.add_argument('--praxis-image', required=True, help='local immutable upstream Praxis image ID')
     parser.add_argument('--maas-image', required=True, help='local immutable cluster-free MaaS API image ID')
     parser.add_argument('--metering-image', required=True, help='local image ID sha256:... in praxis-svc storage')
     parser.add_argument('--hostname', required=True)
@@ -321,6 +323,9 @@ def main():
                            (args.admin_directory / 'tls/server-key.pem', 'tls-key.pem')]:
         shutil.copyfile(source, bundle / target)
     (bundle / 'gateway.json').write_text(json.dumps(config, indent=2) + '\n')
+    for api in ('openai', 'anthropic'):
+        (bundle / f'policy-{api}.yaml').write_text(
+            yaml.safe_dump(policy_document(api), sort_keys=False))
     shutil.copyfile(args.admin_directory / 'tls/ca.pem', args.directory / 'ca.pem')
     if external_database is None:
         postgres_password, metering_password, maas_password = (

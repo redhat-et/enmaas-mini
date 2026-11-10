@@ -211,7 +211,7 @@ alone does not describe the complete request lifecycle.
 | Location | Filters and responsibility |
 | --- | --- |
 | Public edge | `request_id`, `static_response`, `rate_limit`, `router`, `load_balancer`: correlation, route/method containment, catalog, global request protection and dispatch. |
-| Native inference | `api_key_auth`, `identity_header_guard`, `model_access`: external key validation, identity protection and configured upstream-model checks. The first and third are supplied by the pinned Red Hat ET Praxis AI fork. |
+| Native inference | `policy`, `identity_header_guard`: external key validation and identity protection. Policy uses the upstream MaaS HTTP key directory and asserts tenant headers. |
 | Model selection | `model_to_header`, `json_body`, `static_response`, `intelligent_route`: preserve the body-derived alias, reject unsupported choices, select a connection and rewrite the model. |
 | Metering | `external_metering`, `token_count`: admission and usage reporting/extraction. Messages token-count requests are excluded from usage extraction. |
 | Provider forwarding | `credential_injection`, `headers`, `load_balancer`; `anthropic_messages_protocol` on Messages: select credentials/headers and handle the native upstream protocol. |

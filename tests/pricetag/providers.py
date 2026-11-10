@@ -283,8 +283,8 @@ class SetupTest(unittest.TestCase):
             catalog_before['body']=catalog_after['body']
             self.assertEqual(edge_after,edge_before)
             for name in ('openai', 'anthropic'):
-                auth_before=[f for f in before[name]['filters'] if f['filter']=='api_key_auth']
-                auth_after=[f for f in after[name]['filters'] if f['filter']=='api_key_auth']
+                auth_before=[f for f in before[name]['filters'] if f['filter']=='policy']
+                auth_after=[f for f in after[name]['filters'] if f['filter']=='policy']
                 self.assertEqual(auth_after,auth_before)
             public=catalog_after
             self.assertEqual([m['id'] for m in json.loads(public['body'])['data']],[old[0]['id'],new['id']])
@@ -432,7 +432,7 @@ class SetupTest(unittest.TestCase):
 
     def test_active_replacement_changes_only_pricetag_endpoints(self):
         config = {'listeners': ['unchanged'], 'filter_chains': [{'name': 'openai', 'filters': [
-            {'filter': 'api_key_auth', 'validate_url': 'http://pricetag-maas:8080/internal/v1/api-keys/validate'},
+            {'filter': 'policy', 'config_path': '/etc/praxis/policy-openai.yaml'},
             {'filter': 'load_balancer', 'clusters': [
                 {'name': 'openai', 'endpoints': ['api.openai.com:443']},
                 {'name': 'pricetag-openai', 'weight': 2, 'endpoints': ['old:443'],

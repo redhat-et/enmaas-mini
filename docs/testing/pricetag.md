@@ -96,8 +96,8 @@ ledger and backups; define and test a retention policy before long-lived use.
 - The pinned MaaS image contains the reviewed cluster-free runtime changes;
   the standard Kubernetes image is not a substitute. Published images and source
   builds are described in [image options](../quickstarts/remote-gateway-pricetag/images.md).
-- Praxis must contain ET `api_key_auth` and the reviewed external-metering
-  integration. The combined experimental image must be pinned by digest.
+- Praxis uses the digest-pinned upstream `ghcr.io/praxis-proxy/ai` image with
+  its native `policy`, `identity_header_guard` and `external_metering` filters.
 - The PriceTag image includes fork changes for scoped dashboards and management.
   Automatic session invalidation on key revocation and encrypted off-host
   backup/restore remain separate work.
