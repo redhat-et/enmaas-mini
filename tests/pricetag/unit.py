@@ -89,22 +89,17 @@ class PreparationTest(unittest.TestCase):
                 continue
             filters = chain['filters']
             self.assertNotIn('router', [f['filter'] for f in filters])
-            routes = [f for f in filters if f['filter'] == 'intelligent_route']
+            routes = [f for f in filters if f['filter'] == 'model_to_provider']
             self.assertEqual(len(routes), 1)
-            self.assertEqual(routes[0], {
-                'filter': 'intelligent_route', 'local_site': 'single-server',
-                'model_header': 'X-Gateway-Model', 'skip_paths': [],
-                'candidates': [{'kind': 'inference_model', 'name': m['id'],
-                                'site': 'single-server', 'cluster': 'mock-' + api}
-                               for m in models]})
-            replacements = [f['request_replace'][0] for f in filters
-                            if f['filter'] == 'json_body' and 'request_replace' in f]
-            self.assertEqual(replacements, [{'pointer': '/model', 'value': m['model']}
-                                            for m in models])
+            paths = (['/v1/responses', '/v1/chat/completions'] if api == 'openai'
+                     else ['/v1/messages', '/v1/messages/count_tokens'])
+            self.assertEqual(routes[0]['models'], [
+                {'model': m['id'], 'upstream': 'mock-' + api, 'target_model': m['model'], 'paths': paths}
+                for m in models])
             names = [f['filter'] for f in filters]
             for guard in ('policy', 'identity_header_guard'):
-                self.assertLess(names.index(guard), names.index('intelligent_route'))
-            self.assertLess(names.index('intelligent_route'), names.index('credential_injection'))
+                self.assertLess(names.index(guard), names.index('model_to_provider'))
+            self.assertLess(names.index('model_to_provider'), names.index('credential_injection'))
             self.assertLess(names.index('external_metering'), names.index('load_balancer'))
 
     def test_same_upstream_model_on_two_providers_keeps_distinct_candidates(self):
@@ -117,8 +112,8 @@ class PreparationTest(unittest.TestCase):
                   for name in ('first', 'second')]
         result = prepare.render(native_inputs(document), models)
         chain = next(c for c in result['filter_chains'] if c['name'] == 'openai')
-        route = next(f for f in chain['filters'] if f['filter'] == 'intelligent_route')
-        self.assertEqual([(c['name'], c['cluster']) for c in route['candidates']],
+        route = next(f for f in chain['filters'] if f['filter'] == 'model_to_provider')
+        self.assertEqual([(m['model'], m['upstream']) for m in route['models']],
                          [('first/shared', 'first-openai'), ('second/shared', 'second-openai')])
         credentials = next(f for f in chain['filters'] if f['filter'] == 'credential_injection')
         self.assertEqual([(c['name'], c['env_var']) for c in credentials['clusters']],
@@ -479,7 +474,7 @@ class PreparationTest(unittest.TestCase):
                         self.assertTrue(any(f['filter'] == 'static_response' and
                                             f.get('status') == 404 and not f.get('conditions')
                                             for f in filters))
-                        self.assertFalse(any(f['filter'] in ('router', 'intelligent_route', 'load_balancer', 'external_metering')
+                        self.assertFalse(any(f['filter'] in ('router', 'model_to_provider', 'load_balancer', 'external_metering')
                                              for f in filters))
 
     def test_internal_model_headers_survive_router_selection_then_are_removed_before_upstream(self):
@@ -487,7 +482,7 @@ class PreparationTest(unittest.TestCase):
         rendered = prepare.render(original, models)
         for chain in (c for c in rendered['filter_chains'] if c['name'] in ('openai', 'anthropic')):
             names = [item['filter'] for item in chain['filters']]
-            self.assertLess(names.index('intelligent_route'), names.index('headers'))
+            self.assertLess(names.index('model_to_provider'), names.index('headers'))
             self.assertLess(names.index('headers'), names.index('load_balancer'))
 
     def test_vllm_only_excludes_cloud_routes_and_credentials_without_mutating_source(self):

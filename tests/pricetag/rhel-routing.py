@@ -152,7 +152,9 @@ def main():
             code, raw = request('/api/v1/me/usage/recent?range=mtd', opener=browser)
             rows = json.loads(raw)
             assert code == 200 and rows and all(row['username'] == subject for row in rows)
-            assert all(row['model'] in {m['model'] for m in models} for row in rows)
+            expected_models = {m['model'] for m in models}
+            unexpected_rows = [row for row in rows if row['model'] not in expected_models]
+            assert not unexpected_rows, unexpected_rows
             print('PASS: usage stays on the authenticated identity and upstream model IDs; count-tokens contributes zero usage; denials not recorded', flush=True)
     finally:
         metering_admin.request('POST', 'key-revocations', {'subject': subject})

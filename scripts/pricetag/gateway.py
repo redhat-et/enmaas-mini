@@ -6,7 +6,7 @@ from pathlib import Path
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'common'))
-from unified_config import active, catalog, render as unified, validate
+from unified_config import INFERENCE_PATHS, active, catalog, cluster_name, render as unified, validate
 
 INFERENCE = ['/v1/chat/completions', '/v1/responses', '/v1/messages']
 DASHBOARD = ['/', '/login', '/logout', '/dashboard', '/admin', '/manager', '/me', '/welcome', '/account',
@@ -95,6 +95,15 @@ def render(original, models, origins=None):
         filters.insert(0, policy)
         filters.insert(1, {'filter': 'identity_header_guard', 'prefix': 'x-tenant-'})
         selected = active(models, original, api)
+        route = next((i for i, item in enumerate(filters) if item['filter'] == 'intelligent_route'), None)
+        if route is not None:
+            end = next(i for i, item in enumerate(filters[route:], route)
+                       if item['filter'] in ('anthropic_messages_protocol', 'token_count',
+                                             'credential_injection', 'load_balancer'))
+            filters[route:end] = [{'filter': 'model_to_provider', 'models': [
+                {'model': item['id'], 'upstream': cluster_name(item, api),
+                 'target_model': item['model'], 'paths': INFERENCE_PATHS[api]}
+                for item in selected]}]
         # The unified renderer already denies inference for an unused API.
         # model_access rejects an empty allowlist at startup; retain auth and
         # the terminal 404 instead of constructing an invalid filter.

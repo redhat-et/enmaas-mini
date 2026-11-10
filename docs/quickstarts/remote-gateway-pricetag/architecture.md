@@ -178,18 +178,17 @@ solve that internal boundary. See [hardening follow-up #3](https://github.com/re
 ## Models, routing and prices
 
 Provider setup stores endpoint/secret references and reviewed model metadata.
-The generator creates native protocol chains, inline `intelligent_route`
-candidates, alias rewrites, an upstream-model allowlist and the public catalog.
+The generator creates native protocol chains, inline `model_to_provider`
+mappings, an upstream-model allowlist and the public catalog.
 Changing providers/models regenerates configuration and restarts the gateway
 with readiness/rollback checks. It is not a hot-reloaded provider-management API.
 
 - **Discovery:** `GET /v1/models` is an unauthenticated generated static response.
   It exposes configured aliases and API/context/output metadata, not keys or
   usage. It is not a per-user authorization result and does not use `model_catalog`.
-- **Routing:** inline `intelligent_route` selects the connection; separate JSON
-  rules rewrite the model. The pinned filter does not provide the newer overlay
-  `target_model` contract. The [routing reference](../../development/pricetag-routing.md)
-  explains the generated candidates and body-processing hooks.
+- **Routing:** inline `model_to_provider` selects the connection and rewrites
+  the public alias to the upstream model. The [routing reference](../../development/pricetag-routing.md)
+  explains the generated mappings and body-processing hooks.
 - **Pricing:** PriceTag imports rates and applies discounts; the fork also supports
   manual rates that survive refresh. Price lookup uses the **reported model ID**,
   not `(provider, model)`. Two aliases rewritten to the same ID share a rate.
@@ -212,7 +211,7 @@ alone does not describe the complete request lifecycle.
 | --- | --- |
 | Public edge | `request_id`, `static_response`, `rate_limit`, `router`, `load_balancer`: correlation, route/method containment, catalog, global request protection and dispatch. |
 | Native inference | `policy`, `identity_header_guard`: external key validation and identity protection. Policy uses the upstream MaaS HTTP key directory and asserts tenant headers. |
-| Model selection | `model_to_header`, `json_body`, `static_response`, `intelligent_route`: preserve the body-derived alias, reject unsupported choices, select a connection and rewrite the model. |
+| Model selection | `model_to_header`, `json_body`, `static_response`, `model_to_provider`: preserve the body-derived alias, reject unsupported choices, select a connection and rewrite the model. |
 | Metering | `external_metering`, `token_count`: admission and usage reporting/extraction. Messages token-count requests are excluded from usage extraction. |
 | Provider forwarding | `credential_injection`, `headers`, `load_balancer`; `anthropic_messages_protocol` on Messages: select credentials/headers and handle the native upstream protocol. |
 | Dashboard proxy | `headers`, `router`, `load_balancer`: remove caller identity headers and forward allowed browser/API routes. PriceTag owns session and role checks. |
