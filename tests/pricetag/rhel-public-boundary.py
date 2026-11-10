@@ -22,6 +22,10 @@ def main():
     loader.exec_module(benchmark)
     deploy = Path('/etc/praxis-pricetag')
     benchmark.require_mock(deploy)
+    models = json.loads((deploy / 'models.json').read_text())
+    model_id = next(model['id'] for model in models
+                    if {'openai', 'anthropic'}.issubset(model['apis']))
+    inference_body = json.dumps({'model': model_id}).encode()
     client = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect(),
         urllib.request.HTTPSHandler(context=ssl.create_default_context(cafile=str(deploy / 'ca.pem'))))
     spoof = {'X-Forwarded-User': 'admin', 'X-Forwarded-Real-User': 'admin',
@@ -31,7 +35,7 @@ def main():
 
     def status(route, method='GET', headers=None):
         request = urllib.request.Request('https://localhost:8443' + route,
-            data=b'{}' if method == 'POST' else None, method=method,
+            data=inference_body if method == 'POST' else None, method=method,
             headers={'Content-Type': 'application/json', **(headers or {})})
         try:
             with client.open(request, timeout=15) as response:
@@ -50,12 +54,16 @@ def main():
     protected += ['/me/keys/test-id', '/api/v1/me/keys/test-id', '/api/v1/admin/partner-users/test-id',
                   '/api/v1/admin/pricing/reprice/test-id']
     for headers in ({}, spoof):
+        boundary_failures = []
         for route in protected:
             code, _ = status(route, headers=headers)
-            assert code in (301, 302, 303, 307, 308, 401, 403), (route, code)
+            if code not in (301, 302, 303, 307, 308, 401, 403):
+                boundary_failures.append((route, code))
         for route in gateway.INFERENCE + ['/v1/messages/count_tokens']:
             code, _ = status(route, 'POST', headers)
-            assert code == 401, (route, code)
+            if code != 401:
+                boundary_failures.append((route, code))
+        assert not boundary_failures, boundary_failures
     print(f'PASS: {len(protected)} protected routes deny anonymous and spoofed identity access; inference requires keys')
     for route in ('/api/v1/events', '/api/v1/customers/test', '/api/v1/users',
                   '/api/v1/admin/keys', '/internal/v1/api-keys/validate', '/v1/api-keys',

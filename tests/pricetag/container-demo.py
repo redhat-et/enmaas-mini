@@ -144,6 +144,8 @@ def main():
     parser.add_argument('--praxis-image', required=True)
     parser.add_argument('--node-modules', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--suite-only', nargs='+',
+                        help='run only these demo-suite checks while iterating')
     args = parser.parse_args()
     if os.geteuid() != 0 or DEPLOY.exists() or DEPLOY.is_symlink() or ADMIN.exists() or ADMIN.is_symlink():
         parser.error('requires root on a disposable host without an existing deployment')
@@ -273,8 +275,11 @@ def main():
         stage = 'demo suite'
         # Logs and credentials remain private. Only results.json is published.
         with (args.output / 'suite-private.log').open('w') as log:
-            subprocess.run([sys.executable, str(ROOT / 'tests/pricetag/demo-suite'),
-                            '--output', str(args.output / 'suite'), '--node-modules', str(args.node_modules)],
+            command = [sys.executable, str(ROOT / 'tests/pricetag/demo-suite'),
+                       '--output', str(args.output / 'suite'), '--node-modules', str(args.node_modules)]
+            if args.suite_only:
+                command += ['--only', *args.suite_only]
+            subprocess.run(command,
                            stdout=log, stderr=subprocess.STDOUT, check=True, timeout=1800)
         shutil.copyfile(args.output / 'suite/results.json', args.output / 'results.json')
         print('PASS: disposable demo deployment and API/browser/quota suite')

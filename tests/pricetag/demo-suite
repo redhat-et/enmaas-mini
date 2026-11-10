@@ -58,7 +58,8 @@ def main():
             for name,source in [('admin.key','/root/pricetag-admin/admin.key'),('server.pem','/root/pricetag-admin/tls/server.pem'),('ca.pem','/etc/praxis-pricetag/ca.pem')]:
                 shutil.copyfile(source,directory/name);(directory/name).chmod(0o600)
             env={**os.environ,'GATEWAY_URL':origin,'KEY_DIRECTORY':private,'NODE_PATH':str(args.node_modules),'NODE_EXTRA_CA_CERTS':str(directory/'ca.pem'),'MOCK_DEPLOYMENT_CONFIRMED':'yes'}
-            run('browser-runtime',['node','-e',"require('playwright').chromium.launch().then(async b=>{await b.close();console.log('Browser ready')}).catch(e=>{console.error(e.message);process.exit(1)})"],env)
+            if not args.only or any(name.startswith('browser-') for name in args.only):
+                run('browser-runtime',['node','-e',"require('playwright').chromium.launch().then(async b=>{await b.close();console.log('Browser ready')}).catch(e=>{console.error(e.message);process.exit(1)})"],env)
             run('key-demotion',[sys.executable,str(ROOT/'tests/pricetag/rhel-key-demotion.py')])
             run('public-boundary',[sys.executable,str(ROOT/'tests/pricetag/rhel-public-boundary.py')])
             run('native-routing',[sys.executable,str(ROOT/'tests/pricetag/rhel-routing.py')])
