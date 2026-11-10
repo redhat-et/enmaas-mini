@@ -255,12 +255,16 @@ class Gateway:
         if self.scenario == "remote":
             wait_for_gateway(lambda path, method: self.request(path, method=method, bearer="")[0])
             return
+        metrics_address = self.config.get('admin', {}).get(
+            'metrics_address', '127.0.0.1:9901')
+        metrics_port = metrics_address.rsplit(':', 1)[1]
         for _ in range(40):
             try:
                 # GET /v1/models traverses this profile's unconditional
                 # quota filter and consumes a reservation without usage.
                 run(ENGINE, "exec", self.name + "-mock", "python3", "-c",
-                    'import urllib.request; urllib.request.urlopen("http://127.0.0.1:9901/healthy", timeout=1).read()')
+                    'import urllib.request; urllib.request.urlopen("http://127.0.0.1:' + metrics_port +
+                    '/healthy", timeout=1).read()')
                 return
             except (OSError, urllib.error.URLError, RuntimeError):
                 pass

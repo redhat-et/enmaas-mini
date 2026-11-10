@@ -25,6 +25,7 @@ def main():
 
     def candidate_render(*args, **kwargs):
         result = render(*args, **kwargs, intelligent_routing=True)
+        result['admin']['metrics_address'] = '127.0.0.1:9902'
         # Match PriceTag's absence of the legacy token limiter. The pinned
         # pipeline validator only recognizes router as its logical-upstream
         # binder; this test does not enable intelligent routing for all-in-one.

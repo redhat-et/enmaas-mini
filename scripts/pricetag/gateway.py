@@ -73,7 +73,7 @@ def render(original, models, origins=None):
     for entry, model in zip(public_catalog['data'], models):
         entry['praxis']['apis'] = model['apis']
     result = unified(original, models, intelligent_routing=True)
-    result['admin'] = {'address': '127.0.0.1:9901'}
+    result['admin'] = {'address': '127.0.0.1:9901', 'metrics_address': '127.0.0.1:9902'}
     result['insecure_options'] = {'allow_private_endpoints': True, 'allow_private_upstreams': True}
     result['listeners'] = [
         {'name': 'https', 'address': '0.0.0.0:8443', 'filter_chains': ['edge'],

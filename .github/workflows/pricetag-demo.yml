@@ -110,12 +110,13 @@ jobs:
       - name: Collect sanitized results
         if: always()
         run: |
-          mkdir -p evidence/pricetag-demo
+          sudo mkdir -p evidence/pricetag-demo
           for name in results failure; do
             if sudo test -f "$RUNNER_TEMP/pricetag-demo/$name.json"; then
-              sudo cat "$RUNNER_TEMP/pricetag-demo/$name.json" | tee "evidence/pricetag-demo/$name.json" >/dev/null
+              sudo cp "$RUNNER_TEMP/pricetag-demo/$name.json" "evidence/pricetag-demo/$name.json"
             fi
           done
+          sudo chown -R "$(id -u):$(id -g)" evidence/pricetag-demo
       - name: Upload assertion results only
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
