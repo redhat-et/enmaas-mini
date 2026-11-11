@@ -235,7 +235,8 @@ Quota exceptions permit explicit client model selection; they do not reroute
 a denied request automatically.
 
 
-[Providers](providers.md) · [Users, keys and budgets](users.md) ·
+[Providers](providers.md) · [Self-hosted vLLM](vllm-external-provider.md) ·
+[Users, keys and budgets](users.md) ·
 [Management CLI and API](management-api.md) ·
 [Manual installation](manual.md) · [Mock benchmarks](../../testing/pricetag-perf.md)
 
