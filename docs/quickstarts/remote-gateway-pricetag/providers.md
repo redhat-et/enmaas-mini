@@ -9,7 +9,9 @@ Provider keys stay on RHEL; clients use their own MaaS user keys.
 
 An external provider is a hosted service or another gateway. Both APIs can share
 an endpoint or use separate endpoints, but must accept the same key. GPT models
-using Responses need `/v1/responses`, not just Chat compatibility.
+using Responses need `/v1/responses`, not just Chat compatibility. For a
+self-hosted vLLM server behind this profile, see the
+[vLLM integration notes](vllm-external-provider.md).
 
 The installer supports these two fixed profiles. Choose them during installation;
 the helper cannot add arbitrary profile names. Older `pricetag/` deployments use
