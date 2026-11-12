@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# Execute, do not source: credentials live only in this process and its AWS calls.
+set +x
+set +v
+if [[ ${BASH_SOURCE[0]} != "$0" ]]; then
+  printf 'Run this script with bash; do not source it.\n' >&2
+  return 1
+fi
+set +a
+ulimit -c 0
+umask 077
+
+repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd) || exit 1
+cd -- "$repo" || exit 1
+# shellcheck source=scripts/aws/session.sh
+source scripts/aws/session.sh || exit 1
+for tool in aws jq; do
+  command -v "$tool" >/dev/null || { printf 'Missing prerequisite: %s\n' "$tool" >&2; exit 1; }
+done
+if [ "$#" -gt 1 ]; then
+  printf 'Usage: bash tests/external-services/aws-discover [deployment-region]\n' >&2
+  exit 1
+fi
+region=${1:-}
+if [ -z "$region" ]; then
+  [ -t 0 ] || { printf 'Run in an interactive terminal.\n' >&2; exit 1; }
+  read -r -p 'AWS deployment region [eu-central-1]: ' region || exit 1
+  region=${region:-eu-central-1}
+fi
+if [[ ! $region =~ ^[a-z]{2}(-[a-z]+)+-[0-9]+$ ]]; then
+  printf 'Invalid AWS region.\n' >&2
+  exit 1
+fi
+
+trap 'unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_SECURITY_TOKEN' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+# Ignore saved profiles, CLI history and configured endpoint overrides. Never
+# invoke `aws configure`, write a credentials file or put key values in argv.
+export AWS_CONFIG_FILE=/dev/null AWS_SHARED_CREDENTIALS_FILE=/dev/null
+export AWS_EC2_METADATA_DISABLED=true AWS_CLI_AUTO_PROMPT=off AWS_PAGER=''
+export AWS_IGNORE_CONFIGURED_ENDPOINT_URLS=true AWS_MAX_ATTEMPTS=2
+unset AWS_SECURITY_TOKEN
+aws_test_credentials || exit 1
+printf '\nRead-only discovery; credentials stay in this script and its AWS calls, not your parent shell.\n'
+
+if ! identity=$(aws --region "$region" --cli-connect-timeout 10 --cli-read-timeout 30 \
+    sts get-caller-identity --output json 2>/dev/null); then
+  printf 'Caller identity failed; check credentials, region and connectivity. No further calls made.\n' >&2
+  exit 1
+fi
+if ! account=$(printf '%s' "$identity" | jq -er '.Account | select(test("^[0-9]{12}$"))'); then
+  printf 'Invalid account response.\n' >&2
+  exit 1
+fi
+printf '%s\n' "$identity" | jq '{Account,Arn}'
+failed=0
+inspect() {
+  local title=$1
+  shift
+  printf '\n%s\n' "$title"
+  if ! aws --cli-connect-timeout 10 --cli-read-timeout 30 "$@" 2>/dev/null; then
+    printf 'Unavailable: check read permission or connectivity for this section.\n' >&2
+    failed=1
+  fi
+}
+# JMESPath backticks are literals, not shell substitutions.
+# shellcheck disable=SC2016
+inspect 'Public hosted zones (not automatically selected)' \
+  --region "$region" route53 list-hosted-zones \
+  --query 'HostedZones[?Config.PrivateZone==`false`].{Domain:Name,HostedZoneId:Id}' --output table
+# Route 53 Domains uses its us-east-1 service endpoint, not the deployment region.
+inspect 'Domains registered through AWS (registration elsewhere will not appear)' \
+  --region us-east-1 route53domains list-domains \
+  --query 'Domains[].{Domain:DomainName,Expires:Expiry}' --output table
+inspect 'Existing VPCs (Default identifies AWS default VPCs)' \
+  --region "$region" ec2 describe-vpcs \
+  --query 'Vpcs[].{VPC:VpcId,Default:IsDefault,CIDR:CidrBlock,State:State}' --output table
+inspect 'Candidate subnets (deployment planning must still verify routing)' \
+  --region "$region" ec2 describe-subnets \
+  --query 'Subnets[].{Subnet:SubnetId,VPC:VpcId,Zone:AvailabilityZone,FreeIPs:AvailableIpAddressCount,PublicIPOnLaunch:MapPublicIpOnLaunch}' --output table
+# shellcheck disable=SC2016
+inspect 'Existing gateway/identity/observability VMs (not automatically selected)' \
+  --region "$region" ec2 describe-instances \
+  --filters 'Name=instance-state-name,Values=pending,running,stopped' \
+    'Name=tag:Scenario,Values=remote-gateway,keycloak,observability' \
+  --query 'Reservations[].Instances[].{Name:Tags[?Key==`Name`]|[0].Value,Role:Tags[?Key==`Scenario`]|[0].Value,Instance:InstanceId,State:State.Name,PublicIP:PublicIpAddress,PrivateIP:PrivateIpAddress,KeyPair:KeyName,SecurityGroups:SecurityGroups[].GroupId}' --output json
+printf '\nNonsecret selection for the deployment terminal:\nexport ACCOUNT=%q\nexport REGION=%q\n' "$account" "$region"
+printf 'Existing networks are informational; this script does not select or create a deployment VPC.\n'
+printf 'An optional public zone still needs selection and DNS delegation verification.\n'
+printf 'No resources changed or credential files written. Deployment authentication is a separate step.\n'
+if [ "$failed" -ne 0 ]; then
+  printf 'Discovery is partial; resolve unavailable sections before relying on them.\n' >&2
+fi
+exit "$failed"

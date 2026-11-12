@@ -1,0 +1,216 @@
+{
+  "kind": "Dashboard",
+  "metadata": {
+    "name": "enmaas-host",
+    "project": "praxis"
+  },
+  "spec": {
+    "display": {
+      "name": "enMAAS gateway \u2014 host resources"
+    },
+    "duration": "15m",
+    "panels": {
+      "0": {
+        "kind": "Panel",
+        "spec": {
+          "display": {
+            "name": "Host CPU busy percent",
+            "description": "Aggregate CPU time excluding idle and I/O wait. Not container CPU usage."
+          },
+          "plugin": {
+            "kind": "TimeSeriesChart",
+            "spec": {
+              "legend": {
+                "mode": "table",
+                "position": "bottom",
+                "values": [
+                  "max"
+                ]
+              },
+              "visual": {
+                "areaOpacity": 0,
+                "lineWidth": 2
+              }
+            }
+          },
+          "queries": [
+            {
+              "kind": "TimeSeriesQuery",
+              "spec": {
+                "plugin": {
+                  "kind": "PrometheusTimeSeriesQuery",
+                  "spec": {
+                    "query": "100 * sum(rate(enmaas_host_cpu_seconds_total{state!~\"idle|iowait\"}[2m])) / clamp_min(sum(rate(enmaas_host_cpu_seconds_total[2m])), 1e-9)",
+                    "seriesNameFormat": "CPU busy"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      "1": {
+        "kind": "Panel",
+        "spec": {
+          "display": {
+            "name": "Host memory bytes",
+            "description": "Unavailable is total minus MemAvailable. Cached overlaps other measurements and must not be added to unavailable."
+          },
+          "plugin": {
+            "kind": "TimeSeriesChart",
+            "spec": {
+              "legend": {
+                "mode": "table",
+                "position": "bottom",
+                "values": [
+                  "max"
+                ]
+              },
+              "visual": {
+                "areaOpacity": 0,
+                "lineWidth": 2
+              }
+            }
+          },
+          "queries": [
+            {
+              "kind": "TimeSeriesQuery",
+              "spec": {
+                "plugin": {
+                  "kind": "PrometheusTimeSeriesQuery",
+                  "spec": {
+                    "query": "enmaas_host_memory_bytes{state=~\"total|available|unavailable|cached\"}",
+                    "seriesNameFormat": "{{state}}"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      "2": {
+        "kind": "Panel",
+        "spec": {
+          "display": {
+            "name": "Data filesystem bytes",
+            "description": "Capacity of the filesystem containing /var. Reserved space makes total differ from used plus available. External RDS storage is excluded."
+          },
+          "plugin": {
+            "kind": "TimeSeriesChart",
+            "spec": {
+              "legend": {
+                "mode": "table",
+                "position": "bottom",
+                "values": [
+                  "max"
+                ]
+              },
+              "visual": {
+                "areaOpacity": 0,
+                "lineWidth": 2
+              }
+            }
+          },
+          "queries": [
+            {
+              "kind": "TimeSeriesQuery",
+              "spec": {
+                "plugin": {
+                  "kind": "PrometheusTimeSeriesQuery",
+                  "spec": {
+                    "query": "enmaas_host_disk_bytes",
+                    "seriesNameFormat": "{{state}}"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      "3": {
+        "kind": "Panel",
+        "spec": {
+          "display": {
+            "name": "Host load averages",
+            "description": "Runnable and uninterruptible tasks averaged over 1, 5 and 15 minutes; not CPU percentages."
+          },
+          "plugin": {
+            "kind": "TimeSeriesChart",
+            "spec": {
+              "legend": {
+                "mode": "table",
+                "position": "bottom",
+                "values": [
+                  "max"
+                ]
+              },
+              "visual": {
+                "areaOpacity": 0,
+                "lineWidth": 2
+              }
+            }
+          },
+          "queries": [
+            {
+              "kind": "TimeSeriesQuery",
+              "spec": {
+                "plugin": {
+                  "kind": "PrometheusTimeSeriesQuery",
+                  "spec": {
+                    "query": "enmaas_host_load",
+                    "seriesNameFormat": "{{state}}"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "layouts": [
+      {
+        "kind": "Grid",
+        "spec": {
+          "items": [
+            {
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 10,
+              "content": {
+                "$ref": "#/spec/panels/0"
+              }
+            },
+            {
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 10,
+              "content": {
+                "$ref": "#/spec/panels/1"
+              }
+            },
+            {
+              "x": 0,
+              "y": 10,
+              "width": 12,
+              "height": 10,
+              "content": {
+                "$ref": "#/spec/panels/2"
+              }
+            },
+            {
+              "x": 12,
+              "y": 10,
+              "width": 12,
+              "height": 10,
+              "content": {
+                "$ref": "#/spec/panels/3"
+              }
+            }
+          ]
+        }
+      }
+    ]
+  }
+}

@@ -1,0 +1,67 @@
+{
+  "kind": "Dashboard",
+  "metadata": {
+    "name": "enmaas-traces",
+    "project": "praxis"
+  },
+  "spec": {
+    "display": {
+      "name": "enMAAS gateway \u2014 traces"
+    },
+    "duration": "15m",
+    "panels": {
+      "0": {
+        "kind": "Panel",
+        "spec": {
+          "display": {
+            "name": "Recent gateway traces",
+            "description": "Sampled request traces. Sensitive names and attributes are removed before storage. Click a trace to inspect its duration and spans; absence does not prove no request occurred."
+          },
+          "plugin": {
+            "kind": "TraceTable",
+            "spec": {
+              "links": {
+                "trace": "/projects/praxis/dashboards/enmaas-trace-detail?var-traceId=${traceId}"
+              }
+            }
+          },
+          "queries": [
+            {
+              "kind": "TraceQuery",
+              "spec": {
+                "plugin": {
+                  "kind": "TempoTraceQuery",
+                  "spec": {
+                    "datasource": {
+                      "kind": "TempoDatasource",
+                      "name": "tempo"
+                    },
+                    "query": "{resource.service.name =~ \"enmaas-gateway.*\"}"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "layouts": [
+      {
+        "kind": "Grid",
+        "spec": {
+          "items": [
+            {
+              "x": 0,
+              "y": 0,
+              "width": 24,
+              "height": 16,
+              "content": {
+                "$ref": "#/spec/panels/0"
+              }
+            }
+          ]
+        }
+      }
+    ]
+  }
+}

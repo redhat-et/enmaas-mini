@@ -1,0 +1,20 @@
+{
+  "kind": "GlobalDatasource",
+  "metadata": {
+    "name": "loki"
+  },
+  "spec": {
+    "default": false,
+    "plugin": {
+      "kind": "LokiDatasource",
+      "spec": {
+        "proxy": {
+          "kind": "HTTPProxy",
+          "spec": {
+            "url": "http://127.0.0.1:3100"
+          }
+        }
+      }
+    }
+  }
+}

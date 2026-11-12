@@ -28,7 +28,7 @@ Each URL must:
 - use `postgres://` or `postgresql://`;
 - include a host, port, username, password, and database name;
 - target the exact database shown above;
-- set `sslmode=require` or `sslmode=verify-full`;
+- set `sslmode=verify-full`;
 - optionally set `connect_timeout` to an integer from 1 through 30 seconds;
 - optionally set `application_name`; metering may also set `hostaddr` to the
   same literal IPv4 or IPv6 address and port used by the MaaS URL.
@@ -38,9 +38,10 @@ Other URI query parameters, including parameters that override the host, role,
 database, or password, are rejected. This ensures startup validation checks
 the same connection that the applications use.
 
-`sslmode=verify-full` is recommended. It also requires a CA file that verifies
-the server certificate and hostname. A CA file is not accepted with
-`sslmode=require` because that mode does not verify the certificate chain.
+`sslmode=verify-full` and an explicit CA file are required to verify the server
+certificate and hostname. Encryption-only modes such as `sslmode=require` are
+rejected. Existing deployments using that mode must obtain the database CA and
+use a certificate-matching hostname before preparing a new configuration.
 
 URL-encode special characters in the username or password. For example, use
 `%40` for `@` and `%2F` for `/`.

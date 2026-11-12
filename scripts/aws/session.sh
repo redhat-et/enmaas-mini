@@ -3,7 +3,7 @@
 # Call functions in `if` or `||` guards, including when the caller has errexit.
 
 if [ ! -f scripts/aws/rhel-vm ]; then
-  printf 'Run from the reviewed secure-single-server repository root.\n' >&2
+  printf 'Run from the reviewed enmaas-mini repository root.\n' >&2
   return 1
 fi
 AWS_TEST_REPO="$PWD"
@@ -52,10 +52,26 @@ aws_test_credentials() {
   printf 'Credentials loaded in this terminal only; not yet validated against AWS.\n'
 }
 
+aws_test_profile() {
+  local deployment_profile=${1:-}
+  case "$deployment_profile" in
+    ''|*[!a-zA-Z0-9_.-]*) _aws_test_error 'Supply a named AWS CLI profile.'; return 1 ;;
+  esac
+  if [ "$#" -ne 1 ]; then _aws_test_error 'Supply exactly one profile name.'; return 1; fi
+  unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_SECURITY_TOKEN
+  unset AWS_DEFAULT_PROFILE AWS_TEST_READY AWS_TEST_PLAN_INPUTS ACCOUNT
+  unset RHEL_HOST RHEL_SCENARIO RHEL_INFERENCE RHEL_VPC_ID RHEL_STATE_FILE
+  export AWS_PROFILE="$deployment_profile" AWS_PAGER=''
+  AWS_TEST_CREDENTIALS=profile
+  printf 'Selected AWS profile: %s; run discovery to validate identity.\n' "$deployment_profile"
+}
+
 _aws_test_identity_ready() {
-  if [ "${AWS_TEST_CREDENTIALS:-}" != ready ] || [ -z "${AWS_ACCESS_KEY_ID:-}" ] ||
+  if [ "${AWS_TEST_CREDENTIALS:-}" = profile ]; then
+    if [ -z "${AWS_PROFILE:-}" ]; then _aws_test_error 'Select an AWS profile first.'; return 1; fi
+  elif [ "${AWS_TEST_CREDENTIALS:-}" != ready ] || [ -z "${AWS_ACCESS_KEY_ID:-}" ] ||
       [ -z "${AWS_SECRET_ACCESS_KEY:-}" ]; then
-    _aws_test_error 'Load credentials first.'
+    _aws_test_error 'Load credentials or select an AWS profile first.'
     return 1
   fi
   if [ -z "${REGION:-}" ] || [ -z "${RUN_PREFIX:-}" ]; then
@@ -80,6 +96,11 @@ aws_test_discover() {
   }
   test_identity=$(aws --region "$REGION" sts get-caller-identity --output json) || return 1
   ACCOUNT=$(printf '%s' "$test_identity" | jq -er '.Account | select(test("^[0-9]{12}$"))') || return 1
+  if [ -n "${AWS_TEST_EXPECTED_ACCOUNT:-}" ] && [ "$ACCOUNT" != "$AWS_TEST_EXPECTED_ACCOUNT" ]; then
+    unset ACCOUNT
+    _aws_test_error 'AWS identity does not match the selected deployment account.'
+    return 1
+  fi
   test_principal=$(printf '%s' "$test_identity" | jq -er '.Arn') || return 1
   case "$test_principal" in
     *:root) _aws_test_error 'Root-account credentials are refused.'; return 1 ;;
@@ -188,8 +209,8 @@ _aws_test_launch() {
     esac
   done
   case "$test_scenario" in
-    all-in-one|remote-gateway|vllm-server) ;;
-    *) _aws_test_error 'Supply --scenario all-in-one, remote-gateway or vllm-server; hardware presets do not choose the role.'; return 1 ;;
+    all-in-one|remote-gateway|vllm-server|keycloak|observability) ;;
+    *) _aws_test_error 'Supply --scenario all-in-one, remote-gateway, vllm-server, keycloak or observability; hardware presets do not choose the role.'; return 1 ;;
   esac
   case "$test_name" in
     all-in-one|remote-gateway|vllm-server)
@@ -243,7 +264,7 @@ aws_test_verify() {
     _aws_test_error "$test_name must be running with a public IP; wait and rerun verify."
     return 1
   }
-  test_scenario=$(printf '%s' "$test_info" | jq -er '.Scenario | select(. == "all-in-one" or . == "remote-gateway" or . == "vllm-server")') || return 1
+  test_scenario=$(printf '%s' "$test_info" | jq -er '.Scenario | select(. == "all-in-one" or . == "remote-gateway" or . == "vllm-server" or . == "keycloak" or . == "observability")') || return 1
   test_inference=$(printf '%s' "$test_info" | jq -er '.Inference | select(. == "cpu" or . == "gpu" or . == "none")') || return 1
   test_vpc=$(printf '%s' "$test_info" | jq -er '.VpcId | select(. != null)') || return 1
   RHEL_HOST="ec2-user@$test_ip"

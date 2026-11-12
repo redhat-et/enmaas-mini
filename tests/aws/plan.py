@@ -20,6 +20,18 @@ loader.exec_module(vm)
 
 
 class PlanTest(unittest.TestCase):
+    def test_group_tags_are_derived_from_run_and_legacy_tags_are_unchanged(self):
+        prefix = 'em-demo-0123456789ab'
+        for role, scenario in [('gateway', 'remote-gateway'), ('keycloak', 'keycloak'), ('observability', 'observability')]:
+            tags = {row['Key']: row['Value'] for row in vm.tags(prefix+'-'+role, scenario)}
+            self.assertEqual(tags['enmaas:group'], 'demo')
+            self.assertEqual(tags['enmaas:run'], prefix)
+            self.assertEqual(tags['enmaas:purpose'], 'external-services-test')
+        with self.assertRaises(ValueError):
+            vm.tags(prefix+'-gateway', 'keycloak')
+        for legacy in ('enmaas-0123456789abcdef-gateway', 'pricetag-test-real'):
+            self.assertNotIn('enmaas:group', {row['Key']: row['Value'] for row in vm.tags(legacy, 'remote-gateway')})
+
     def test_capacity_report_lists_only_public_subnets_without_claiming_free_instances(self):
         aws = vm.Aws("eu-central-1", None, False)
         args = SimpleNamespace(account_id="123456789012", instance_type="g6.2xlarge", subnet_id="subnet-a")
@@ -204,8 +216,30 @@ class PlanTest(unittest.TestCase):
                 vm.apply_retry(aws, args, state, state)
             self.assertEqual([call.args[1] for call in calls.call_args_list], ["run-instances"])
             self.assertEqual(calls.call_args.kwargs["client_token"], "original-token")
+            self.assertEqual([row["ResourceType"] for row in calls.call_args.kwargs["tag_specifications"]],
+                             ["instance", "volume"])
             self.assertEqual(calls.call_args.kwargs["network_interfaces"][0]["Groups"], ["sg-original"])
             self.assertEqual(json.loads(args.state_file.read_text())["InstanceId"], "i-retry")
+
+    def test_new_launch_tag_contract_survives_retry_and_rejects_unknown_types(self):
+        for tag_types in (["instance", "volume", "network-interface"], ["instance", "snapshot"]):
+            with self.subTest(tag_types=tag_types), tempfile.TemporaryDirectory() as directory:
+                args, proposal, aws = self.apply_inputs(directory)
+                state = {**proposal, "ClientToken": "original-token", "SecurityGroupId": "sg-original",
+                         "KeyPairName": args.prefix, "ApplyStatus": "launch-requested",
+                         "LaunchTagResourceTypes": tag_types}
+                vm.save_state(args.state_file, state)
+                with patch.object(aws, "call", return_value={"Instances": [{"InstanceId": "i-retry"}]}) as calls, \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    if "snapshot" in tag_types:
+                        with self.assertRaisesRegex(ValueError, "launch-tag contract"):
+                            vm.launch_instance(aws, args, proposal, state)
+                        calls.assert_not_called()
+                    else:
+                        vm.launch_instance(aws, args, proposal, state)
+                        self.assertEqual(calls.call_args.kwargs["client_token"], "original-token")
+                        self.assertEqual([row["ResourceType"] for row in calls.call_args.kwargs["tag_specifications"]], tag_types)
+                        self.assertEqual(json.loads(args.state_file.read_text())["LaunchTagResourceTypes"], tag_types)
 
     def retry_inputs(self, directory):
         args = self.settings(config=ROOT / "configs/aws/vllm-gpu.json", scenario="all-in-one",
@@ -356,6 +390,10 @@ class PlanTest(unittest.TestCase):
 
     def test_public_ssh_is_explicit_and_does_not_open_https_or_backends(self):
         for scenario in vm.SCENARIOS:
+            if scenario in vm.AUXILIARY:
+                with self.assertRaises(ValueError):
+                    vm.ingress(scenario, "192.0.2.1/32", ssh_access="public")
+                continue
             rules = vm.ingress(scenario, "192.0.2.1/32", ssh_access="public")
             self.assertEqual(rules[0]["IpRanges"], [{"CidrIp": "0.0.0.0/0"}])
             self.assertEqual([rule["FromPort"] for rule in rules],
@@ -857,6 +895,10 @@ class PlanTest(unittest.TestCase):
                     self.assertEqual(len(options["network_interfaces"]), 1)
                     self.assertTrue(options["network_interfaces"][0]["DeleteOnTermination"])
                     self.assertTrue(options["network_interfaces"][0]["AssociatePublicIpAddress"])
+                    self.assertEqual([row["ResourceType"] for row in options["tag_specifications"]],
+                                     ["instance", "volume", "network-interface"])
+                    self.assertTrue(all(row["Tags"] == vm.tags(args.prefix, args.scenario)
+                                        for row in options["tag_specifications"]))
                     self.assertEqual(len(options["block_device_mappings"]), 1)
                     self.assertTrue(options["block_device_mappings"][0]["Ebs"]["DeleteOnTermination"])
                     return {"Instances": [{"InstanceId": "i-test"}]}

@@ -51,7 +51,7 @@ def main():
         try:
             run(PODMAN + ['network', 'create', network])
             run(PODMAN + ['run', '-d', '--name', container, '--network', network,
-                 '--network-alias', 'external-db.test', '--env', 'POSTGRES_PASSWORD=' + password,
+                 '--network-alias', 'external-db.test', '--network-alias', 'wrong-db.test', '--env', 'POSTGRES_PASSWORD=' + password,
                  POSTGRES])
             wait_for_postgres(container)
             for source, target in ((certificate, '/tmp/server.crt'), (key, '/tmp/server.key')):
@@ -94,7 +94,19 @@ def main():
                     check=True, text=True, stdout=subprocess.PIPE).stdout.strip()
                 if result != f'{role}:{role}':
                     raise RuntimeError(f'unexpected connection identity: {result}')
-            print('PASS: external MaaS and metering URLs connected over verified TLS')
+                # A reachable server with a different hostname must fail before authentication.
+                wrong_environment = dict(environment, PGHOST='wrong-db.test')
+                wrong_file = certificates / f'{role}-wrong-host.env'
+                wrong_file.write_text(''.join(f'{name}={value}\n' for name, value in wrong_environment.items()))
+                rejected = subprocess.run(
+                    PODMAN + ['run', '--rm', '--network', network, '--env-file', wrong_file,
+                     '-v', f'{certificate}:/etc/pricetag-external-ca.crt:ro,Z',
+                     '-v', f'{password_file}:/run/secrets/external-db-password:ro,Z',
+                     POSTGRES, 'sh', '-c', shell_command],
+                    text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                if rejected.returncode == 0 or 'does not match host name' not in rejected.stderr:
+                    raise RuntimeError('expected certificate hostname rejection was not observed')
+            print('PASS: external MaaS and metering connections verify TLS; wrong server hostname rejected')
         finally:
             subprocess.run(PODMAN + ['rm', '-f', container],
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

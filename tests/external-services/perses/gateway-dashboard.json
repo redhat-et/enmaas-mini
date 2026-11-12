@@ -1,0 +1,216 @@
+{
+  "kind": "Dashboard",
+  "metadata": {
+    "name": "enmaas-gateway",
+    "project": "praxis"
+  },
+  "spec": {
+    "display": {
+      "name": "enMAAS gateway \u2014 routed traffic"
+    },
+    "duration": "15m",
+    "panels": {
+      "0": {
+        "kind": "Panel",
+        "spec": {
+          "display": {
+            "name": "Routed requests per second",
+            "description": "Public-chain requests that reached a router; early pre-routing rejections are excluded."
+          },
+          "plugin": {
+            "kind": "TimeSeriesChart",
+            "spec": {
+              "legend": {
+                "mode": "table",
+                "position": "bottom",
+                "values": [
+                  "max"
+                ]
+              },
+              "visual": {
+                "areaOpacity": 0,
+                "lineWidth": 2
+              }
+            }
+          },
+          "queries": [
+            {
+              "kind": "TimeSeriesQuery",
+              "spec": {
+                "plugin": {
+                  "kind": "PrometheusTimeSeriesQuery",
+                  "spec": {
+                    "query": "sum by (cluster, status_class) (rate(praxis_http_requests_total{cluster=~\"authenticated-openai|authenticated-anthropic|dashboard\"}[2m]))",
+                    "seriesNameFormat": "{{cluster}} {{status_class}}"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      "1": {
+        "kind": "Panel",
+        "spec": {
+          "display": {
+            "name": "Mean routed request duration",
+            "description": "Seconds per routed request. Mean duration, not a latency percentile. Shows zero when no requests occur in the window."
+          },
+          "plugin": {
+            "kind": "TimeSeriesChart",
+            "spec": {
+              "legend": {
+                "mode": "table",
+                "position": "bottom",
+                "values": [
+                  "max"
+                ]
+              },
+              "visual": {
+                "areaOpacity": 0,
+                "lineWidth": 2
+              }
+            }
+          },
+          "queries": [
+            {
+              "kind": "TimeSeriesQuery",
+              "spec": {
+                "plugin": {
+                  "kind": "PrometheusTimeSeriesQuery",
+                  "spec": {
+                    "query": "sum by (cluster) (rate(praxis_http_request_duration_seconds_sum{cluster=~\"authenticated-openai|authenticated-anthropic|dashboard\"}[2m])) / clamp_min(sum by (cluster) (rate(praxis_http_request_duration_seconds_count{cluster=~\"authenticated-openai|authenticated-anthropic|dashboard\"}[2m])), 1e-9)",
+                    "seriesNameFormat": "{{cluster}}"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      "2": {
+        "kind": "Panel",
+        "spec": {
+          "display": {
+            "name": "Active public requests",
+            "description": "Requests active on the public HTTPS listener."
+          },
+          "plugin": {
+            "kind": "TimeSeriesChart",
+            "spec": {
+              "legend": {
+                "mode": "table",
+                "position": "bottom",
+                "values": [
+                  "max"
+                ]
+              },
+              "visual": {
+                "areaOpacity": 0,
+                "lineWidth": 2
+              }
+            }
+          },
+          "queries": [
+            {
+              "kind": "TimeSeriesQuery",
+              "spec": {
+                "plugin": {
+                  "kind": "PrometheusTimeSeriesQuery",
+                  "spec": {
+                    "query": "praxis_http_active_requests{listener=\"https\"}",
+                    "seriesNameFormat": "Public HTTPS"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      "3": {
+        "kind": "Panel",
+        "spec": {
+          "display": {
+            "name": "Gateway open file descriptors",
+            "description": "Gateway process file descriptor count; this is not host CPU or memory usage."
+          },
+          "plugin": {
+            "kind": "TimeSeriesChart",
+            "spec": {
+              "legend": {
+                "mode": "table",
+                "position": "bottom",
+                "values": [
+                  "max"
+                ]
+              },
+              "visual": {
+                "areaOpacity": 0,
+                "lineWidth": 2
+              }
+            }
+          },
+          "queries": [
+            {
+              "kind": "TimeSeriesQuery",
+              "spec": {
+                "plugin": {
+                  "kind": "PrometheusTimeSeriesQuery",
+                  "spec": {
+                    "query": "praxis_process_open_fds",
+                    "seriesNameFormat": "Open descriptors"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "layouts": [
+      {
+        "kind": "Grid",
+        "spec": {
+          "items": [
+            {
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 10,
+              "content": {
+                "$ref": "#/spec/panels/0"
+              }
+            },
+            {
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 10,
+              "content": {
+                "$ref": "#/spec/panels/1"
+              }
+            },
+            {
+              "x": 0,
+              "y": 10,
+              "width": 12,
+              "height": 10,
+              "content": {
+                "$ref": "#/spec/panels/2"
+              }
+            },
+            {
+              "x": 12,
+              "y": 10,
+              "width": 12,
+              "height": 10,
+              "content": {
+                "$ref": "#/spec/panels/3"
+              }
+            }
+          ]
+        }
+      }
+    ]
+  }
+}

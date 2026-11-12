@@ -8,6 +8,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'common'))
 from unified_config import active, catalog, render as unified, validate
 
+OIDC = ['/oauth/login', '/oauth/callback']
 INFERENCE = ['/v1/chat/completions', '/v1/responses', '/v1/messages']
 DASHBOARD = ['/', '/login', '/logout', '/dashboard', '/admin', '/manager', '/me', '/welcome', '/account',
              '/management', '/admin/impersonate', '/me/keys', '/whoami', '/api/v1/whoami', '/api/v1/pricing',
@@ -80,7 +81,7 @@ def render(original, models, origins=None):
             filters.insert(load_balancer, request_headers)
         chain['filters'] = filters
 
-    allowed = [{'path': p} for p in DASHBOARD] + [{'path_prefix': p} for p in DASHBOARD_PREFIXES] + [
+    allowed = [{'path': p, 'methods': ['GET']} for p in OIDC] + [{'path': p} for p in DASHBOARD] + [{'path_prefix': p} for p in DASHBOARD_PREFIXES] + [
         {'path': '/v1/models', 'methods': ['GET']}] + [
         {'path': p, 'methods': ['POST']} for p in [*INFERENCE, '/v1/messages/count_tokens']]
     # The public listener routes protocol paths to different private chains so
@@ -99,7 +100,7 @@ def render(original, models, origins=None):
              for p in ('/v1/messages', '/v1/messages/count_tokens')] +
             [{'path': p, 'cluster': 'authenticated-openai'}
              for p in ('/v1/responses', '/v1/chat/completions')] +
-            [{'path': p, 'cluster': 'dashboard'} for p in DASHBOARD] +
+            [{'path': p, 'cluster': 'dashboard'} for p in [*DASHBOARD, *OIDC]] +
             [{'path_prefix': p, 'cluster': 'dashboard'} for p in DASHBOARD_PREFIXES]},
         {'filter': 'load_balancer', 'clusters': [
             {'name': 'authenticated-openai', 'endpoints': ['127.0.0.1:18082']},

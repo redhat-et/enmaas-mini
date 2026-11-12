@@ -18,6 +18,16 @@ The tested VM has 8 vCPUs, 32 GiB RAM and 150 GiB disk. No GPU is needed.
 > demo branches** or add `--image-mode source`; see [image options](images.md).
 > The optional provider editor is not included.
 
+## Choose the setup
+
+This page installs **one node without SSO or external observability**, using local
+or external PostgreSQL. For gateway + external SSO + observability,
+follow [full deployment](full-deployment.md). Both layouts can use real providers.
+[Deployment and installation modes](deployment-options.md) compares both and
+provides interactive/headless commands. AWS provisioning is separate:
+[one node](../../testing/aws-pricetag.md) or
+[three-node lab](../../testing/external-services/aws.md).
+
 ## 1. Set the connection
 
 Run from your checked-out `enmaas-mini` repository on your workstation:

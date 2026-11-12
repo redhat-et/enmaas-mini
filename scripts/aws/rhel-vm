@@ -20,12 +20,14 @@ import uuid
 
 OWNER = "309956199498"
 MANAGED = "secure-single-server-test"
-SCENARIOS = ("all-in-one", "remote-gateway", "vllm-server")
+SCENARIOS = ("all-in-one", "remote-gateway", "vllm-server", "keycloak", "observability")
+AUXILIARY = {"keycloak": 8192, "observability": 16384}
+HTTPS_SCENARIOS = ("remote-gateway", "keycloak", "observability")
 VLLM_PORT = 8000
 CONFIG_KEYS = {"scenario", "inference", "arch", "instance_type", "volume_gib", "ami_id", "ssh_access", "https_access"}
 READS = {"get-caller-identity", "describe-instance-types", "describe-images", "describe-subnets",
          "describe-route-tables", "describe-instances", "describe-security-groups", "describe-volumes",
-         "describe-key-pairs", "describe-instance-type-offerings"}
+         "describe-key-pairs", "describe-instance-type-offerings", "describe-network-interfaces"}
 WRITES = {"import-key-pair", "create-security-group", "authorize-security-group-ingress", "run-instances"}
 
 
@@ -78,7 +80,9 @@ def ingress(scenario, cidr, ssh_access="restricted", https_access="restricted"):
         raise ValueError("https_access must be restricted or public")
     if https_access == "public" and scenario != "remote-gateway":
         raise ValueError("public HTTPS is only available for remote-gateway")
-    needs_cidr = ssh_access == "restricted" or (scenario == "remote-gateway" and https_access == "restricted")
+    if scenario in AUXILIARY and ssh_access != "restricted":
+        raise ValueError("auxiliary test hosts require restricted SSH")
+    needs_cidr = ssh_access == "restricted" or (scenario in HTTPS_SCENARIOS and https_access == "restricted")
     if needs_cidr and not cidr:
         raise ValueError("--allowed-cidr is required for restricted SSH or HTTPS")
     if cidr:
@@ -87,7 +91,7 @@ def ingress(scenario, cidr, ssh_access="restricted", https_access="restricted"):
             raise ValueError("allowed-cidr must be one IPv4 /32; use --ssh-access/--https-access public for public access")
         cidr = str(network)
     ports = [(22, ssh_access)]
-    if scenario == "remote-gateway":
+    if scenario in HTTPS_SCENARIOS:
         ports.append((8443, https_access))
     return [{"IpProtocol": "tcp", "FromPort": port, "ToPort": port,
              "IpRanges": [{"CidrIp": "0.0.0.0/0" if access == "public" else cidr}]}
@@ -131,8 +135,20 @@ def update_state(path, state):
 
 
 def tags(prefix, scenario):
-    return [{"Key": "ManagedBy", "Value": MANAGED}, {"Key": "ResourcePrefix", "Value": prefix},
-            {"Key": "Scenario", "Value": scenario}, {"Key": "Name", "Value": prefix}]
+    result = [{"Key": "ManagedBy", "Value": MANAGED}, {"Key": "ResourcePrefix", "Value": prefix},
+              {"Key": "Scenario", "Value": scenario}, {"Key": "Name", "Value": prefix}]
+    # Registry-generated runs share the RDS ownership tag. Legacy journals keep
+    # their original contract; never retroactively adopt or retag resources.
+    match = re.fullmatch(r'(enmaas-[a-f0-9]{16}|em-[a-z][a-z0-9]{0,7}-[a-f0-9]{12})-(gateway|keycloak|observability)', prefix)
+    if match:
+        expected = {'gateway': 'remote-gateway', 'keycloak': 'keycloak', 'observability': 'observability'}
+        if scenario != expected[match[2]]:
+            raise ValueError('deployment role and scenario differ')
+        result += [{"Key": "enmaas:run", "Value": match[1]},
+                   {"Key": "enmaas:purpose", "Value": "external-services-test"}]
+        if match[1].startswith('em-'):
+            result.append({"Key": "enmaas:group", "Value": match[1].split('-')[1]})
+    return result
 
 
 def filters(**values):
@@ -398,7 +414,9 @@ def configure(args):
     if inference not in ("none", "cpu", "gpu") or arch not in ("amd64", "arm64"):
         raise ValueError("inference must be none/cpu/gpu and arch must be amd64/arm64")
     if settings.get("scenario") not in SCENARIOS:
-        raise ValueError("set scenario to all-in-one, remote-gateway or vllm-server")
+        raise ValueError("set a supported gateway, vLLM or auxiliary scenario")
+    if settings.get("scenario") in AUXILIARY and (inference != "none" or settings["ssh_access"] != "restricted"):
+        raise ValueError("auxiliary test hosts require none inference and restricted SSH")
     if settings.get("scenario") == "vllm-server" and inference == "none":
         raise ValueError("vllm-server requires the cpu or gpu inference hardware profile")
     if inference != "none" and arch != "amd64":
@@ -417,10 +435,11 @@ def configure(args):
         setattr(args, key, value)
 
 
-def validate_machine(machine, architecture, inference):
-    if (machine["MemoryInfo"]["SizeInMiB"] < 32768
+def validate_machine(machine, architecture, inference, scenario="remote-gateway"):
+    minimum = AUXILIARY.get(scenario, 32768)
+    if (machine["MemoryInfo"]["SizeInMiB"] < minimum
             or architecture not in machine["ProcessorInfo"]["SupportedArchitectures"]):
-        raise ValueError("instance must have at least 32 GiB RAM and match --arch")
+        raise ValueError(f"instance must have at least {minimum // 1024} GiB RAM and match --arch")
     if inference == "gpu":
         gpus = machine.get("GpuInfo", {}).get("Gpus", [])
         if (len(gpus) != 1 or gpus[0].get("Name") != "L4"
@@ -489,7 +508,7 @@ def plan(aws, args):
     instance_type = args.instance_type or ("m7g.2xlarge" if args.arch == "arm64" else "m7i.2xlarge")
     machine = aws.call("ec2", "describe-instance-types", instance_types=[instance_type])["InstanceTypes"][0]
     architecture = "arm64" if args.arch == "arm64" else "x86_64"
-    validate_machine(machine, architecture, args.inference)
+    validate_machine(machine, architecture, args.inference, args.scenario)
     image_filters = filters(name=f"RHEL-9.*_HVM-*-{architecture}-*-Hourly2-GP3",
                             architecture=architecture, state="available")
     images = aws.call("ec2", "describe-images", owners=[OWNER], filters=image_filters)["Images"]
@@ -527,7 +546,7 @@ def plan(aws, args):
     return {"AccountId": identity["Account"], "PrincipalArn": identity["Arn"], "Region": args.region,
             "Prefix": args.prefix, "Scenario": args.scenario, "Inference": args.inference,
             "SshAccess": args.ssh_access,
-            "HttpsAccess": args.https_access if args.scenario == "remote-gateway" else "disabled",
+            "HttpsAccess": args.https_access if args.scenario in HTTPS_SCENARIOS else "disabled",
             "InstanceType": instance_type, "MemoryGiB": machine["MemoryInfo"]["SizeInMiB"] / 1024,
             "GpuInfo": machine.get("GpuInfo"), "AvailabilityZone": subnet["AvailabilityZone"],
             "Architecture": architecture, "ImageId": image["ImageId"], "ImageName": image["Name"],
@@ -536,7 +555,8 @@ def plan(aws, args):
 
 
 def apply_plan(aws, args, proposal):
-    state = {**proposal, "ClientToken": str(uuid.uuid4()), "ApplyStatus": "started"}
+    state = {**proposal, "ClientToken": str(uuid.uuid4()), "ApplyStatus": "started",
+             "LaunchTagResourceTypes": ["instance", "volume", "network-interface"]}
     save_state(args.state_file, state)
     print("Recovery journal:", args.state_file, flush=True)
     owned = tags(args.prefix, args.scenario)
@@ -558,6 +578,11 @@ def apply_plan(aws, args, proposal):
 def launch_instance(aws, args, proposal, state):
     # Replay identical parameters with the recorded token after an uncertain result.
     owned = tags(args.prefix, args.scenario)
+    # Preserve older journal requests exactly when retrying their client token.
+    # New runs tag the auto-created primary interface at creation, not afterward.
+    tag_types = state.get("LaunchTagResourceTypes", ["instance", "volume"])
+    if tag_types not in (["instance", "volume"], ["instance", "volume", "network-interface"]):
+        raise ValueError("unsupported launch-tag contract in recovery journal")
     try:
         result = aws.call("ec2", "run-instances", image_id=proposal["ImageId"],
             instance_type=proposal["InstanceType"], count=1, client_token=state["ClientToken"], key_name=state["KeyPairName"],
@@ -567,7 +592,7 @@ def launch_instance(aws, args, proposal, state):
             metadata_options={"HttpTokens": "required", "HttpEndpoint": "enabled", "HttpPutResponseHopLimit": 1},
             block_device_mappings=[{"DeviceName": proposal["RootDeviceName"], "Ebs": {
                 "Encrypted": True, "VolumeSize": args.volume_gib, "VolumeType": "gp3", "DeleteOnTermination": True}}],
-            tag_specifications=[{"ResourceType": kind, "Tags": owned} for kind in ["instance", "volume"]])
+            tag_specifications=[{"ResourceType": kind, "Tags": owned} for kind in tag_types])
     except AwsError as error:
         if error.code == "InsufficientInstanceCapacity":
             state["ApplyStatus"] = "capacity-unavailable"
@@ -755,7 +780,7 @@ def verify(aws, args):
                       "Scenario": state["Scenario"],
                       "Inference": state.get("Inference", "none"), "InstanceType": state["InstanceType"],
                       "SshAccess": state.get("SshAccess", "restricted"),
-                      "HttpsAccess": state.get("HttpsAccess", "restricted" if state["Scenario"] == "remote-gateway" else "disabled"),
+                      "HttpsAccess": state.get("HttpsAccess", "restricted" if state["Scenario"] in HTTPS_SCENARIOS else "disabled"),
                       "VolumeGiB": volume["Size"],
                       "Result": "AWS configuration verified; SSH, host firewall and gateway tests remain separate"}, indent=2))
 
@@ -844,7 +869,7 @@ def execute_plan(aws, args):
     if args.ssh_access == "public":
         print("Public SSH selected: anyone on the IPv4 Internet can reach port 22."
               " SSH authentication still applies.")
-    if args.scenario == "remote-gateway":
+    if args.scenario in HTTPS_SCENARIOS:
         if args.https_access == "public":
             print("Public HTTPS selected: anyone on the IPv4 Internet can reach port 8443."
                   " Install the HTTPS/JWT gateway before serving requests; valid caller JWTs remain required.")

@@ -1,0 +1,89 @@
+#!/usr/bin/env python3
+"""Provision an external OIDC identity through PriceTag's private partner API."""
+import argparse
+from email.utils import parseaddr
+import json
+import os
+from pathlib import Path
+import stat
+import urllib.error
+import urllib.request
+import uuid
+
+from metering_admin import NoRedirect
+
+DEPLOY = Path('/etc/praxis-pricetag')
+
+
+def validate(document):
+    if not isinstance(document, dict) or set(document) != {'user_id', 'tags'}:
+        raise ValueError('profile requires user_id and tags only')
+    identity = document['user_id']
+    try:
+        if not isinstance(identity, str) or str(uuid.UUID(identity)) != identity:
+            raise ValueError()
+    except (ValueError, AttributeError):
+        raise ValueError('user_id must be the canonical UUID asserted by the issuer') from None
+    tags = document['tags']
+    required = {'email', 'first_name', 'last_name'}
+    if not isinstance(tags, dict) or set(tags) != required:
+        raise ValueError('tags must contain email, first_name and last_name')
+    if any(not isinstance(value, str) or not value.strip() or len(value) > 256
+           or any(ord(c) < 32 or ord(c) == 127 for c in value) for value in tags.values()):
+        raise ValueError('identity tags must be nonempty bounded text without control characters')
+    address = tags['email']
+    if parseaddr(address)[1] != address or '@' not in address or any(c.isspace() for c in address):
+        raise ValueError('email must be a bare email address')
+    return document
+
+
+def private_json(path):
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(descriptor, 'rb') as source:
+        info = os.fstat(source.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o077:
+            raise ValueError('profile must be a root-owned mode-0600 regular file')
+        content = source.read(65537)
+    if len(content) > 65536:
+        raise ValueError('profile exceeds 64 KiB')
+    return validate(json.loads(content))
+
+
+def provision(document):
+    if os.geteuid() != 0:
+        raise ValueError('run with sudo on the gateway host')
+    document = validate(document)
+    secret = (DEPLOY / 'partner-secret').read_text().strip()
+    if not secret:
+        raise ValueError('partner API secret is not configured')
+    request = urllib.request.Request(
+        'http://127.0.0.1:18087/api/v1/users/' + document['user_id'],
+        data=json.dumps({'tags': document['tags']}).encode(), method='PUT',
+        headers={'Authorization': 'Bearer ' + secret, 'Content-Type': 'application/json'})
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+    try:
+        with opener.open(request, timeout=30) as response:
+            result = json.load(response)
+    except urllib.error.HTTPError as error:
+        raise ValueError(f'partner identity API returned HTTP {error.code}') from None
+    if not isinstance(result, dict) or result.get('user_id') != document['user_id']:
+        raise ValueError('partner API returned an unexpected identity; inspect server state')
+    return result
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--profile', type=Path, required=True,
+                        help='root-private JSON containing the issuer UUID and display attributes')
+    args = parser.parse_args()
+    if os.geteuid() != 0:
+        parser.error('run with sudo on the gateway host')
+    provision(private_json(args.profile))
+    print('OIDC identity provisioned; roles, budgets and inference keys are separate operations.')
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (OSError, ValueError):
+        raise SystemExit('Identity provisioning failed; inspect the private profile and service state. No automatic retry was attempted.') from None

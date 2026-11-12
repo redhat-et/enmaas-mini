@@ -56,6 +56,18 @@ jobs:
           printf '%s\n' "${bin_dir}" >>"${GITHUB_PATH}"
       - name: Check scripts, templates, documentation, and regressions
         run: python3 tests/mocked-provider.py --suite offline --engine docker
+      - name: Check external-services lab contracts without AWS credentials
+        run: |
+          python3 tests/pricetag/tls-bundle.py
+          python3 -m unittest discover -s tests/external-services -p 'test_*.py'
+          python3 tests/pricetag/oidc-user.py
+          python3 tests/pricetag/oidc.py
+          python3 tests/aws/auxiliary.py
+          shellcheck -x tests/external-services/install-telemetry-agent
+          shellcheck -x tests/external-services/install-observability
+          shellcheck -x tests/external-services/install-keycloak
+          bash -n tests/external-services/aws-lab.sh
+          shellcheck -x tests/external-services/aws-discover
       - name: Check external-client TLS, caller fixtures, isolation and cancellation
         run: python3 -B tests/remote-client/unit.py
       - name: Verify anonymous pulls of released installer images

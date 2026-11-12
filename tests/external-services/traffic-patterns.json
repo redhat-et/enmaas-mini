@@ -1,0 +1,46 @@
+{
+  "mock_only": true,
+  "phase_seconds": 600,
+  "phases": [
+    {
+      "name": "baseline",
+      "users": 1,
+      "streams_per_user": 1,
+      "rate_limit_rps": 1000
+    },
+    {
+      "name": "team",
+      "users": 20,
+      "streams_per_user": 1,
+      "rate_limit_rps": 1000
+    },
+    {
+      "name": "parallel",
+      "users": 20,
+      "streams_per_user": 4,
+      "rate_limit_rps": 1000
+    },
+    {
+      "name": "bursts",
+      "users": 20,
+      "streams_per_user": 4,
+      "rate_limit_rps": 1000,
+      "active_seconds": 30,
+      "idle_seconds": 30
+    },
+    {
+      "name": "rate_limited",
+      "users": 20,
+      "streams_per_user": 4,
+      "rate_limit_rps": 5
+    },
+    {
+      "name": "recovery",
+      "users": 1,
+      "streams_per_user": 1,
+      "rate_limit_rps": 1000
+    }
+  ],
+  "runner_status": "Implemented with local scheduler, HTTPS and failure-cleanup tests; full gateway/RHEL execution pending. No capacity claim.",
+  "runner": "tests/external-services/benchmark.py"
+}

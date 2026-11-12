@@ -1,0 +1,63 @@
+{
+  "kind": "Dashboard",
+  "metadata": {
+    "name": "enmaas-logs",
+    "project": "praxis"
+  },
+  "spec": {
+    "display": {
+      "name": "enMAAS gateway \u2014 service events"
+    },
+    "duration": "15m",
+    "panels": {
+      "0": {
+        "kind": "Panel",
+        "spec": {
+          "display": {
+            "name": "Sanitized service log events",
+            "description": "Event time, service and severity. Original messages and sensitive attributes are removed before export; use SSH for full service diagnostics."
+          },
+          "plugin": {
+            "kind": "LogsTable",
+            "spec": {}
+          },
+          "queries": [
+            {
+              "kind": "LogQuery",
+              "spec": {
+                "plugin": {
+                  "kind": "LokiLogQuery",
+                  "spec": {
+                    "datasource": {
+                      "kind": "LokiDatasource",
+                      "name": "loki"
+                    },
+                    "query": "{service_name=~\".+\"}"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "layouts": [
+      {
+        "kind": "Grid",
+        "spec": {
+          "items": [
+            {
+              "x": 0,
+              "y": 0,
+              "width": 24,
+              "height": 16,
+              "content": {
+                "$ref": "#/spec/panels/0"
+              }
+            }
+          ]
+        }
+      }
+    ]
+  }
+}

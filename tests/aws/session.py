@@ -80,6 +80,21 @@ class SessionTest(unittest.TestCase):
         self.assertNotIn("UNEXPECTED_AWS_CALL", result.stdout)
         return result.stdout + result.stderr
 
+    def test_profile_selection_clears_static_credentials_and_checks_account(self):
+        for shell in SHELLS:
+            with self.subTest(shell=shell):
+                output = self.run_shell(shell, SETUP + """
+AWS_TEST_EXPECTED_ACCOUNT=999999999999
+aws_test_profile lab-role || exit 1
+[ -z "${AWS_ACCESS_KEY_ID:-}" ] && [ -z "${AWS_SECRET_ACCESS_KEY:-}" ] || exit 1
+if aws_test_discover; then printf 'WRONG_ACCOUNT_ACCEPTED\\n'; fi
+AWS_TEST_EXPECTED_ACCOUNT=123456789012
+if aws_test_discover; then printf 'PROFILE_OK\\n'; fi
+printf 'SHELL_ALIVE\\n'
+""")
+                self.assertNotIn('WRONG_ACCOUNT_ACCEPTED', output)
+                self.assertIn('PROFILE_OK', output)
+
     def test_missing_public_key_reports_recovery_before_planning(self):
         for shell in SHELLS:
             output = self.run_shell(shell, "set -eu\nMODE=normal\n" + SETUP + """

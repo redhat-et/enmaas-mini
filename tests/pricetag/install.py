@@ -28,6 +28,47 @@ benchmark = module('benchmark')
 
 
 class InstallTest(unittest.TestCase):
+    def test_replaceable_mock_profiles_require_explicit_mock_mode(self):
+        base = ['--hostname', 'gateway.example', '--plan']
+        args = installer.parse_args(base + ['--mode', 'mock', '--mock-profiles'])
+        self.assertTrue(args.mock_profiles)
+        self.assertTrue(installer.parse_args(base + ['--mode', 'mock']).mock_profiles)
+        self.assertFalse(installer.parse_args(base + ['--mode', 'mock', '--demo-fixture']).mock_profiles)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            installer.install(args)
+        self.assertIn('OpenAI (mock), External OpenAI/Messages (mock)', output.getvalue())
+        for extra in (['--mock-profiles'], ['--mode', 'mock', '--mock-profiles', '--demo-fixture']):
+            with self.assertRaises(SystemExit):
+                installer.parse_args(base + extra)
+
+    def test_explicit_headless_never_prompts_even_with_terminal(self):
+        base=['--hostname','gateway.example','--non-interactive','--yes']
+        with patch.object(installer.sys.stdin,'isatty',return_value=True), patch('builtins.input',side_effect=AssertionError('unexpected prompt')):
+            for missing in ([],['--provider','openai'],['--provider','external','--external-api','both','--external-key-file','/root/key']):
+                with self.assertRaises(SystemExit):installer.parse_args(base+missing)
+            args=installer.parse_args(base+['--provider','openai','--openai-key-file','/root/key','--no-sample-users','--image-mode','source'])
+            self.assertTrue(args.non_interactive)
+            self.assertFalse(args.sample_users)
+            self.assertEqual(args.provider,['openai'])
+            with self.assertRaises(SystemExit):installer.parse_args(['--mode','mock','--hostname','gateway.example','--non-interactive'])
+            mock=installer.parse_args(base+['--mode','mock','--no-sample-users','--image-mode','source'])
+            self.assertEqual(mock.mode,'mock')
+
+    def test_oidc_rejects_known_published_revision_without_handler(self):
+        args = installer.parse_args(['--mode','mock','--hostname','gateway.example',
+            '--oidc-config','/root/oidc.json','--image-mode','published','--yes'])
+        with contextlib.redirect_stdout(io.StringIO()), self.assertRaisesRegex(ValueError,'source'):
+            installer.install(args)
+
+    def test_oidc_invalid_input_fails_before_host_changes(self):
+        args = installer.parse_args(['--mode', 'mock', '--hostname', 'gateway.example',
+                                     '--oidc-config', '/nonexistent/oidc.json', '--yes'])
+        with patch.object(installer, 'preflight') as preflight:
+            with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(ValueError):
+                installer.install(args)
+            preflight.assert_not_called()
+
     def test_bootstrap_failure_stops_before_marker_and_explains_recovery(self):
         source = (ROOT / 'scripts/pricetag/start').read_text()
         start = source.index('  if ! python3 "${SCRIPT_DIR}/metering_admin.py"')
@@ -62,7 +103,7 @@ class InstallTest(unittest.TestCase):
                               installer.PUBLISHED_METERING_IMAGE):
                     self.assertEqual(text.count(image), 1)
                 self.assertNotIn('  Mode ', text)
-                self.assertIn('Mock providers (benchmark)' if mode == 'mock' else
+                self.assertIn('OpenAI (mock), External OpenAI/Messages (mock)' if mode == 'mock' else
                               'OpenAI, External (OpenAI-compatible + Anthropic Messages)', text)
 
     def test_sample_users_can_be_omitted_without_omitting_admin(self):
@@ -147,7 +188,7 @@ class InstallTest(unittest.TestCase):
             self.assertEqual(checkout.call_args_list[0].args[2], 'refs/heads/feature/test')
             self.assertEqual(args.maas_revision, resolved)
             self.assertEqual(checkout.call_args_list[1].args[2],
-                             'refs/heads/feat/latest-upstream-standalone')
+                             'refs/heads/fix/oidc-logout-form-policy')
             self.assertEqual(args.metering_revision, resolved)
             self.assertTrue(any('--revision' in c.args[0] and resolved in c.args[0]
                                 for c in run.call_args_list))

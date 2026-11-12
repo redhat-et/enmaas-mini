@@ -71,7 +71,9 @@ nav:
           - Mutable RHEL deployment: docs/quickstarts/common/vllm.md
           - Bootc image deployment: bootc/VLLM.md
       - Remote gateway with PriceTag:
-          - Guided installation: docs/quickstarts/remote-gateway-pricetag/README.md
+          - Choose deployment and installer mode: docs/quickstarts/remote-gateway-pricetag/deployment-options.md
+          - One-node installation: docs/quickstarts/remote-gateway-pricetag/README.md
+          - Full deployment with SSO and observability: docs/quickstarts/remote-gateway-pricetag/full-deployment.md
           - Architecture and OpenShift comparison: docs/quickstarts/remote-gateway-pricetag/architecture.md
           - Manual installation: docs/quickstarts/remote-gateway-pricetag/manual.md
           - External PostgreSQL databases: docs/quickstarts/remote-gateway-pricetag/external-database.md
@@ -97,6 +99,31 @@ nav:
       - Mock provider tests: docs/testing/mocked-provider.md
       - AWS VM runbook: docs/testing/aws.md
       - AWS operations: docs/testing/aws-operations.md
+      - Full-deployment testing:
+          - Overview: docs/testing/external-services/README.md
+          - Nodes and collectors: docs/testing/external-services/topology.md
+          - Local Podman:
+              - Setup and tests: docs/testing/external-services/local-podman.md
+              - Open dashboards: docs/testing/external-services/local-dashboards.md
+          - AWS test infrastructure:
+              - Three-node provisioning: docs/testing/external-services/aws.md
+              - Optional RDS: docs/testing/external-services/rds.md
+          - RHEL service installation:
+              - Headless installation: docs/testing/external-services/headless.md
+              - Certificates: docs/testing/external-services/certificates.md
+              - Peer networking: docs/testing/external-services/network.md
+              - Optional DNS: docs/testing/external-services/dns.md
+              - Keycloak node: docs/testing/external-services/keycloak-rhel.md
+              - Observability node: docs/testing/external-services/observability-rhel.md
+              - Gateway telemetry agent: docs/testing/external-services/gateway-telemetry.md
+              - SSO and identities: docs/testing/external-services/oidc.md
+              - Providers: docs/testing/external-services/providers.md
+          - Qualification and cleanup:
+              - Security acceptance: docs/testing/external-services/security-acceptance.md
+              - Benchmark: docs/testing/external-services/benchmark.md
+              - Reports: docs/testing/external-services/report.md
+              - Detailed design: docs/testing/external-services/design.md
+              - Cleanup: docs/testing/external-services/cleanup.md
 
 extra_css:
   - assets/stylesheets/redhat.css

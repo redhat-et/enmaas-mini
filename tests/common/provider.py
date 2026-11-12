@@ -160,10 +160,11 @@ def events(path, result):
 class Provider:
     def __init__(self, ports=(18080, 18081, 19000), host="127.0.0.1", control_host="127.0.0.1",
                  openai_authorization="Bearer synthetic-openai", model="fixture", local=False, strict_openai=False,
-                 declared_tools_only=False, request_backlog=5, record_limit=None):
+                 declared_tools_only=False, request_backlog=5, record_limit=None, models_by_api=None):
         # None requires the local profile to remove Authorization completely.
         self.openai_authorization = openai_authorization
         self.model = model
+        self.models_by_api = models_by_api
         self.local = local
         self.strict_openai = strict_openai
         self.declared_tools_only = declared_tools_only
@@ -190,9 +191,13 @@ class Provider:
                         else:
                             self.reply(404, {"error": "unsupported control path"})
                         return
-                    self.record({})
+                    valid = self.record({})
+                    if fixture.models_by_api is not None and not valid:
+                        return self.reply(403, {"error": "credential mismatch"})
                     if self.path == "/v1/models":
-                        self.reply(200, {"object": "list", "data": [{"id": fixture.model, "object": "model"}]})
+                        self.reply(200, {"object": "list", "data": [{"id": model, "object": "model"} for model in
+                            (fixture.models_by_api.get("anthropic" if self.server.provider_index == 1 else "openai", [])
+                             if fixture.models_by_api is not None else [fixture.model])]})
                     else:
                         self.reply(404, {"error": "unsupported path"})
 
@@ -253,6 +258,8 @@ class Provider:
                     error = openai_error(self.path, body) if fixture.strict_openai else None
                     if error:
                         return self.reply(400, {"error": error})
+                    if fixture.models_by_api is not None and body.get("model") not in fixture.models_by_api.get("anthropic" if anthropic else "openai", []):
+                        return self.reply(404, {"error": "unknown mock profile model"})
                     if fixture.local and body.get("model") != fixture.model:
                         return self.reply(404, {"error": "unknown local model"})
                     if self.path == "/v1/messages/count_tokens" and anthropic:

@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# Attach a private test relay to an existing gateway. No AWS operations.
+set -euo pipefail
+HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd -- "${HERE}/../.." && pwd)"
+# shellcheck source=scripts/common/lib.sh
+source "${ROOT}/scripts/common/lib.sh"
+require_root
+[[ "$#" -eq 4 ]] || die 'usage: install-telemetry-agent INPUTS SERVER_CA CLIENT_CERT CLIENT_KEY'
+inputs="$1"; ca="$2"; cert="$3"; key="$4"
+python3 - "$inputs" "$ca" "$cert" "$key" <<'PY'
+from pathlib import Path
+import stat,sys
+root=Path(sys.argv[1])
+for path in [root,root/'quadlets',root/'collector.yaml',root/'gateway-telemetry.conf',
+             root/'quadlets/lab-gateway-telemetry.container',root/'systemd',
+             root/'systemd/enmaas-host-metrics.service',root/'systemd/enmaas-host-metrics.timer',
+             root/'quadlets/lab-gateway-log-positions.volume',
+             root/'pricetag-gateway-logs.conf',root/'pricetag-metering-logs.conf',root/'pricetag-maas-logs.conf',*map(Path,sys.argv[2:])]:
+    info=path.lstat()
+    if path.is_symlink() or info.st_uid!=0 or info.st_mode&0o077 or not (stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode)):
+        raise SystemExit('inputs must be root-owned private regular files/directories without symlinks')
+PY
+"${ROOT}/scripts/remote-gateway/credentials" check-tls --cert "$cert" --key "$key"
+openssl x509 -in "$ca" -noout >/dev/null
+uid="$(service_uid)"; units="/etc/containers/systemd/users/${uid}"
+[[ -f "${units}/pricetag-gateway.container" ]] || die 'install the gateway first'
+[[ ! -e /etc/enmaas-telemetry-lab ]] || die 'existing telemetry installation; inspect it before retrying'
+[[ ! -e "${units}/lab-gateway-telemetry.container" ]] || die 'existing telemetry unit'
+[[ ! -e "${units}/pricetag-gateway.container.d/telemetry.conf" ]] || die 'existing telemetry drop-in'
+for file in /etc/systemd/system/enmaas-host-metrics.service /etc/systemd/system/enmaas-host-metrics.timer /usr/local/libexec/enmaas-host-metrics; do
+  [[ ! -e "$file" ]] || die 'existing host metrics installation'
+done
+for component in pricetag-gateway pricetag-metering pricetag-maas; do
+  [[ -f "${units}/${component}.container" ]] || die "missing service: ${component}"
+  [[ ! -e "${units}/${component}.container.d/service-logs.conf" ]] || die 'existing service-log drop-in'
+done
+log_directory="$(service_home)/.local/share/enmaas-telemetry-logs"
+[[ ! -e "$log_directory" ]] || die 'existing telemetry log directory; inspect before retrying'
+[[ ! -e "${units}/lab-gateway-log-positions.volume" ]] || die 'existing log-position volume unit'
+image="$(sed -n 's/^Image=//p' "${inputs}/quadlets/lab-gateway-telemetry.container")"
+[[ "$image" =~ @sha256:[a-f0-9]{64}$ ]] || die 'expected a pinned collector image'
+arch="$(oci_architecture "$(uname -m)")"
+as_service podman pull --platform "linux/${arch}" "$image" >/dev/null
+platform="$(as_service podman image inspect "$image" --format '{{.Os}}/{{.Architecture}}')"
+require_linux_image_platform "$image" "${platform%%/*}" "${platform#*/}" "$arch"
+install -d -m 0700 /etc/enmaas-telemetry-lab
+printf 'Inspect telemetry secrets and units after partial installation.\n' >/etc/enmaas-telemetry-lab/install-state
+create_secret() {
+  ! as_service podman secret inspect "$1" >/dev/null 2>&1 || die "existing secret: $1"
+  as_service podman secret create "$1" - <"$2" >/dev/null
+}
+create_secret lab-gateway-telemetry-config "${inputs}/collector.yaml"
+create_secret lab-gateway-telemetry-ca "$ca"
+create_secret lab-gateway-telemetry-cert "$cert"
+create_secret lab-gateway-telemetry-key "$key"
+# Validate before changing the running gateway; this has no network access.
+as_service podman run --rm --network none --read-only --cap-drop all --security-opt no-new-privileges \
+  --secret lab-gateway-telemetry-config,target=/lab/collector.yaml \
+  --secret lab-gateway-telemetry-ca,target=/lab/server-ca.pem \
+  --secret lab-gateway-telemetry-cert,target=/lab/client.pem \
+  --secret lab-gateway-telemetry-key,target=/lab/client.key \
+  "$image" validate --config=/lab/collector.yaml >/dev/null
+install -m 0644 "${inputs}/quadlets/lab-gateway-telemetry.container" "${units}/lab-gateway-telemetry.container"
+install -d -m 0755 "${units}/pricetag-gateway.container.d"
+install -m 0644 "${inputs}/gateway-telemetry.conf" "${units}/pricetag-gateway.container.d/telemetry.conf"
+install -m 0600 "$ca" /etc/enmaas-telemetry-lab/server-ca.pem
+install -m 0600 "$cert" /etc/enmaas-telemetry-lab/client.pem
+install -m 0600 "$key" /etc/enmaas-telemetry-lab/client.key
+install -d -m 0755 /usr/local/libexec
+install -m 0755 "${HERE}/host-metrics.py" /usr/local/libexec/enmaas-host-metrics
+install -m 0644 "${inputs}/systemd/enmaas-host-metrics.service" /etc/systemd/system/enmaas-host-metrics.service
+install -m 0644 "${inputs}/systemd/enmaas-host-metrics.timer" /etc/systemd/system/enmaas-host-metrics.timer
+install -d -m 0700 -o "$SERVICE_USER" -g "$(service_gid)" "$log_directory"
+install -m 0644 "${inputs}/quadlets/lab-gateway-log-positions.volume" "${units}/lab-gateway-log-positions.volume"
+for component in pricetag-gateway pricetag-metering pricetag-maas; do
+  install -d -m 0755 "${units}/${component}.container.d"
+  install -m 0644 "${inputs}/${component}-logs.conf" "${units}/${component}.container.d/service-logs.conf"
+done
+systemctl daemon-reload
+systemctl enable --now enmaas-host-metrics.timer
+as_service systemctl --user daemon-reload
+as_service systemctl --user restart pricetag-maas.service pricetag-metering.service pricetag-gateway.service
+as_service systemctl --user start lab-gateway-telemetry.service
+printf 'Gateway, MaaS and PriceTag restarted with the private relay. Verify remote signal arrival and queue/drop metrics before acceptance.\n'
