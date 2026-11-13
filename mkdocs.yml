@@ -92,6 +92,8 @@ nav:
       - Documentation site: docs/development/documentation-site.md
       - MaaS and PriceTag image publication: docs/development/pricetag-images.md
       - PriceTag gateway routing: docs/development/pricetag-routing.md
+      - EnMaaS-opps image and configuration parity: docs/development/enmaas-opps-parity.md
+      - Image to repository correlation: docs/development/image-repo-correlation.md
   - Testing:
       - Testing guide: docs/testing/README.md
       - Mock provider tests: docs/testing/mocked-provider.md
