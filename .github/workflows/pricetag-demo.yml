@@ -60,21 +60,31 @@ jobs:
           # Independent of private registries or provider credentials. Use the
           # reviewed source candidate, independently of published image digests.
           maas=6ac4c80ebc95f590e5f24593ac15bb80c7f9fa1d
-          metering=b1c5ce0e82b4bd63525a7eccd9ecd4d010e153d5
+          # The standalone-management branch carrying
+          # redhat-et/pricetag-metering PR #149 (redhat-et main plus the
+          # standalone management layer); follow main once merged.
+          metering=aefcacd2643d54bd7e4b915c6afac2ca8cc8716a
           for component in maas metering; do
             directory="$RUNNER_TEMP/$component"
-            if [[ "$component" == maas ]]; then
-              repository=https://github.com/Ladas/models-as-a-service.git
-              revision="$maas"
-            else
-              repository=https://github.com/Ladas/pricetag-metering.git
-              revision="$metering"
-            fi
             git init "$directory"
-            git -C "$directory" remote add origin "$repository"
-            git -C "$directory" fetch --depth=1 origin "$revision"
-            git -C "$directory" checkout --detach FETCH_HEAD
-            test "$(git -C "$directory" rev-parse HEAD)" = "$revision"
+            if [[ "$component" == maas ]]; then
+              git -C "$directory" remote add origin https://github.com/Ladas/models-as-a-service.git
+              git -C "$directory" fetch --depth=1 origin "$maas"
+              git -C "$directory" checkout --detach FETCH_HEAD
+              test "$(git -C "$directory" rev-parse HEAD)" = "$maas"
+            else
+              # Fetch the immutable pinned commit from the canonical repository.
+              # While PR #149 is open, the standalone-management branch of
+              # redhat-et/pricetag-metering carries this commit and keeps it
+              # reachable; the pin follows main once the pull request merges.
+              git -C "$directory" remote add origin https://github.com/redhat-et/pricetag-metering.git
+              if ! git -C "$directory" fetch --depth=1 origin "$metering"; then
+                echo "::error::metering revision $metering is not reachable in redhat-et/pricetag-metering; update the pin to a commit carried by main or the PR branch" >&2
+                exit 1
+              fi
+              git -C "$directory" checkout --detach FETCH_HEAD
+              test "$(git -C "$directory" rev-parse HEAD)" = "$metering"
+            fi
           done
           node --test "$RUNNER_TEMP/metering/tests/ui/"*.test.cjs
           sudo env NODE_PATH="$GITHUB_WORKSPACE/tests/pricetag/browser/node_modules" \

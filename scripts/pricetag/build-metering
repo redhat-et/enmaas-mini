@@ -8,14 +8,15 @@ import tarfile
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
-REVISION = 'b1c5ce0e82b4bd63525a7eccd9ecd4d010e153d5'
+REVISION = 'aefcacd2643d54bd7e4b915c6afac2ca8cc8716a'
+SOURCE = 'https://github.com/redhat-et/pricetag-metering'
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--source', required=True, type=Path, help='PriceTag Git checkout containing the selected revision')
     parser.add_argument('--platform', choices=['linux/amd64', 'linux/arm64'], help='defaults to container-engine host architecture')
-    parser.add_argument('--tag', default='localhost/pricetag-metering:upstream-b1c5ce0')
+    parser.add_argument('--tag', default='localhost/pricetag-metering:standalone-aefcacd')
     parser.add_argument('--revision', default=REVISION, help='full source commit to test; defaults to the pinned source candidate')
     args = parser.parse_args()
     if not re.fullmatch(r'[0-9a-f]{40}', args.revision):
@@ -30,12 +31,12 @@ def main():
         with tarfile.open(archive) as source:
             source.extractall(context, filter='data')
         command = ['podman', 'build', '--label', 'org.opencontainers.image.revision=' + args.revision,
-                   '--label', 'org.opencontainers.image.source=https://github.com/Ladas/pricetag-metering',
+                   '--label', 'org.opencontainers.image.source=' + SOURCE,
                    '-f', str(ROOT / 'configs/pricetag/Containerfile.metering'), '-t', args.tag]
         if args.platform:
             command.extend(['--platform', args.platform])
         subprocess.run([*command, str(context)], check=True)
-    print('Built PriceTag fork revision ' + args.revision + '; inspect the image ID before deployment.')
+    print('Built PriceTag metering revision ' + args.revision + '; inspect the image ID before deployment.')
 
 
 if __name__ == '__main__':

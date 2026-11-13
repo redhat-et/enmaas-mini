@@ -116,7 +116,7 @@ class InstallTest(unittest.TestCase):
         self.assertEqual(args.metering_image, installer.PUBLISHED_METERING_IMAGE)
         self.assertEqual(args.maas_image, installer.PUBLISHED_MAAS_IMAGE)
         self.assertIsNone(args.metering_branch)
-        self.assertEqual(installer.METERING_REPO, 'https://github.com/Ladas/pricetag-metering.git')
+        self.assertEqual(installer.METERING_REPO, 'https://github.com/redhat-et/pricetag-metering.git')
         source = self.image_args('--image-mode', 'source')
         self.assertEqual(source.maas_branch, installer.MAAS_BRANCH)
         self.assertEqual(source.metering_branch, installer.METERING_BRANCH)
@@ -147,7 +147,7 @@ class InstallTest(unittest.TestCase):
             self.assertEqual(checkout.call_args_list[0].args[2], 'refs/heads/feature/test')
             self.assertEqual(args.maas_revision, resolved)
             self.assertEqual(checkout.call_args_list[1].args[2],
-                             'refs/heads/feat/latest-upstream-standalone')
+                             'refs/heads/standalone-management')
             self.assertEqual(args.metering_revision, resolved)
             self.assertTrue(any('--revision' in c.args[0] and resolved in c.args[0]
                                 for c in run.call_args_list))
