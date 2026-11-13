@@ -61,6 +61,20 @@ jobs:
       - name: Verify anonymous pulls of released installer images
         if: matrix.arch == 'amd64'
         run: python3 tests/pricetag/published-images.py --engine docker
+      - name: Verify the private Praxis tenant image with registry credentials
+        if: matrix.arch == 'amd64' && env.ENMAAS_TENANT_REGISTRY_USERNAME != '' && env.ENMAAS_TENANT_REGISTRY_PASSWORD != ''
+        env:
+          ENMAAS_TENANT_REGISTRY_USERNAME: ${{ secrets.ENMAAS_TENANT_REGISTRY_USERNAME }}
+          ENMAAS_TENANT_REGISTRY_PASSWORD: ${{ secrets.ENMAAS_TENANT_REGISTRY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          auth_dir="$(mktemp -d "${RUNNER_TEMP}/praxis-auth.XXXXXX")"
+          chmod 700 "${auth_dir}"
+          token="$(printf '%s:%s' "${ENMAAS_TENANT_REGISTRY_USERNAME}" "${ENMAAS_TENANT_REGISTRY_PASSWORD}" | base64 -w0)"
+          printf '{"auths":{"quay.io":{"auth":"%s"}}}\n' "${token}" > "${auth_dir}/config.json"
+          chmod 600 "${auth_dir}/config.json"
+          python3 tests/pricetag/published-images.py --engine docker --praxis-authfile "${auth_dir}/config.json"
+          rm -rf "${auth_dir}"
       - name: Check bootc build contract without registry credentials
         run: |
           python3 bootc/tests/build.py
