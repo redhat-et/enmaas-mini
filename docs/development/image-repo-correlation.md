@@ -21,7 +21,7 @@ workflows, Quay tag patterns and the EnMaaS-opps README; verified 2026-11-12.
 | Image | Code from | Built by | Notes |
 | --- | --- | --- | --- |
 | `quay.io/redhat-et/secure-single-server-maas-standalone@sha256:0bec6ef5…` (rev `6ac4c80`) | `Ladas/models-as-a-service` branch `feat/standalone-runtime-minimal` | `redhat-et/enmaas-mini` CI: `.github/workflows/pricetag-images.yml` fetches the pinned fork revision, builds with `scripts/pricetag/build-maas` | current maas pin |
-| `quay.io/redhat-et/secure-single-server-pricetag-metering@sha256:dabb2f35…` (rev `ce9c6c51`) | `Ladas/pricetag-metering` branch `feat/latest-upstream-standalone` | same workflow, via `scripts/pricetag/build-metering` and `configs/pricetag/Containerfile.metering` | current metering pin; the workflow's `METERING_REVISION` (`b1c5ce0`) has drifted from `install.py`'s published-image revision (`ce9c6c51`) |
+| `quay.io/redhat-et/secure-single-server-pricetag-metering@sha256:dabb2f35…` (rev `ce9c6c51`) | `redhat-et/pricetag-metering` branch `standalone-management` — redhat-et main plus the standalone management layer ([PR #149](https://github.com/redhat-et/pricetag-metering/pull/149)) | same workflow, via `scripts/pricetag/build-metering` and `configs/pricetag/Containerfile.metering` | current metering pin (predates the repoint — it is the earlier Ladas-fork build); the workflow and installer source constants now build `aefcacd` |
 | `docker.io/library/postgres@sha256:996e9dc5…` | upstream PostgreSQL | Docker official images | metering/maas database |
 
 ## Not yet published
