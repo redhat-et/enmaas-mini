@@ -20,7 +20,7 @@ let stage='setup';
   const prefix='demo-relationship-'+Date.now(),names=[prefix+'-lead-a',prefix+'-lead-b',prefix+'-member'];
   stage='create three users through UI';
   for(const subject of names){await admin.locator('#user [name=subject]').fill(subject);await admin.locator('#user [name=name]').fill(subject);await done(admin,()=>admin.getByRole('button',{name:'Save user',exact:true}).click());}
-  async function users(){return await admin.evaluate(async()=>await(await fetch('/api/v1/management/users')).json());}
+  async function users(){return await admin.evaluate(async()=>{const rows=[];let offset=0;for(;;){const page=await(await fetch('/api/v1/management/users?limit=500&offset='+offset)).json();rows.push(...page.data);if(!page.has_more||!page.data.length)break;offset+=page.data.length;}return rows;});}
   const initial=await users(),ids=names.map(n=>initial.find(u=>u.logins.includes(n)).user_id);
   async function relationship(user,manager,success=true){
    await admin.locator('#partner-users-search').fill(user);

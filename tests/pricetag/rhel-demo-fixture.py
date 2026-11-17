@@ -94,7 +94,17 @@ def main():
         (args.output / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
     save()
     if args.cleanup:
-        profiles = {row['user_id']: row for row in call('GET', '/api/v1/management/users')}
+        def directory_rows():
+            # The management users listing is paginated ({data, has_more});
+            # walk every page so cleanup compares against the full directory.
+            rows, offset = [], 0
+            while True:
+                page = call('GET', f'/api/v1/management/users?limit=500&offset={offset}')
+                rows.extend(page['data'])
+                if not page['has_more'] or not page['data']:
+                    return rows
+                offset += len(page['data'])
+        profiles = {row['user_id']: row for row in directory_rows()}
         for index, user in enumerate(manifest['users']):
             subject = f'{args.prefix}-{index + 1:02d}'
             if (user['subject'] != subject or user['user_id'] not in profiles or
