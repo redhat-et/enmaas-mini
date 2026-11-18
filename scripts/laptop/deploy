@@ -1896,8 +1896,40 @@ def start_services(args: argparse.Namespace, state: dict[str, Any]) -> None:
                         label=f"Creating user {subject}"
                     )
                 except subprocess.CalledProcessError as e:
-                    print(f"  WARN: sample user {subject} failed: {e}", flush=True)
-                    logger.warning("sample user %s failed: %s", subject, e)
+                    print(f"  WARN: sample user {subject} via host failed: {e}; trying gateway exec...", flush=True)
+                    logger.warning("sample user %s via host failed: %s", subject, e)
+                    # Fallback to gateway exec (trusted 10.77.0.11) for Darwin NAT
+                    try:
+                        result = subprocess.run(
+                            [engine_name, "exec", "pricetag-gateway", "curl", "-s", "-X", "POST",
+                             "-H", f"X-MaaS-Username: {subject}",
+                             "-H", 'X-MaaS-Group: ["system:authenticated"]',
+                             "-H", "Content-Type: application/json",
+                             "-H", "Accept: application/json",
+                             "-d", f'{{"name":"{subject}","expiresIn":"90d"}}',
+                             "http://pricetag-maas:8080/v1/api-keys"],
+                            capture_output=True, text=True, timeout=15
+                        )
+                        if result.returncode == 0 and result.stdout.strip():
+                            data = json.loads(result.stdout)
+                            key = data.get("key")
+                            if isinstance(key, str) and key:
+                                key_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                                if key_path.exists():
+                                    key_path.unlink()
+                                os.umask(0o077)
+                                fd = os.open(str(key_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                                with os.fdopen(fd, "w") as out:
+                                    out.write(key + "\n")
+                                print(f"  Sample user {subject} created via gateway: {key_path}", flush=True)
+                                logger.info("Sample user %s via gateway", subject)
+                            else:
+                                print(f"  WARN: gateway exec for {subject} returned no key: {result.stdout}", flush=True)
+                        else:
+                            print(f"  WARN: gateway exec for {subject} failed: {result.stdout} {result.stderr}", flush=True)
+                    except Exception as e2:
+                        print(f"  WARN: sample user {subject} gateway fallback failed: {e2}", flush=True)
+                        logger.warning("sample user %s gateway failed: %s", subject, e2)
             else:
                 print(f"  Sample user {subject} exists (idempotent)", flush=True)
 
