@@ -658,6 +658,59 @@ def postgres_bootstrap_sql(metering_password: str, maas_password: str) -> str:
 # Compose generation (the core laptop artifact)
 # ---------------------------------------------------------------------------
 
+def ensure_postgres_volume(deploy_dir: Path | None = None, postgres_image: str | None = None) -> None:
+    """Pre-create pricetag-data volume with correct ownership for postgres UID.
+
+    Rootless podman volumes are initially owned by the host UID (1001) but
+    postgres (UID 70/999) needs to chown/chmod on first init. With cap_drop
+    removed, postgres can chown itself, but pre-creating ensures idempotent
+    ownership and avoids 'Operation not permitted' on repeatable --from-scratch.
+    """
+    engine: str = "podman" if shutil.which("podman") else "docker"
+    image: str = postgres_image or POSTGRES_IMAGE
+    try:
+        subprocess.run([engine, "volume", "create", "pricetag-data"],
+                       timeout=10, stdout=LOG_FD or subprocess.DEVNULL, stderr=LOG_FD or subprocess.DEVNULL)
+        logger.info("Volume pricetag-data created (or already exists)")
+    except Exception as e:
+        logger.warning("volume create failed: %s", e)
+    # Fix ownership via one-shot container (postgres image has chown).
+    # Try UID 999 (debian postgres:17.8), 70 (alpine), 26 (rhel) in order.
+    for uid in ("999", "70", "26"):
+        try:
+            subprocess.run(
+                [engine, "run", "--rm", "-v", "pricetag-data:/var/lib/postgresql/data",
+                 image, "sh", "-c",
+                 f"chown -R {uid}:{uid} /var/lib/postgresql/data 2>/dev/null; chmod 700 /var/lib/postgresql/data 2>/dev/null; ls -ld /var/lib/postgresql/data"],
+                timeout=15, stdout=LOG_FD or subprocess.DEVNULL, stderr=LOG_FD or subprocess.DEVNULL
+            )
+            logger.info("Volume ownership set to %s:%s", uid, uid)
+            break
+        except Exception as e:
+            logger.warning("volume chown attempt %s failed: %s", uid, e)
+            continue
+    # Ensure deploy_dir/maas-db-url is a regular file, not symlink (MaaS rejects symlinks)
+    if deploy_dir:
+        maas_url_path = Path(deploy_dir) / "maas-db-url"
+        try:
+            if maas_url_path.is_symlink():
+                target = maas_url_path.readlink()
+                # Resolve and replace symlink with regular file copy
+                content = maas_url_path.read_text()
+                maas_url_path.unlink()
+                maas_url_path.write_text(content)
+                os.chmod(maas_url_path, 0o600)
+                print(f"  Fixed symlink {maas_url_path} -> {target} (replaced with regular file)", flush=True)
+                logger.info("Fixed symlink %s -> %s", maas_url_path, target)
+            elif maas_url_path.is_file():
+                # Ensure perms are 0600 and is regular file
+                st = maas_url_path.lstat()
+                # lstat ensures we don't follow symlink; already checked is_symlink above
+                pass
+        except Exception as e:
+            logger.warning("maas-db-url symlink check failed: %s", e)
+
+
 def generate_compose_yaml(
     args: argparse.Namespace,
     arch: str,
@@ -679,6 +732,8 @@ def generate_compose_yaml(
     postgres_image: str = POSTGRES_IMAGE
     llm_katan_backend: str = args.llm_katan_backend
     with_llm: bool = bool(args.with_llm_katan)
+    # Absolute bind for maas-db-url so compose file at ROOT still resolves correctly.
+    maas_db_url_host_path: str = str((args.deploy_dir.resolve() if hasattr(args, "deploy_dir") else DEFAULT_DEPLOY_DIR.resolve()) / "maas-db-url")
 
     if with_llm:
         if llm_katan_backend == "echo":
@@ -766,56 +821,28 @@ def generate_compose_yaml(
     cap_drop:
       - ALL
 """
-    elif llm_katan_backend in ("mock", "fixture"):
-        # Back-compat: default mock without explicit --with-llm-katan: use llm-katan echo for consistency
+    elif llm_katan_backend in ("mock", "fixture") or llm_katan_backend is None:
+        # Default: deterministic fixture provider (tests/common/provider.py) on python:3.12
+        # 2+3=5 tokens for exact ledger verification. llm-katan is opt-in via --with-llm-katan.
         provider_service = f"""  pricetag-provider:
-    # Default mock -> llm-katan echo (ghcr.io/yossiovadia/llm-katan:0.22.0) on :8000
-    image: {LLM_KATAN_IMAGE}
+    # Fixture provider (tests/common/provider.py) - deterministic 2+3=5 tokens
+    image: {PYTHON_IMAGE}
     container_name: pricetag-provider
-    command:
-      - --model
-      - fixture
-      - --backend
-      - echo
-      - --providers
-      - openai,anthropic
-      - --port
-      - "8000"
-      - --host
-      - "0.0.0.0"
-      - --api-keys
-      - "openai=synthetic-openai,anthropic=synthetic-anthropic"
-      - --error-rate
-      - "0.0"
-      - --latency-ms
-      - "0"
-      - --timeout-after
-      - "0"
-      - --rate-limit-after
-      - "0"
-      - --max-inflight
-      - "0"
-      - --chunk-delay-ms
-      - "0"
-      - --ttft-ms
-      - "0"
-      - --itl-ms
-      - "0"
-    env_file:
-      - ./llm-katan.env
+    volumes:
+      - ./fixtures:/fixtures:ro
     environment:
-      CUSTOM_MOCK_API_KEY: synthetic-anthropic
-      OPENAI_API_KEY: synthetic-openai
+      MOCK_STREAM_DELAY: "1"
+      MOCK_MANAGEMENT: "1"
+      LLM_KATAN_BACKEND: "fixture"
+    command: ["python3", "/fixtures/run.py"]
     networks:
       pricetag-mock:
         ipv4_address: 10.78.0.10
-    ports:
-      - "127.0.0.1:8000:8000"
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8000/health || wget -qO- http://127.0.0.1:8000/health || python3 -c \\"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).read()\\""]
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:18080/v1/models', timeout=2).read()"]
       interval: 10s
-      timeout: 5s
+      timeout: 3s
       retries: 10
       start_period: 15s
     cap_drop:
@@ -888,8 +915,8 @@ services:
     tmpfs:
       - /var/run/postgresql:rw,mode=3775
       - /tmp
-    cap_drop:
-      - ALL
+    # Postgres needs to chown its data dir on first init; keep capabilities.
+    # Hardened production will pre-create volume with correct UID (see ensure_postgres_volume).
 
 {provider_service}
   pricetag-maas:
@@ -911,7 +938,7 @@ services:
       METRICS_SECURE: "false"
       METRICS_ADDRESS: "127.0.0.1:9090"
     volumes:
-      - ./maas-db-url:/run/secrets/maas-db-url:ro
+      - {maas_db_url_host_path}:/run/secrets/maas-db-url:ro
     depends_on:
       pricetag-db:
         condition: service_healthy
@@ -1372,8 +1399,22 @@ def prepare_deployment(args: argparse.Namespace, arch: str) -> dict[str, Any]:
     metering_url: str = f"postgres://metering:{metering_password}@pricetag-db:5432/metering?sslmode=disable"
     maas_url: str = f"postgres://maas:{maas_password}@pricetag-db:5432/maas?sslmode=disable"
 
-    (deploy_dir / "maas-db-url").write_text(maas_url + "\n")
-    os.chmod(deploy_dir / "maas-db-url", 0o600)
+    # MaaS requires DB URL file to be regular file, not symlink (enforce).
+    # If a previous deploy left a symlink, replace it with a regular file.
+    maas_db_url_path = deploy_dir / "maas-db-url"
+    if maas_db_url_path.is_symlink():
+        try:
+            maas_db_url_path.unlink()
+        except OSError:
+            pass
+    maas_db_url_path.write_text(maas_url + "\n")
+    os.chmod(maas_db_url_path, 0o600)
+    # Verify it's regular file (lstat, not follow)
+    try:
+        if maas_db_url_path.is_symlink() or not maas_db_url_path.is_file():
+            raise ValueError(f"{maas_db_url_path} must be regular file, not symlink")
+    except OSError:
+        pass
 
     (deploy_dir / "metering.env").write_text(
         "".join(f"{k}={v}\n" for k, v in {
@@ -1545,6 +1586,11 @@ def start_services(args: argparse.Namespace, state: dict[str, Any]) -> None:
             subprocess.run(["podman", "machine", "start"], capture_output=True, timeout=30)
         except Exception:
             pass
+
+    # Pre-create postgres volume with correct ownership before compose up
+    # (rootless podman volume initially owned by 1001; postgres needs 70/999)
+    print("  Ensuring postgres volume pricetag-data exists with correct perms...", flush=True)
+    ensure_postgres_volume(deploy_dir=deploy_dir, postgres_image=POSTGRES_IMAGE)
 
     print(f"  Starting via {' '.join(engine)} up -d ...", flush=True)
     logger.info("Starting via %s up -d", " ".join(engine))

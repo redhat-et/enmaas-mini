@@ -172,7 +172,7 @@ services:
       METRICS_SECURE: "false"
       METRICS_ADDRESS: "127.0.0.1:9090"
     volumes:
-      - ./maas-db-url:/run/secrets/maas-db-url:ro
+      - {{ deploy_dir | default("~/.local/share/enmaas-mini/laptop") }}/maas-db-url:/run/secrets/maas-db-url:ro
     depends_on:
       pricetag-db:
         condition: service_healthy
