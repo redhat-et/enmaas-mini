@@ -193,18 +193,29 @@ def run(
         print("  OK", flush=True)
         logger.info("OK: %s", shlex.join(cmd_str))
         return None
+    if capture:
+        result = subprocess.run(
+            cmd_str,
+            check=check,
+            cwd=str(cwd),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            input=input_data.decode() if isinstance(input_data, bytes) else input_data,
+            env=env,
+        )
+        return result.stdout.strip() if result.stdout else None
     result = subprocess.run(
         cmd_str,
         check=check,
         cwd=str(cwd),
         text=True,
-        capture_output=capture,
-        stdout=subprocess.PIPE if capture else None,
-        stderr=LOG_FD if LOG_FD else subprocess.PIPE,
+        stdout=None,
+        stderr=LOG_FD if LOG_FD else None,
         input=input_data.decode() if isinstance(input_data, bytes) else input_data,
         env=env,
     )
-    return result.stdout.strip() if capture else None
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -586,15 +597,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             args.external_api = "both"
         else:
             p.error("--provider external requires --external-api openai|anthropic|both")
-    # Image defaults
+    # Image defaults: prefer published hardened images on all platforms;
+    # the yossiovadia private image is only used if explicitly passed via --maas-image
     if not args.maas_image:
-        arch = oci_arch(platform.machine())
-        if platform.system() == "Darwin" and arch == "arm64":
-            args.maas_image = MAAS_LAPTOP_IMAGE_ARM64
-            if LOG_FD:
-                LOG_FD.write(f"Using MBP arm64 MaaS image: {args.maas_image}\n")
-        else:
-            args.maas_image = PUBLISHED_MAAS_IMAGE
+        args.maas_image = PUBLISHED_MAAS_IMAGE
+        if platform.system() == "Darwin" and oci_arch(platform.machine()) == "arm64" and LOG_FD:
+            LOG_FD.write(f"Using published MaaS image on MBP arm64 (manifest list, Rosetta fallback OK): {args.maas_image}\n")
     if not args.metering_image:
         args.metering_image = PUBLISHED_METERING_IMAGE
 
@@ -1271,6 +1279,16 @@ def prepare_deployment(args: argparse.Namespace, arch: str) -> dict[str, Any]:
 
     from unified_config import validate  # type: ignore[import]
     models = validate(models)
+
+    # llm-katan echo runs both providers on :8000 (single port, path-routed).
+    # The legacy fixture separates them on :18080/:18081. Rewrite for llm-katan.
+    llm_katan_backend_flag = getattr(args, "llm_katan_backend", "echo")
+    if llm_katan_backend_flag == "echo":
+        for chain in original.get("filter_chains", []):
+            for f in chain.get("filters", []):
+                if f.get("filter") == "load_balancer":
+                    for cluster in f.get("clusters", []):
+                        cluster["endpoints"] = ["pricetag-provider:8000"]
 
     from gateway import render  # type: ignore[import]
     gateway_config = render(original, models, [f"https://{args.hostname}:8443", "https://localhost:8443"])
