@@ -571,11 +571,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         else:
             args.llm_katan_backend = args.llm_katan
 
-    # Default llm-katan backend: mock (if no explicit choice)
+    # Default: no llm-katan (use deterministic fixture provider for benchmark)
+    # llm-katan is opt-in via --with-llm-katan / --llm-katan echo to keep
+    # the default path private-registry-free and token-deterministic (2+3=5).
     if args.llm_katan is None and args.llm_katan_backend is None:
-        args.llm_katan = "mock"
-        args.llm_katan_backend = "mock"
-        args.with_llm_katan = True
+        args.llm_katan = None
+        args.llm_katan_backend = None
+        args.with_llm_katan = False
 
     # Normalize: if --with-llm-katan not set but backend is echo, imply with
     if args.llm_katan_backend == "echo":
@@ -1115,14 +1117,23 @@ def acquire_images(args: argparse.Namespace, arch: str) -> tuple[str, ...]:
     # Published (pull)
     engine: str = "podman" if shutil.which("podman") else "docker"
     # llm-katan image: ghcr.io for echo backend, else PYTHON fallback
-    provider_image = LLM_KATAN_IMAGE if args.llm_katan_backend in ("echo", "mock", "fixture") else PYTHON_IMAGE
-    images_list: list[tuple[str, str]] = [
-        ("Praxis", PRAXIS_IMAGE),
-        ("MaaS", args.maas_image),
-        ("PriceTag metering", args.metering_image),
-        ("Postgres 17.8", POSTGRES_IMAGE),
-        ("LLM-Katan", provider_image),
-    ]
+    # Only pull llm-katan if explicitly enabled; otherwise use fixture (PYTHON_IMAGE)
+    if args.with_llm_katan and args.llm_katan_backend in ("echo", "mock", "fixture"):
+        provider_image = LLM_KATAN_IMAGE
+        images_list: list[tuple[str, str]] = [
+            ("Praxis", PRAXIS_IMAGE),
+            ("MaaS", args.maas_image),
+            ("PriceTag metering", args.metering_image),
+            ("Postgres 17.8", POSTGRES_IMAGE),
+            ("LLM-Katan", provider_image),
+        ]
+    else:
+        images_list: list[tuple[str, str]] = [
+            ("Praxis", PRAXIS_IMAGE),
+            ("MaaS", args.maas_image),
+            ("PriceTag metering", args.metering_image),
+            ("Postgres 17.8", POSTGRES_IMAGE),
+        ]
     if args.no_pull:
         print("  --no-pull: skipping pulls, using local images", flush=True)
         logger.info("--no-pull: skipping pulls")
