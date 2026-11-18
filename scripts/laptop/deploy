@@ -1739,6 +1739,42 @@ def start_services(args: argparse.Namespace, state: dict[str, Any]) -> None:
     if not admin_key.exists() or not admin_key.stat().st_size:
         print(f"  Creating MaaS admin key at {admin_key} ...", flush=True)
         maas_key_script = ROOT / "scripts/pricetag/maas-key"
+        # Darwin applehv: host 127.0.0.1:18086 may be untrusted (NAT), fallback to gateway exec (trusted 10.77.0.11)
+        def _create_via_gateway() -> bool:
+            try:
+                result = subprocess.run(
+                    [engine_name, "exec", "pricetag-gateway", "curl", "-s", "-X", "POST",
+                     "-H", "X-MaaS-Username: admin",
+                     "-H", 'X-MaaS-Group: ["system:authenticated","single-server-admin"]',
+                     "-H", "Content-Type: application/json",
+                     "-H", "Accept: application/json",
+                     "-d", '{"name":"admin","expiresIn":"90d"}',
+                     "http://pricetag-maas:8080/v1/api-keys"],
+                    capture_output=True, text=True, timeout=15
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    data = json.loads(result.stdout)
+                    key = data.get("key")
+                    if isinstance(key, str) and key:
+                        admin_key.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                        # Secure write (0600, O_EXCL)
+                        if admin_key.exists():
+                            admin_key.unlink()
+                        os.umask(0o077)
+                        fd = os.open(str(admin_key), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                        with os.fdopen(fd, "w") as out:
+                            out.write(key + "\n")
+                        print(f"  Admin key created via gateway (trusted 10.77.0.11): {admin_key}", flush=True)
+                        logger.info("Admin key via gateway exec")
+                        return True
+                    else:
+                        logger.warning("gateway exec returned no key: %s", result.stdout)
+                else:
+                    logger.warning("gateway exec failed: rc=%s out=%s err=%s", result.returncode, result.stdout, result.stderr)
+            except Exception as e:
+                logger.warning("gateway exec admin key failed: %s", e)
+            return False
+
         try:
             run(
                 [sys.executable, str(maas_key_script), "create",
@@ -1747,15 +1783,21 @@ def start_services(args: argparse.Namespace, state: dict[str, Any]) -> None:
                 label="Creating admin MaaS key"
             )
         except subprocess.CalledProcessError as e:
-            print(f"  WARN: admin key creation failed: {e}; retrying after 5s...", flush=True)
-            logger.warning("admin key creation failed: %s", e)
-            time.sleep(5)
-            run(
-                [sys.executable, str(maas_key_script), "create",
-                 "--subject", "admin", "--admin", "--name", "admin",
-                 "--url", "http://127.0.0.1:18086", "--output", str(admin_key)],
-                label="Creating admin MaaS key (retry)"
-            )
+            print(f"  WARN: admin key via host failed (Darwin NAT untrusted caller?): {e}; trying gateway exec...", flush=True)
+            logger.warning("admin key via host failed: %s", e)
+            if not _create_via_gateway():
+                print(f"  WARN: gateway exec also failed; retrying host after 5s...", flush=True)
+                time.sleep(5)
+                try:
+                    run(
+                        [sys.executable, str(maas_key_script), "create",
+                         "--subject", "admin", "--admin", "--name", "admin",
+                         "--url", "http://127.0.0.1:18086", "--output", str(admin_key)],
+                        label="Creating admin MaaS key (retry)"
+                    )
+                except subprocess.CalledProcessError as e2:
+                    if not _create_via_gateway():
+                        raise
     else:
         print(f"  Admin key exists: {admin_key} (idempotent)", flush=True)
 
