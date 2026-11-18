@@ -1321,14 +1321,23 @@ def prepare_deployment(args: argparse.Namespace, arch: str) -> dict[str, Any]:
     models = validate(models)
 
     # llm-katan echo runs both providers on :8000 (single port, path-routed).
-    # The legacy fixture separates them on :18080/:18081. Rewrite for llm-katan.
+    # The legacy fixture separates them on :18080/:18081 and is local=True with no credentials.
+    # For llm-katan, use the managed mock provider (mock/mock-anthropic) with credential_injection
+    # so the gateway correctly injects OPENAI_API_KEY/CUSTOM_MOCK_API_KEY for llm-katan echo.
     llm_katan_backend_flag = getattr(args, "llm_katan_backend", "echo")
     if llm_katan_backend_flag == "echo":
+        # Replace with managed mock config that has credential_injection for llm-katan
+        orig_managed, managed_models = mock_inputs(managed=True)
+        # Keep our fixture model id but use mock provider for routing (so intelligent_route maps correctly)
+        # The catalog will still be fixture with provider vllm for metering, but the gateway filter needs mock
+        original = orig_managed
         for chain in original.get("filter_chains", []):
             for f in chain.get("filters", []):
                 if f.get("filter") == "load_balancer":
                     for cluster in f.get("clusters", []):
                         cluster["endpoints"] = ["pricetag-provider:8000"]
+        # Override models to use mock provider for llm-katan routing, keep id as fixture for catalog
+        models = [{"id": "fixture", "provider": "mock", "model": "fixture", "apis": ["openai", "anthropic"], "context": 32768, "output": 4096}]
 
     from gateway import render  # type: ignore[import]
     gateway_config = render(original, models, [f"https://{args.hostname}:8443", "https://localhost:8443"])
