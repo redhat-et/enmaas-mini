@@ -2097,9 +2097,54 @@ def verify_deployment(args: argparse.Namespace, state: dict[str, Any]) -> None:
                 label="Creating verify user (perf-verify-00)"
             )
         except subprocess.CalledProcessError as e:
-            print(f"  WARN: perf users creation failed: {e}", flush=True)
-            logger.warning("perf users creation failed: %s", e)
-            return
+            print(f"  WARN: perf users via host failed: {e}; trying gateway exec...", flush=True)
+            logger.warning("perf users via host failed: %s", e)
+            # Fallback: create perf-verify user via gateway exec (Darwin NAT)
+            try:
+                _engine = "podman" if shutil.which("podman") else "docker"
+                result = subprocess.run(
+                    [_engine, "exec", "pricetag-gateway", "curl", "-s", "-X", "POST",
+                     "-H", "X-MaaS-Username: perf-verify-00",
+                     "-H", 'X-MaaS-Group: ["system:authenticated"]',
+                     "-H", "Content-Type: application/json",
+                     "-H", "Accept: application/json",
+                     "-d", '{"name":"perf-verify-00","expiresIn":"90d"}',
+                     "http://pricetag-maas:8080/v1/api-keys"],
+                    capture_output=True, text=True, timeout=15
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    data = json.loads(result.stdout)
+                    key = data.get("key")
+                    if isinstance(key, str) and key:
+                        tokens_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+                        (tokens_dir / "perf-verify-00.key").write_text(key + "\n")
+                        os.chmod(tokens_dir / "perf-verify-00.key", 0o600)
+                        # Provision metering user via bootstrap_via_http-like call (host 127.0.0.1:18087 works)
+                        try:
+                            import urllib.request as _ur
+                            mgmt_secret = (deploy_dir / "management-secret").read_text().strip()
+                            base = "http://127.0.0.1:18087/api/v1/management"
+                            def _req(method, resource, payload=None):
+                                url = f"{base}/{resource}"
+                                data = None if payload is None else json.dumps(payload).encode()
+                                req = _ur.Request(url, data=data, method=method, headers={"Authorization": f"Bearer {mgmt_secret}", "Content-Type": "application/json"})
+                                with _ur.urlopen(req, timeout=10) as resp:
+                                    return json.load(resp)
+                            _req("PUT", "users", {"subject": "perf-verify-00", "name": "perf-verify-00"})
+                            _req("PUT", "budgets", {"subject": "perf-verify-00", "monthly_usd": 100})
+                            print("  Verify user created via gateway + metering provisioned", flush=True)
+                        except Exception as e2:
+                            print(f"  WARN: metering provision for perf-verify failed: {e2}", flush=True)
+                    else:
+                        print(f"  WARN: gateway perf user no key: {result.stdout}", flush=True)
+                        return
+                else:
+                    print(f"  WARN: gateway perf user failed: {result.stdout} {result.stderr}", flush=True)
+                    return
+            except Exception as e2:
+                print(f"  WARN: perf gateway fallback failed: {e2}", flush=True)
+                logger.warning("perf gateway fallback failed: %s", e2)
+                return
 
         model: str = state["models"][0]["id"] if state.get("models") else "fixture"
         print(f"  Running perf run: model={model} url=https://localhost:8443 requests=20 ...", flush=True)
