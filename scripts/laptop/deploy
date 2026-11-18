@@ -685,6 +685,9 @@ def generate_compose_yaml(
             # Known gaps: /v1/responses + /v1/messages/count_tokens (see shims/README.md)
             provider_service = f"""  pricetag-provider:
     # llm-katan echo backend (ghcr.io/yossiovadia/llm-katan:0.22.0) - openai,anthropic on :8000
+    # On MBP laptop we default to fixture provider (tests/common/provider.py) for
+    # deterministic 2+3=5 tokens; llm-katan is opt-in via --with-llm-katan and
+    # falls back to fixture if its private image pull fails.
     # Env: configs/laptop/llm-katan.env (synthetic keys, failure flags disabled)
     # Dashboard: http://127.0.0.1:8000/dashboard (loopback-only publish)
     image: {LLM_KATAN_IMAGE}
@@ -726,8 +729,6 @@ def generate_compose_yaml(
     networks:
       pricetag-mock:
         ipv4_address: 10.78.0.10
-      pricetag-private:
-        ipv4_address: 10.78.0.10
     ports:
       - "127.0.0.1:8000:8000"
     restart: unless-stopped
@@ -753,8 +754,6 @@ def generate_compose_yaml(
     command: ["python3", "/fixtures/run.py"]
     networks:
       pricetag-mock:
-        ipv4_address: 10.78.0.10
-      pricetag-private:
         ipv4_address: 10.78.0.10
     restart: unless-stopped
     healthcheck:
@@ -808,8 +807,6 @@ def generate_compose_yaml(
     networks:
       pricetag-mock:
         ipv4_address: 10.78.0.10
-      pricetag-private:
-        ipv4_address: 10.78.0.10
     ports:
       - "127.0.0.1:8000:8000"
     restart: unless-stopped
@@ -833,8 +830,6 @@ def generate_compose_yaml(
     command: ["python3", "/fixtures/run.py"]
     networks:
       pricetag-mock:
-        ipv4_address: 10.78.0.10
-      pricetag-private:
         ipv4_address: 10.78.0.10
     restart: unless-stopped
     healthcheck:
@@ -993,8 +988,6 @@ services:
       GATEWAY_CONFIG: /etc/praxis/gateway.json
     volumes:
       - ./gateway:/etc/praxis:ro
-      - ./m2m-secret:/run/secrets/pricetag-m2m:ro
-      - ./mock-secret:/run/secrets/pricetag-mock-ui-v1:ro
     secrets:
       - pricetag-m2m
       - pricetag-mock-ui-v1

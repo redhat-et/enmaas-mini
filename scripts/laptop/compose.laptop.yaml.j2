@@ -68,17 +68,16 @@ services:
       - /var/run/postgresql:rw,mode=3775
       - /tmp
     read_only: false
-    cap_drop:
-      - ALL
-    # Hardened posture would add: user, read_only, NoNewPrivileges, drop ALL (preserved via deploy)
-    # Placeholder note: {{ postgres_hardened_placeholder }}
+    # Postgres needs to chown its data dir on init; do not drop caps that block it.
+    # Keep capabilities; hardened production will run with explicit volume ownership pre-created.
 
   llm-katan:
-    image: ghcr.io/yossiovadia/llm-katan:0.22.0
+    image: {{ llm_katan_image | default("ghcr.io/yossiovadia/llm-katan:0.22.0") }}
     container_name: pricetag-provider
     # Echo backend: no GPU, no torch, instant startup. Providers: openai,anthropic on :8000.
     # Keep the container name pricetag-provider for mock-guard compatibility (endpoint pricetag-provider:18080/18081 == pricetag-provider:8000).
     # llm-katan exposes both providers on the same port with path-based routing.
+    # Isolated on pricetag-mock only; gateway is the sole bridge to pricetag-private.
     command:
       - --model
       - fixture
@@ -110,7 +109,6 @@ services:
       - "0"
     env_file:
       - ./llm-katan.env
-      - configs/laptop/llm-katan.env
     environment:
       # Synthetic credentials - must match gateway credential_injection (mock-guard):
       # Secret=pricetag-mock-ui-v1,type=env,target=CUSTOM_MOCK_API_KEY is represented here as env.
@@ -118,8 +116,6 @@ services:
       OPENAI_API_KEY: synthetic-openai
     networks:
       pricetag-mock:
-        ipv4_address: 10.78.0.10
-      pricetag-private:
         ipv4_address: 10.78.0.10
     ports:
       # Dashboard + provider APIs: loopback only, not 0.0.0.0. External access via gateway :8443 only.
@@ -258,7 +254,6 @@ services:
       GATEWAY_CONFIG: /etc/praxis/gateway.json
     volumes:
       - ./gateway:/etc/praxis:ro
-      - ./m2m-secret:/run/secrets/pricetag-m2m:ro
     secrets:
       - pricetag-m2m
       - pricetag-mock-ui-v1
