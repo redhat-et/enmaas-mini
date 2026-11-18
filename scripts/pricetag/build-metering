@@ -8,7 +8,7 @@ import tarfile
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
-REVISION = 'c9bdc56a730ca038dd4e68ea5f99dc4969cb1e74'
+REVISION = 'f69eeb8cf9bb7692a5324fddadb3467cf68e9a3d'
 SOURCE = 'https://github.com/redhat-et/pricetag-metering'
 
 

@@ -37,7 +37,7 @@ jobs:
       # redhat-et/pricetag-metering PR #149 (redhat-et main plus the
       # standalone management layer). Follow main once that pull request
       # merges.
-      METERING_REVISION: c9bdc56a730ca038dd4e68ea5f99dc4969cb1e74
+      METERING_REVISION: f69eeb8cf9bb7692a5324fddadb3467cf68e9a3d
       MAAS_IMAGE: quay.io/redhat-et/secure-single-server-maas-standalone
       METERING_IMAGE: quay.io/redhat-et/secure-single-server-pricetag-metering
     steps:
