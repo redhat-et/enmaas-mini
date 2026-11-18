@@ -78,6 +78,26 @@ sudo python3 scripts/pricetag/manage GET users \
 Choose a new output filename for each call. Inspect files privately with
 `sudo less`; key-issuance responses contain a one-time key.
 
+### Public APIs through loopback
+
+For operations available only through the authenticated public API, use the same
+client on the gateway. `--origin` must match the configured public HTTPS origin;
+`--url` stays on literal loopback. Set `GATEWAY_URL` to the deployment's public
+HTTPS URL and choose a new response filename:
+
+```sh
+sudo python3 scripts/pricetag/api GET /api/v1/whoami \
+  --url https://127.0.0.1:8443 --origin "$GATEWAY_URL" \
+  --key-file /root/pricetag-admin/admin.key \
+  --ca-file /etc/praxis-pricetag/ca.pem \
+  --output /root/gateway-management/identity.json
+```
+
+The certificate must cover `127.0.0.1`. TLS verification, key login and current-role
+checks remain enabled; the origin option only supplies the configured browser
+origin for SSH-local calls. It is refused for non-loopback destinations. Session
+cookies remain in memory, and no redirect is followed.
+
 ## Change a budget
 
 Create a private request file and edit it:

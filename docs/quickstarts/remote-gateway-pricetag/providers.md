@@ -30,12 +30,22 @@ installation, use the [installer](README.md#3-install) or
 From the **workstation installation shell**:
 
 ```console
-ssh -t "${SSH_OPTS[@]}" "$RHEL_HOST" \
-  'cd ~/secure-single-server && exec bash'
+ssh -t "${SSH_OPTS[@]}" "$RHEL_HOST"
 ```
 
-Run the following steps **on RHEL**. New workstation shell? Restore the
-[connection variables](README.md#1-set-the-connection) first.
+Run the following steps **on the gateway RHEL host**, from its installed checkout.
+For the one-node quickstart:
+
+```console
+cd ~/secure-single-server
+```
+
+For a coordinated installation, use `/opt/enmaas-mini/<deployment-id>` instead;
+copy the exact `repository` value from its service configuration. The same provider
+commands apply with remote SSO, observability or PostgreSQL.
+
+New workstation shell? Restore the [connection variables](README.md#1-set-the-connection)
+first. Use the gateway address, not an auxiliary service host.
 
 ## 1. Inspect configured and available models
 
@@ -73,13 +83,12 @@ Filtering is local after fetching the catalog; it is not an upstream search quer
 ## 2. Edit the model selection and limits
 
 ```console
-cd ~/secure-single-server
 cp -p configs/pricetag/provider-models.json configs/pricetag/provider-models.json.bak
 vi configs/pricetag/provider-models.json
 python3 -m json.tool configs/pricetag/provider-models.json >/dev/null
 ```
 
-The file is `~/secure-single-server/configs/pricetag/provider-models.json`.
+The file is `configs/pricetag/provider-models.json` inside the installed checkout.
 Keep the desired rows under each **API**, using upstream IDs without gateway
 prefixes. Each row is `["MODEL_ID", context_tokens, max_output_tokens]`:
 
@@ -126,7 +135,7 @@ blocks free models.
 
 | Data | Authoritative location |
 | --- | --- |
-| Selected models and configured limits | `~/secure-single-server/configs/pricetag/provider-models.json` |
+| Selected models and configured limits | `configs/pricetag/provider-models.json` in the installed checkout |
 | Active USD rates | PostgreSQL `metering.model_pricing` |
 | Generated alias-to-price-source mapping | `/etc/praxis-pricetag/price-sources.json` |
 

@@ -11,3 +11,5 @@ __pycache__/
 .worktrees/
 .DS_Store
 docs/examples/*/visual-demo.sheet*.png
+
+.venv-aws-tests/

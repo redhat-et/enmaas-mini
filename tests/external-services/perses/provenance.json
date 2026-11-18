@@ -1,0 +1,13 @@
+{
+  "source_repository": "https://github.com/praxis-proxy/experimental",
+  "revision": "387c06d84f29b02b6fab985aa780686825582ee2",
+  "source_directory": "demos/ai-gateway/observability/perses",
+  "status": "Reference assets; not automatically provisioned. Metric/plugin compatibility must be qualified.",
+  "files": {
+    "project.json": "64c5c1eaff83cee67d9068ab5ec4e72437c8dc60129d337f51cf0294977a17a3",
+    "dashboards/ai-gateway-overview.json": "61935e74bd5afa1b588dea10b2e3ae81057f9ab3f23cde79a4479b8c4ce2a46d",
+    "dashboards/filter-latency.json": "58a2b07e2ff5c563680658fbc95ad1bc72fe020c88b846fa72cf9dbc8622107f",
+    "dashboards/token-budget.json": "926566ea5768754722ebc5792a855c9c091847313d8781b6c30c63264ff8d5b6",
+    "dashboards/traces.json": "ecafd219d4636a120135e7d852669e61f7cee7be3d8f28008faa28d520369dce"
+  }
+}

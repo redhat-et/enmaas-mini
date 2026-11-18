@@ -1,0 +1,55 @@
+name: Mocked AWS and installer coverage
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/aws-mocked.yml'
+      - 'scripts/aws/**'
+      - 'scripts/pricetag/**'
+      - 'tests/aws/**'
+      - 'tests/pricetag/**'
+      - 'scripts/common/**'
+      - 'configs/pricetag/**'
+      - 'tests/external-services/**'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/aws-mocked.yml'
+      - 'scripts/aws/**'
+      - 'scripts/pricetag/**'
+      - 'tests/aws/**'
+      - 'tests/pricetag/**'
+      - 'scripts/common/**'
+      - 'configs/pricetag/**'
+      - 'tests/external-services/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  mocked:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install local test tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-venv jq zsh
+          python3 -m venv .venv-aws-tests
+          .venv-aws-tests/bin/python -m pip install -r tests/aws/requirements.txt
+      - name: Run mocked contracts with dummy credentials and coverage
+        run: .venv-aws-tests/bin/python tests/aws/run-mocked.py
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: mocked-aws-coverage
+          path: |
+            .state/coverage/aws.json
+            .state/coverage/html/
+          retention-days: 7
+          if-no-files-found: error

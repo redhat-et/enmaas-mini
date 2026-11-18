@@ -1,0 +1,79 @@
+name: Local observability qualification
+
+on:
+  workflow_dispatch:
+    inputs:
+      phase_seconds:
+        description: Seconds per sustained phase (65 smoke, 600 full run)
+        default: '65'
+        required: true
+        type: choice
+        options: ['65', '600']
+  pull_request:
+    paths:
+      - 'tests/external-services/**'
+      - '.github/workflows/observability-local.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  contracts:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install test tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y podman python3-venv zsh
+          python3 -m venv .venv-observability
+          .venv-observability/bin/pip install -r tests/aws/requirements.txt -r tests/external-services/stress-requirements.txt
+      - name: Test contracts and isolated alert timing
+        run: |
+          .venv-observability/bin/python -m unittest discover -s tests/external-services
+          .venv-observability/bin/python tests/external-services/test-alert-rules.py
+
+  runtime:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 100
+    env:
+      ENMAAS_LAB_INSTANCE: external-ci
+      PHASE_SECONDS: ${{ inputs.phase_seconds }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install tools and browser
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y podman python3-venv zsh
+          python3 -m venv .venv-observability
+          .venv-observability/bin/pip install -r tests/aws/requirements.txt -r tests/external-services/stress-requirements.txt
+          npm ci --prefix tests/pricetag/browser
+          cd tests/pricetag/browser
+          npx playwright install --with-deps chromium
+      - name: Build the exact reviewed application candidates
+        run: |
+          git init "$RUNNER_TEMP/metering"
+          git -C "$RUNNER_TEMP/metering" fetch --depth 1 https://github.com/Ladas/pricetag-metering.git 2281e1a84bfc3b998e7db36bc01bae88130bfcdd
+          git -C "$RUNNER_TEMP/metering" checkout --detach FETCH_HEAD
+          .venv-observability/bin/python scripts/pricetag/build-metering --source "$RUNNER_TEMP/metering"
+          git init "$RUNNER_TEMP/maas"
+          git -C "$RUNNER_TEMP/maas" fetch --depth 1 https://github.com/Ladas/models-as-a-service.git 6ac4c80ebc95f590e5f24593ac15bb80c7f9fa1d
+          git -C "$RUNNER_TEMP/maas" checkout --detach FETCH_HEAD
+          scripts/pricetag/build-maas --source "$RUNNER_TEMP/maas" --expected-commit 6ac4c80ebc95f590e5f24593ac15bb80c7f9fa1d
+      - name: Remove unused compiler-stage cache on this disposable runner
+        run: podman image prune --force --filter dangling=true
+      - name: Exercise the stack and browser checks
+        run: |
+          .venv-observability/bin/python tests/external-services/ci-runtime.py --duration "$PHASE_SECONDS"
+      - name: Remove owned containers and credentials
+        if: always()
+        run: |
+          if test -x .venv-observability/bin/python; then
+            .venv-observability/bin/python tests/external-services/local.py down
+          fi

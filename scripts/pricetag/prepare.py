@@ -16,6 +16,8 @@ import unicodedata
 from urllib.parse import parse_qsl, quote, unquote, urlsplit, urlunsplit
 
 from gateway import render
+from oidc_config import load as load_oidc
+from tls_bundle import validate as validate_tls_bundle
 
 ROOT = Path(__file__).resolve().parents[2]
 POSTGRES = 'docker.io/library/postgres@sha256:996e9dc583ba9f0265a2c75547a9c95fb22c251e394749cab205a0a00e1856a1'
@@ -114,8 +116,8 @@ def validate_external_database_url(url_text, ca_file=None, ca_required=True):
         except ValueError as error:
             raise ValueError('external database URL hostaddr must be an IPv4 or IPv6 address') from error
     sslmode = query.get('sslmode', '').lower()
-    if sslmode not in ('require', 'verify-full'):
-        raise ValueError('external database URL must set sslmode=require or sslmode=verify-full')
+    if sslmode != 'verify-full':
+        raise ValueError('external database URL must set sslmode=verify-full to verify server identity')
     if sslmode == 'verify-full' and ca_required:
         if ca_file is None:
             raise ValueError('sslmode=verify-full requires --external-database-ca-file')
@@ -227,6 +229,7 @@ def main():
                         help='expose only local vLLM; do not mount cloud provider secrets')
     mode.add_argument('--mock-provider', action='store_true',
                       help='isolated synthetic provider for a fresh performance-test VM')
+    parser.add_argument('--mock-profiles', action='store_true', help='mock standard replaceable provider profiles')
     parser.add_argument('--managed-mock', action='store_true', help='authenticated mock providers for the management demo')
     parser.add_argument('--mock-secret', default='pricetag-mock-ui-v1', help='existing synthetic credential Podman secret')
     parser.add_argument('--sample-users', action=argparse.BooleanOptionalAction, default=True,
@@ -238,6 +241,8 @@ def main():
                         help='private file containing a URL to the existing external metering database')
     parser.add_argument('--external-database-ca-file', type=Path,
                         help='CA certificate used when the external URL sets sslmode=verify-full')
+    parser.add_argument('--tls-bundle', type=Path, help='pre-issued server.pem, server.key and ca.pem; never a CA signing key')
+    parser.add_argument('--oidc-config', type=Path, help='private root-owned JSON for optional external browser SSO')
     parser.add_argument('--price-sources', type=Path, required=True,
                         help='JSON mapping gateway aliases to reviewed PriceTag pricing model IDs')
     parser.add_argument('--directory', type=Path, default=Path('/etc/praxis-pricetag'))
@@ -245,6 +250,8 @@ def main():
     args = parser.parse_args()
     if os.geteuid() != 0:
         parser.error('run as root on the RHEL host')
+    if args.mock_profiles and (not args.mock_provider or args.managed_mock or args.provider_unit is None):
+        parser.error('--mock-profiles requires --mock-provider and --provider-unit, without --managed-mock')
     if args.managed_mock and not args.mock_provider:
         parser.error('--managed-mock requires --mock-provider')
     if args.managed_mock and not re.fullmatch(r'pricetag-mock-ui-v[0-9]+', args.mock_secret):
@@ -265,11 +272,18 @@ def main():
             parser.error('--external-database-ca-file must be an absolute path')
     elif args.external_database_ca_file is not None:
         parser.error('--external-database-ca-file requires both external database URL files')
+    tls_files = validate_tls_bundle(args.tls_bundle, args.hostname) if args.tls_bundle else None
+    oidc_env, oidc_ca, oidc_host = load_oidc(args.oidc_config, f'https://{args.hostname}:8443') if args.oidc_config else ({}, None, None)
     for directory in (args.directory, args.admin_directory):
         if not directory.is_absolute() or re.search(r'[\s%]', str(directory)) or directory.exists():
             parser.error('use new absolute directories without whitespace or percent signs')
     owner = pwd.getpwnam('praxis-svc')
-    if args.mock_provider:
+    if args.mock_profiles:
+        from mock_profiles import configuration
+        from demo_config import native_inputs
+        document = configuration()
+        original, models = native_inputs(document), document['models']
+    elif args.mock_provider:
         original, models = mock_inputs(managed=args.managed_mock)
     else:
         models = json.loads(args.models.read_text())
@@ -284,7 +298,7 @@ def main():
     if not args.mock_provider and any(m['id'] == sources.get(m['id'], m['model']) for m in models):
         parser.error('use distinct gateway aliases to keep their initial pricing snapshot stable')
     provider_secrets = [f'Secret={args.mock_secret},type=env,target=CUSTOM_MOCK_API_KEY'] if args.managed_mock else []
-    for line in ([] if args.mock_provider else args.provider_unit.read_text().splitlines()):
+    for line in ([] if args.mock_provider and not args.mock_profiles else args.provider_unit.read_text().splitlines()):
         if re.fullmatch(r'Secret=[A-Za-z0-9_.-]+,type=env,target=[A-Z0-9_]+_API_KEY', line):
             provider_secrets.append(line)
     needed = {entry['env_var'] for chain in config['filter_chains'] for f in chain['filters']
@@ -315,8 +329,13 @@ def main():
     def credentials(*options):
         subprocess.run([str(credential), *map(str, options)], check=True, stdout=subprocess.DEVNULL)
 
-    credentials('lab-tls', '--directory', args.admin_directory / 'tls', '--hostname', args.hostname,
-                '--alt-hostname', 'localhost', '--alt-hostname', '127.0.0.1')
+    if tls_files is None:
+        credentials('lab-tls', '--directory', args.admin_directory / 'tls', '--hostname', args.hostname,
+                    '--alt-hostname', 'localhost', '--alt-hostname', '127.0.0.1')
+    else:
+        (args.admin_directory / 'tls').mkdir(mode=0o700)
+        for source, target in (('server.pem', 'server.pem'), ('server.key', 'server-key.pem'), ('ca.pem', 'ca.pem')):
+            shutil.copyfile(tls_files[source], args.admin_directory / 'tls' / target)
     for source, target in [(args.admin_directory / 'tls/server.pem', 'tls.pem'),
                            (args.admin_directory / 'tls/server-key.pem', 'tls-key.pem')]:
         shutil.copyfile(source, bundle / target)
@@ -352,6 +371,10 @@ def main():
         maas_url = external_application_url(maas_url, ca_configured)
     m2m_secret = secrets.token_urlsafe(48)
     management_secret = secrets.token_urlsafe(48)
+    if oidc_env:
+        partner_secret = secrets.token_urlsafe(48)
+        oidc_env['USER_MANAGEMENT_API_SECRET'] = partner_secret
+        (args.directory / 'partner-secret').write_text(partner_secret + '\n')
     metering_url = (metering_url if external_database else
                     f'postgres://metering:{metering_password}@pricetag-db:5432/metering?sslmode=disable')
     env('metering.env', {'DATABASE_URL': metering_url,
@@ -368,7 +391,9 @@ def main():
         'KEY_SERVICE_GROUPS_HEADER': 'X-MaaS-Group',
         'PARTNER_USER_KEY_GROUP': 'system:authenticated',
         'SUPERADMIN_USERS': 'admin', 'MONTHLY_TOKEN_QUOTA': '10000000000', 'TZ': 'UTC',
-        'MAAS_VALIDATE_URL': 'http://pricetag-maas:8080/internal/v1/api-keys/validate'})
+        'MAAS_VALIDATE_URL': 'http://pricetag-maas:8080/internal/v1/api-keys/validate', **oidc_env})
+    if oidc_ca is not None:
+        shutil.copyfile(oidc_ca, args.directory / 'oidc-ca.pem')
     (args.directory / 'm2m-secret').write_text(m2m_secret + '\n')
     maas_url = (maas_url if external_database else
                 f'postgres://maas:{maas_password}@pricetag-db:5432/maas?sslmode=disable')
@@ -421,7 +446,9 @@ def main():
     container('pricetag-metering', 'PriceTag metering and dashboards', application_dependency,
         f'Image={args.metering_image}\nPull=never\nNetworkAlias=pricetag-metering\n'
         f'EnvironmentFile={args.directory}/metering.env\nPublishPort=127.0.0.1:18087:8080\n'
-        f'Volume={args.directory}/catalog:/etc/gateway-catalog:ro\n' + external_ca_mount + app, '2G',
+        + (f'AddHost={oidc_host}\n' if oidc_host is not None else '') +
+        f'Volume={args.directory}/catalog:/etc/gateway-catalog:ro\n' + external_ca_mount +
+        (f'Volume={args.directory}/oidc-ca.pem:/etc/pricetag-oidc-ca.pem:ro\n' if oidc_ca is not None else '') + app, '2G',
         network='pricetag.network:ip=10.77.0.12')
     dependencies = 'pricetag-metering.service'
     if args.mock_provider:
@@ -431,9 +458,12 @@ def main():
         fixtures.mkdir()
         shutil.copyfile(ROOT / 'tests/common/provider.py', fixtures / 'provider.py')
         shutil.copyfile(ROOT / 'tests/pricetag/provider.py', fixtures / 'run.py')
+        if args.mock_profiles:
+            (fixtures / 'mock-profiles.json').write_text(json.dumps(document))
         container('pricetag-provider', 'Synthetic LLM for performance testing only', '',
             f'Image={PYTHON}\nVolume={fixtures}:/fixtures:ro\nEnvironment=MOCK_STREAM_DELAY=1\n' +
             ('Environment=MOCK_MANAGEMENT=1\n' if args.managed_mock else '') +
+            ('Environment=MOCK_PROFILES=1\n' if args.mock_profiles else '') +
             'Exec=python3 /fixtures/run.py\n' + app, '1G', network='pricetag-mock.network')
         dependencies += ' pricetag-provider.service'
     container('pricetag-gateway', 'Praxis HTTPS gateway with MaaS identity and USD budgets',
@@ -444,6 +474,8 @@ def main():
         os.chown(path, 0, owner.pw_gid)
         path.chmod(0o750 if path.is_dir() else 0o640)
     (args.directory / 'management-secret').chmod(0o600)
+    if oidc_env:
+        (args.directory / 'partner-secret').chmod(0o600)
     print(f'Prepared {args.directory}; no services started. Administrator credentials: {args.admin_directory}')
 
 

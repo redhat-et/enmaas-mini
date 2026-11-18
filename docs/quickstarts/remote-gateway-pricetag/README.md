@@ -11,12 +11,24 @@ authentication, routing and current boundaries.
 
 **Needs:** a fresh RHEL 9.6 x86_64 host with sudo, outbound HTTPS, and inbound
 SSH/8443 from your IP; Git, Python 3 and OpenCode on your workstation.
-The tested VM has 8 vCPUs, 32 GiB RAM and 150 GiB disk. No GPU is needed.
+The test-host reference is 8 vCPUs, 32 GiB RAM and 150 GiB disk. No GPU is needed.
+[Choose a size](sizing.md) maps traffic and active people/bots to AWS candidates
+and explains the capacity checks required before production use.
 
 > The default published images include the administration, user-key, quota and
 > pricing controls described below. To test newer source, choose **Build latest
 > demo branches** or add `--image-mode source`; see [image options](images.md).
 > The optional provider editor is not included.
+
+## Choose the setup
+
+This page installs **one node without SSO or external observability**, using local
+or external PostgreSQL. For gateway + external SSO + observability,
+follow [full deployment](full-deployment.md). Both layouts can use real providers.
+[Deployment and installation modes](deployment-options.md) compares both and
+provides interactive/headless commands. AWS provisioning is separate:
+[one node](../../testing/aws-pricetag.md) or
+[three-node lab](../../testing/external-services/aws.md).
 
 ## 1. Set the connection
 

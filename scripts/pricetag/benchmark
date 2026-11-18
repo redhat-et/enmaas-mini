@@ -29,20 +29,28 @@ def require_mock(directory):
     legacy = len(models) == 1 and models[0].get('id') == 'fixture' and models[0].get('model') == 'fixture'
     managed = bool(models) and all(m.get('provider') == 'mock' and str(m.get('id', '')).startswith('mock/')
         and re.fullmatch(r'fixture(?:-[a-z0-9-]+)?', str(m.get('model', ''))) for m in models)
-    if not (legacy or managed):
+    sys.path.insert(0, str(ROOT / 'scripts/pricetag'))
+    from mock_profiles import configuration
+    profiles = models == configuration()['models']
+    if not (legacy or managed or profiles):
         raise ValueError('benchmark requires the dedicated fixture-only deployment')
     unit = (directory / 'quadlets/pricetag-gateway.container').read_text()
     credential_lines = [line for line in unit.splitlines() if line.startswith('Secret=') and 'type=env' in line]
     mock_credentials = managed and all(re.fullmatch(
         r'Secret=(?:pricetag-mock-ui-v[0-9]+|praxis-mock-api-key-v[0-9]+),type=env,target=CUSTOM_MOCK_API_KEY', line)
         for line in credential_lines)
-    if 'Network=pricetag-mock.network' not in unit or (credential_lines and not mock_credentials):
+    profile_credentials = profiles and set(credential_lines) == {
+        'Secret=pricetag-mock-openai-v1,type=env,target=OPENAI_API_KEY',
+        'Secret=pricetag-mock-external-v1,type=env,target=CUSTOM_EXTERNAL_API_KEY'}
+    if 'Network=pricetag-mock.network' not in unit or (credential_lines and not (mock_credentials or profile_credentials)) or (profiles and not profile_credentials):
         raise ValueError('benchmark refuses a deployment with real-provider credentials')
     config = json.loads((directory / 'gateway/gateway.json').read_text())
     endpoints = [endpoint for chain in config['filter_chains'] for item in chain['filters']
                  if item.get('filter') == 'load_balancer' for cluster in item.get('clusters', [])
                  for endpoint in cluster.get('endpoints', [])]
-    if not {'pricetag-provider:18080', 'pricetag-provider:18081'} <= set(endpoints):
+    required = ({'pricetag-provider:18080', 'pricetag-provider:18180', 'pricetag-provider:18181'}
+                if profiles else {'pricetag-provider:18080', 'pricetag-provider:18081'})
+    if not required <= set(endpoints):
         raise ValueError('mock provider endpoints are missing')
     if any(not str(endpoint).startswith(('pricetag-provider:', '127.0.0.1:', 'pricetag-metering:'))
            for endpoint in endpoints):
