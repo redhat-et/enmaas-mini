@@ -878,10 +878,13 @@ services:
       interval: 5s
       timeout: 3s
       retries: 20
+      start_period: 10s
     restart: unless-stopped
     tmpfs:
       - /var/run/postgresql:rw,mode=3775
       - /tmp
+    cap_drop:
+      - ALL
 
 {provider_service}
   pricetag-maas:
@@ -914,6 +917,12 @@ services:
     read_only: false
     cap_drop:
       - ALL
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/health || wget -qO- http://127.0.0.1:8080/health || python3 -c \\"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=2).read()\\""]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 20s
 
   pricetag-metering:
     image: {args.metering_image}
@@ -956,6 +965,12 @@ services:
     read_only: false
     cap_drop:
       - ALL
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/ready || wget -qO- http://127.0.0.1:8080/ready || python3 -c \\"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/ready', timeout=2).read()\\""]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 30s
 
   pricetag-gateway:
     image: {PRAXIS_IMAGE}
@@ -1132,8 +1147,18 @@ def acquire_images(args: argparse.Namespace, arch: str) -> tuple[str, ...]:
                 print(f"    podman build --platform linux/{arch} -t {image} -f maas-api/Dockerfile maas-api", flush=True)
                 print("  Continuing with local image if present...", flush=True)
                 logger.warning("MaaS laptop image pull failed: %s", e)
-            else:
-                raise
+                continue
+            if "LLM-Katan" in name:
+                print(f"  WARN: LLM-Katan pull failed (private registry or no auth): {e}", flush=True)
+                print(f"    ghcr.io/yossiovadia/llm-katan:0.22.0 is private; falling back to fixture provider", flush=True)
+                print(f"    (tests/common/provider.py on {PYTHON_IMAGE}) — deterministic 2+3=5 tokens", flush=True)
+                print(f"    To use llm-katan, build locally: git clone https://github.com/yossiovadia/llm-katan && podman build -t {image} -f Containerfile .", flush=True)
+                logger.warning("LLM-Katan pull failed, falling back to fixture: %s", e)
+                # Mark as fallback so later stages use fixture provider (no image needed)
+                args.llm_katan_backend = "fixture"
+                args.with_llm_katan = False
+                continue
+            raise
         verify_image_arch(image, arch)
     return (args.maas_image, args.metering_image)
 
