@@ -63,7 +63,7 @@ jobs:
           # The standalone-management branch carrying
           # redhat-et/pricetag-metering PR #149 (redhat-et main plus the
           # standalone management layer); follow main once merged.
-          metering=97be0aedbd3663b1cc4067f3343778158e19bbe6
+          metering=4fe3bab46aa7e782bf8b5152fc477b36f0ca0849
           for component in maas metering; do
             directory="$RUNNER_TEMP/$component"
             git init "$directory"

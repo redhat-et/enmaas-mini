@@ -71,7 +71,7 @@ image has **My keys** at `/management`. Each branch resolves to a full commit
 before building, recorded in the image label and checked on import.
 
 For the exact reviewed candidate, use
-`--metering-revision 97be0aedbd3663b1cc4067f3343778158e19bbe6`
+`--metering-revision 4fe3bab46aa7e782bf8b5152fc477b36f0ca0849`
 with source mode. Branch mode may include later commits.
 
 ```console
