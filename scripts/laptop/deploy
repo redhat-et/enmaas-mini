@@ -637,9 +637,9 @@ def mock_inputs(managed: bool = False) -> tuple[dict[str, Any], list[dict[str, A
         from demo_config import mock_configuration, native_inputs  # type: ignore[import]
         document = mock_configuration()
         return native_inputs(document), document["models"]
-    models: list[dict[str, Any]] = [{"id": "fixture", "provider": "vllm", "model": "fixture",
+    models = [{"id": "fixture", "provider": "vllm", "model": "fixture",
                "apis": ["openai", "anthropic"], "context": 32768, "output": 4096}]
-    config: dict[str, Any] = {"filter_chains": [{"name": api, "filters": [
+    config = {"filter_chains": [{"name": api, "filters": [
         {"filter": "headers", "request_remove": ["Authorization", "X-Api-Key"]},
         {"filter": "load_balancer", "clusters": [{"name": "vllm",
          "endpoints": ["pricetag-provider:" + port]}]}]}
@@ -814,7 +814,6 @@ def generate_compose_yaml(
       - {fixtures_path}:/fixtures:ro
     environment:
       MOCK_STREAM_DELAY: "1"
-      MOCK_MANAGEMENT: "1"
       LLM_KATAN_BACKEND: "{llm_katan_backend}"
     command: ["python3", "/fixtures/run.py"]
     networks:
@@ -840,7 +839,6 @@ def generate_compose_yaml(
       - {fixtures_path}:/fixtures:ro
     environment:
       MOCK_STREAM_DELAY: "1"
-      MOCK_MANAGEMENT: "1"
       LLM_KATAN_BACKEND: "fixture"
     command: ["python3", "/fixtures/run.py"]
     networks:
