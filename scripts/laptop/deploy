@@ -1,0 +1,1995 @@
+#!/usr/bin/env python3
+"""Production-grade MBP deployment for enmaas-mini (Darwin + Podman machine).
+
+Platform dispatch:
+  - Linux/RHEL: delegate to scripts/pricetag/install.py (Quadlet, RHEL-only)
+  - Darwin (MBP, applehv 10 vCPU / 16 GiB / 93 GiB Fedora 41 VM; M4 Pro 14 core 48 GiB host):
+    compose-native path that reuses prepare.py logic (postgres_bootstrap, gateway render)
+    but emits compose.laptop.yaml and runs via podman-compose.
+
+Stack on Darwin/MBP (podman machine):
+  - postgres:17.8 (placeholder for hardened registry.redhat.io/rhel9/postgresql-16)
+  - maas-api standalone arm64 build (M1/M2/M3/M4 - linux/arm64)
+  - pricetag metering
+  - praxis gateway (standalone)
+  - llm-katan (mock/echo fixture via tests/common/provider.py)
+
+Six stages (mirrors install.py 1-6):
+  1. Validate provider setup
+  2. Prepare host
+  3. Acquire application images (platform-aware amd64/arm64)
+  4. Import images
+  5. Configure providers, TLS and budgets
+  6. Start and verify services
+
+Lifecycle:
+  deploy --from-scratch  -> idempotent DB init, secrets, health, admin user
+  deploy --verify        -> harness + benchmark (20 requests, exact ledger)
+  teardown --purge-volumes -> compose down, volume/network rm, admin dirs
+
+Usage examples:
+  scripts/laptop/deploy --mode mock --hostname localhost --monthly-usd 5
+  scripts/laptop/deploy --mode mock --hostname localhost --demo-fixture --from-scratch
+  scripts/laptop/deploy --mode mock --hostname localhost --with-llm-katan --llm-katan-backend echo --verify --yes
+  scripts/laptop/deploy --mode mock --hostname localhost --with-llm-katan --llm-katan-backend echo --from-scratch
+  scripts/laptop/deploy --plan
+  sudo scripts/laptop/deploy --mode real --provider openai --openai-key-file /root/openai.key
+"""
+from __future__ import annotations
+
+import argparse
+import fcntl
+import ipaddress
+import json
+import logging
+import os
+import platform
+import re
+import secrets
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+from typing import Any
+
+# ---------------------------------------------------------------------------
+# Constants (pinned provenance, matching install.py / prepare.py)
+# ---------------------------------------------------------------------------
+ROOT: Path = Path(__file__).resolve().parents[2]
+
+# Published images (pinned by digest) - same as install.py
+PRAXIS_IMAGE: str = "quay.io/opendatahub/praxis-experimental@sha256:502f120fed7b8e516ce1d78396045c8f72673672351432b9dc2e61baf5c13ac8"
+PRAXIS_REVISION: str = "5667c4acecd0981ae5114cbbf2ee3dcccec9c248"
+PUBLISHED_MAAS_IMAGE: str = "quay.io/redhat-et/secure-single-server-maas-standalone@sha256:0bec6ef57fa5b10a7bef8f4df8d98f932c9d7fc96798f7bfc0cd77b504790fa8"
+PUBLISHED_METERING_IMAGE: str = "quay.io/redhat-et/secure-single-server-pricetag-metering@sha256:dabb2f35f54c30c2c387b3bf298b66f3b84a4110ddf3a78a204c7d59c5de2f1a"
+MAAS_COMMIT: str = "6ac4c80ebc95f590e5f24593ac15bb80c7f9fa1d"
+METERING_COMMIT: str = "ce9c6c51b8dff178637003945b517255c54fc853"
+
+# MBP-specific: arm64 build required for MaaS on Apple Silicon
+MAAS_LAPTOP_IMAGE_ARM64: str = "quay.io/yossiovadia/models-as-a-service:feat-standalone-api-key-mode-5fc83feb"
+MAAS_LAPTOP_IMAGE_TAGGED: str = "yossiovadia/models-as-a-service:feat/standalone-api-key-mode@5fc83feb"
+
+# Postgres: 17.8 for laptop; hardened placeholder for production registry
+POSTGRES_IMAGE: str = "docker.io/library/postgres:17.8"
+POSTGRES_IMAGE_DIGEST: str = "docker.io/library/postgres@sha256:996e9dc583ba9f0265a2c75547a9c95fb22c251e394749cab205a0a00e1856a1"
+POSTGRES_HARDENED_PLACEHOLDER: str = "registry.redhat.io/rhel9/postgresql-16@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+POSTGRES: str = POSTGRES_IMAGE  # alias for prepare.py compatibility
+
+# LLM-Katan simulation - echo backend
+# Fixture provider (tests/common/provider.py) = deterministic 2+3=5 tokens for benchmark.
+# llm-katan echo = lighter dev default with dashboard + failure injection, but
+# variable word-count tokens and no /v1/responses or /v1/messages/count_tokens
+# (see scripts/laptop/shims/README.md).
+PYTHON_IMAGE: str = "docker.io/library/python@sha256:519591d6871b7bc437060736b9f7456b8731f1499a57e22e6c285135ae657bf7"
+LLM_KATAN_IMAGE: str = "ghcr.io/yossiovadia/llm-katan:0.22.0"
+LLM_KATAN_ENV_SRC: Path = ROOT / "configs/laptop/llm-katan.env"
+
+# Defaults for laptop deploy (MBP applehv: 10 vCPU / 16 GiB / 93 GiB Fedora 41 VM on M4 Pro 14c 48 GiB host)
+DEFAULT_HOSTNAME: str = "localhost"
+DEFAULT_MONTHLY_USD: int = 5
+DEFAULT_MODE: str = "mock"
+DEFAULT_DEPLOY_DIR: Path = Path.home() / ".local/share/enmaas-mini/laptop"
+DEFAULT_ADMIN_DIR: Path = Path.home() / "praxis-laptop-admin"
+DEFAULT_COMPOSE_FILE: Path = ROOT / "compose.laptop.yaml"
+LOCK_PATH: Path = Path("/tmp/praxis-laptop-deploy.lock")
+LOG_PATH: Path | None = None
+LOG_FD: Any = None
+STAGE: str = "Setup"
+
+VOLUME_NAMES: list[str] = ["pricetag-data", "enmaas-mini_pricetag-data", "laptop_pricetag-data"]
+NETWORK_NAMES: list[str] = ["pricetag-private", "pricetag-mock", "enmaas-mini_pricetag-private", "laptop_pricetag-private"]
+SECRET_NAMES: list[str] = ["pricetag-m2m", "pricetag-mock-ui-v1"]
+
+# ---------------------------------------------------------------------------
+# Logging & stage helpers (mirror install.py UX)
+# ---------------------------------------------------------------------------
+
+logger: logging.Logger = logging.getLogger("deploy")
+
+
+def stage(number: int | str, title: str) -> None:
+    global STAGE
+    STAGE = title
+    msg = f"\n[{number}/6] {title}\n" + "-" * 54
+    print(msg, flush=True)
+    logger.info(msg)
+    if LOG_FD:
+        LOG_FD.write(msg + "\n")
+        LOG_FD.flush()
+
+
+def open_log(directory: str = "/tmp") -> Path:
+    global LOG_FD, LOG_PATH
+    Path(directory).mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix="praxis-laptop-deploy-", suffix=".log", dir=directory)
+    LOG_PATH = Path(name)
+    os.chmod(LOG_PATH, 0o600)
+    LOG_FD = os.fdopen(fd, "w", buffering=1)
+    handler = logging.FileHandler(str(LOG_PATH))
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logger.addHandler(handler)
+    logger.setLevel(logging.DEBUG)
+    print(f"\nDetailed log: {LOG_PATH} (private)\nFollow: tail -f {LOG_PATH}", flush=True)
+    logger.info("Detailed log: %s", LOG_PATH)
+    return LOG_PATH
+
+
+def log_cmd(cmd: list[str]) -> None:
+    if LOG_FD:
+        LOG_FD.write("+ " + shlex.join(cmd) + "\n")
+        LOG_FD.flush()
+    logger.debug("+ %s", shlex.join(cmd))
+
+
+def wait_for(proc: subprocess.Popen[Any], label: str = "Working") -> int:
+    started = time.monotonic()
+    while True:
+        try:
+            return proc.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            elapsed = int(time.monotonic() - started)
+            print(f"  {label}... {elapsed}s elapsed", flush=True)
+            if LOG_FD:
+                LOG_FD.write(f"  {label}... {elapsed}s elapsed\n")
+                LOG_FD.flush()
+            logger.debug("%s... %ds elapsed", label, elapsed)
+
+
+def run(
+    cmd: list[str | Path],
+    capture: bool = False,
+    label: str | None = None,
+    cwd: str | Path = "/tmp",
+    env: dict[str, str] | None = None,
+    check: bool = True,
+    input_data: bytes | None = None,
+) -> str | None:
+    cmd_str: list[str] = [str(c) for c in cmd]
+    log_cmd(cmd_str)
+    if LOG_FD and not capture:
+        print(f"  {label or ('Running ' + Path(cmd_str[0]).name)}...", flush=True)
+        logger.info("Running: %s", shlex.join(cmd_str))
+        proc = subprocess.Popen(
+            cmd_str,
+            cwd=str(cwd),
+            text=False,
+            stdout=LOG_FD,
+            stderr=LOG_FD,
+            stdin=subprocess.PIPE if input_data is not None else None,
+            env=env,
+        )
+        if input_data is not None and proc.stdin is not None:
+            proc.stdin.write(input_data)
+            proc.stdin.close()
+        code = wait_for(proc, label or "Running")
+        if code != 0:
+            if check:
+                logger.error("Command failed (%d): %s", code, shlex.join(cmd_str))
+                raise subprocess.CalledProcessError(code, cmd_str)
+            return None
+        print("  OK", flush=True)
+        logger.info("OK: %s", shlex.join(cmd_str))
+        return None
+    result = subprocess.run(
+        cmd_str,
+        check=check,
+        cwd=str(cwd),
+        text=True,
+        capture_output=capture,
+        stdout=subprocess.PIPE if capture else None,
+        stderr=LOG_FD if LOG_FD else subprocess.PIPE,
+        input=input_data.decode() if isinstance(input_data, bytes) else input_data,
+        env=env,
+    )
+    return result.stdout.strip() if capture else None
+
+
+# ---------------------------------------------------------------------------
+# Validation helpers
+# ---------------------------------------------------------------------------
+
+def valid_hostname(value: str) -> bool:
+    try:
+        ipaddress.IPv4Address(value)
+        return True
+    except ValueError:
+        pass
+    try:
+        ipaddress.IPv6Address(value)
+        return True
+    except ValueError:
+        pass
+    if not value or len(value) > 253:
+        return False
+    return all(
+        re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", part)
+        for part in value.split(".")
+    )
+
+
+def oci_arch(machine: str) -> str:
+    mapping: dict[str, str] = {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64", "arm64": "arm64"}
+    if machine not in mapping:
+        raise ValueError(f"unsupported architecture: {machine} (expected x86_64 or aarch64/arm64)")
+    return mapping[machine]
+
+
+def parse_version(v: str) -> tuple[int, ...]:
+    v = v.lstrip("v").split("-")[0].split("+")[0]
+    parts = re.split(r"\.", v)
+    out: list[int] = []
+    for p in parts:
+        m = re.match(r"(\d+)", p)
+        if m:
+            out.append(int(m.group(1)))
+        else:
+            break
+    return tuple(out) if out else (0,)
+
+
+def version_gte(have: str, need: str) -> bool:
+    return parse_version(have) >= parse_version(need)
+
+
+# ---------------------------------------------------------------------------
+# Host checks (podman >=4.6, arch, disk >=30% free, machine resources)
+# ---------------------------------------------------------------------------
+
+def check_podman() -> str:
+    """Validate podman >=4.6 is available. Returns version string."""
+    try:
+        ver = subprocess.run(
+            ["podman", "version", "--format", "{{.Client.Version}}"],
+            capture_output=True, text=True, timeout=10
+        )
+        if ver.returncode == 0 and ver.stdout.strip():
+            version = ver.stdout.strip()
+            if not version_gte(version, "4.6"):
+                raise ValueError(f"podman 4.6 or newer is required; found {version}")
+            print(f"  Podman: {version} OK", flush=True)
+            logger.info("Podman: %s OK", version)
+            return version
+    except FileNotFoundError:
+        pass
+
+    # Fallback: docker is acceptable for laptop (with warning)
+    try:
+        ver = subprocess.run(
+            ["docker", "version", "--format", "{{.Client.Version}}"],
+            capture_output=True, text=True, timeout=10
+        )
+        if ver.returncode == 0 and ver.stdout.strip():
+            version = ver.stdout.strip()
+            print(f"  Podman not found; using Docker {version} (laptop fallback)", flush=True)
+            if LOG_FD:
+                LOG_FD.write(f"  Podman not found; using Docker {version}\n")
+            logger.warning("Podman not found; using Docker %s", version)
+            return version
+    except FileNotFoundError:
+        pass
+
+    raise ValueError("podman >=4.6 is required (or docker as fallback); not found in PATH")
+
+
+def detect_compose() -> list[str]:
+    """Detect compose engine: prefer podman-compose, then podman compose, then docker compose."""
+    if shutil.which("podman-compose"):
+        print("  Compose: podman-compose OK", flush=True)
+        logger.info("Compose: podman-compose OK")
+        return ["podman-compose"]
+    try:
+        r = subprocess.run(["podman", "compose", "version"], capture_output=True, text=True, timeout=10)
+        if r.returncode == 0:
+            print(f"  Compose: podman compose {r.stdout.strip()} OK", flush=True)
+            logger.info("Compose: podman compose %s OK", r.stdout.strip())
+            return ["podman", "compose"]
+    except FileNotFoundError:
+        pass
+    try:
+        r = subprocess.run(["docker", "compose", "version"], capture_output=True, text=True, timeout=10)
+        if r.returncode == 0:
+            print(f"  Compose: {r.stdout.strip()} OK", flush=True)
+            logger.info("Compose: %s OK", r.stdout.strip())
+            return ["docker", "compose"]
+    except FileNotFoundError:
+        pass
+    if shutil.which("docker-compose"):
+        print("  Compose: docker-compose (legacy) OK", flush=True)
+        return ["docker-compose"]
+
+    raise ValueError(
+        "compose not found: install podman-compose, or enable podman/docker compose plugin. "
+        "On MBP: brew install podman-compose  or  podman machine init --cpus 10 --memory 16384 --disk-size 93"
+    )
+
+
+def check_arch() -> str:
+    machine: str = platform.machine()
+    if machine not in ("x86_64", "aarch64", "arm64", "amd64"):
+        raise ValueError(f"unsupported architecture: {machine} (expected x86_64 or aarch64)")
+    arch: str = oci_arch(machine)
+    print(f"  Host arch: {machine} -> {arch} OK", flush=True)
+    logger.info("Host arch: %s -> %s OK", machine, arch)
+    return arch
+
+
+def check_disk_free(path: Path | str = "/tmp", required_pct: float = 30.0) -> None:
+    """Require at least required_pct % free disk on the given path."""
+    try:
+        usage = shutil.disk_usage(str(path))
+        pct_free = (usage.free / usage.total) * 100 if usage.total else 0
+        pct_used = 100 - pct_free
+        print(f"  Disk {path}: {pct_free:.1f}% free ({usage.free // (1024**3)} GiB free / {usage.total // (1024**3)} GiB total)", flush=True)
+        logger.info("Disk %s: %.1f%% free", path, pct_free)
+        if pct_free < required_pct:
+            raise ValueError(
+                f"disk {path} has only {pct_free:.1f}% free ({pct_used:.1f}% used); "
+                f"need >= {required_pct:.0f}% free (~{required_pct:.0f}% headroom for images/containers). "
+                "Free space or prune: podman system prune -a"
+            )
+    except FileNotFoundError:
+        logger.warning("Could not check disk usage for %s", path)
+
+
+def check_podman_machine_resources() -> None:
+    """Warn if podman machine has <10 CPU / 16 GiB / 93 GiB (MBP applehv spec for M4 Pro 14c 48 GiB host)."""
+    if platform.system() != "Darwin":
+        return
+    try:
+        result = subprocess.run(
+            ["podman", "machine", "list", "--format", "json"],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            machines = json.loads(result.stdout)
+            if not machines:
+                print("  WARN: no podman machine found; create one: podman machine init --cpus 10 --memory 16384 --disk-size 93 applehv", flush=True)
+                logger.warning("No podman machine found")
+                return
+            for m in machines:
+                cpus = m.get("CPUs") or m.get("cpus") or m.get("CPUCount") or 0
+                mem = m.get("Memory") or m.get("memory") or 0
+                if isinstance(mem, str):
+                    mem_str = mem.lower()
+                    if "gib" in mem_str:
+                        mem_gib = float(mem_str.replace("gib", "").strip())
+                    elif "mib" in mem_str:
+                        mem_gib = float(mem_str.replace("mib", "").strip()) / 1024
+                    else:
+                        mem_gib = 0
+                elif isinstance(mem, int):
+                    mem_gib = mem / (1024**3) if mem > 1024**3 else mem / 1024
+                else:
+                    mem_gib = 0
+
+                name: str = m.get("Name", "applehv")
+                if isinstance(cpus, int) and cpus and cpus < 10:
+                    print(f"  WARN: podman machine '{name}' has {cpus} vCPU < 10 recommended; expect degraded perf. Recreate: podman machine rm {name} && podman machine init --cpus 10 --memory 16384 --disk-size 93 {name}", flush=True)
+                    logger.warning("podman machine %s has %d vCPU < 10", name, cpus)
+                if mem_gib and mem_gib < 15:
+                    print(f"  WARN: podman machine '{name}' has {mem_gib:.1f} GiB < 16 GiB recommended", flush=True)
+                    logger.warning("podman machine %s has %.1f GiB < 16 GiB", name, mem_gib)
+
+                try:
+                    insp = subprocess.run(
+                        ["podman", "machine", "inspect", name],
+                        capture_output=True, text=True, timeout=10
+                    )
+                    if insp.returncode == 0 and insp.stdout.strip():
+                        data = json.loads(insp.stdout)
+                        entry = data[0] if isinstance(data, list) and data else data
+                        if isinstance(entry, dict):
+                            disk = entry.get("Resources", {}).get("DiskSize") or entry.get("DiskSize") or ""
+                            if isinstance(disk, str) and disk:
+                                if "gib" in disk.lower():
+                                    disk_gib = float(disk.lower().replace("gib", "").strip())
+                                    if disk_gib < 90:
+                                        print(f"  WARN: podman machine '{name}' disk {disk} < 93 GiB recommended", flush=True)
+                                        logger.warning("podman machine %s disk %s < 93GiB", name, disk)
+                except Exception:
+                    pass
+                return
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        print(f"  WARN: could not inspect podman machine resources: {e}", flush=True)
+        logger.warning("Could not inspect podman machine: %s", e)
+
+    try:
+        result = subprocess.run(
+            ["podman", "info", "--format", "{{.Host.Cpus}} {{.Host.MemTotal}}"],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            parts = result.stdout.strip().split()
+            if parts:
+                try:
+                    cpus = int(parts[0])
+                    if cpus < 10:
+                        print(f"  WARN: host reports {cpus} vCPU < 10 recommended (applehv: 10 vCPU/16GiB/93GiB Fedora 41 VM)", flush=True)
+                        logger.warning("Host reports %d vCPU < 10", cpus)
+                except ValueError:
+                    pass
+    except FileNotFoundError:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Platform dispatch
+# ---------------------------------------------------------------------------
+
+def should_delegate_to_rhel() -> bool:
+    """Return True if this host is RHEL Linux and should use install.py."""
+    if platform.system() != "Linux":
+        return False
+    os_release = Path("/etc/os-release")
+    if not os_release.is_file():
+        return False
+    try:
+        content = os_release.read_text()
+        if re.search(r'^ID="?rhel"?$', content, re.M):
+            return True
+    except OSError:
+        pass
+    return False
+
+
+def delegate_to_install(passthrough_args: list[str]) -> int:
+    """Delegate to RHEL Quadlet installer (install.py) with same args."""
+    installer: Path = ROOT / "scripts/pricetag/install.py"
+    if not installer.is_file():
+        print(f"error: RHEL installer not found at {installer}", file=sys.stderr)
+        return 1
+    print("Detected RHEL host; delegating to scripts/pricetag/install.py (Quadlet path)", flush=True)
+    print(f"  Delegating: {sys.executable} {installer} {shlex.join(passthrough_args)}", flush=True)
+    result = subprocess.run([sys.executable, str(installer), *passthrough_args])
+    return result.returncode
+
+
+# ---------------------------------------------------------------------------
+# Argument parsing (superset of install.py for laptop ergonomics)
+# ---------------------------------------------------------------------------
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("--hostname", default=DEFAULT_HOSTNAME,
+                   help=f"public IPv4/DNS name; no scheme/path/port (default: {DEFAULT_HOSTNAME})")
+    p.add_argument("--monthly-usd", type=int, default=DEFAULT_MONTHLY_USD,
+                   help=f"default per-user monthly USD allowance (1-10000; default {DEFAULT_MONTHLY_USD})")
+    p.add_argument("--mode", choices=("real", "mock"), default=DEFAULT_MODE,
+                   help=f"real providers or mock synthetic benchmark (default: {DEFAULT_MODE})")
+    p.add_argument("--demo-fixture", action="store_true",
+                   help="mock mode only: two model aliases for the UI demo (mock/fixture + mock/demo-cheap)")
+    p.add_argument("--provider", action="append", choices=("openai", "external", "pricetag"), default=[],
+                   help="real mode: one or more providers; pricetag is legacy external profile")
+    p.add_argument("--openai-key-file", type=Path, help="absolute path to OpenAI key file (real mode)")
+    p.add_argument("--external-key-file", type=Path, help="absolute path to external key file (real mode)")
+    p.add_argument("--external-api", choices=("openai", "anthropic", "both"),
+                   help="external endpoint protocol(s)")
+    p.add_argument("--external-messages-url", help="external Anthropic Messages URL")
+    p.add_argument("--external-openai-url", help="external OpenAI-compatible URL")
+    p.add_argument("--external-messages-auth", choices=("x-api-key", "bearer"), default="x-api-key",
+                   help="external Messages credential header")
+    p.add_argument("--pricetag-key-file", type=Path, help=argparse.SUPPRESS)
+    p.add_argument("--pricetag-messages-url", help=argparse.SUPPRESS)
+    p.add_argument("--pricetag-openai-url", help=argparse.SUPPRESS)
+    p.add_argument("--maas-database-url-file", type=Path, help=argparse.SUPPRESS)
+    p.add_argument("--metering-database-url-file", type=Path, help=argparse.SUPPRESS)
+    p.add_argument("--external-database-ca-file", type=Path, help=argparse.SUPPRESS)
+    p.add_argument("--sample-users", action=argparse.BooleanOptionalAction, default=True,
+                   help="create Alice/Bob in addition to admin (default: yes)")
+    p.add_argument("--yes", action="store_true", help="skip confirmation prompt")
+    p.add_argument("--plan", action="store_true", help="print stages without host changes")
+    p.add_argument("--image-mode", choices=("source", "published"), default="published",
+                   help="build source or pull digest-pinned images (default: published)")
+    p.add_argument("--maas-image", help="published MaaS image with @sha256 digest (or laptop arm64 tag)")
+    p.add_argument("--metering-image", help="published metering image with @sha256 digest")
+    p.add_argument("--maas-revision", help="full MaaS source SHA to build/verify")
+    p.add_argument("--maas-branch", help="source mode: branch in MaaS fork")
+    p.add_argument("--metering-revision", help="full metering source SHA to build/verify")
+    p.add_argument("--metering-branch", help="source mode: branch in metering repo")
+    # Laptop-specific
+    p.add_argument("--from-scratch", action="store_true",
+                   help="idempotent full reset: remove volumes/networks, regenerate secrets, re-init DB")
+    p.add_argument("--verify", action="store_true",
+                   help="after deploy, run harness + benchmark (20 requests) verification")
+    # Primary flags required by spec (canonical):
+    p.add_argument("--with-llm-katan", action="store_true",
+                   help="enable llm-katan sidecar (mock/echo LLM simulation)")
+    p.add_argument("--llm-katan-backend", choices=("echo", "mock", "fixture", "vllm", "external"),
+                   default="mock",
+                   help="llm-katan backend: echo (deterministic), mock/fixture (default), vllm or external")
+    # Back-compat alias for --with-llm-katan / --llm-katan-backend:
+    p.add_argument("--llm-katan", choices=("mock", "fixture", "vllm", "external", "echo"),
+                   default=None,
+                   help=argparse.SUPPRESS)
+    p.add_argument("--deploy-dir", type=Path, default=DEFAULT_DEPLOY_DIR,
+                   help=f"laptop deploy directory (default: {DEFAULT_DEPLOY_DIR})")
+    p.add_argument("--admin-dir", type=Path, default=DEFAULT_ADMIN_DIR,
+                   help=f"admin credentials directory (default: {DEFAULT_ADMIN_DIR})")
+    p.add_argument("--compose-file", type=Path, default=DEFAULT_COMPOSE_FILE,
+                   help=f"compose file to generate (default: {DEFAULT_COMPOSE_FILE})")
+    p.add_argument("--no-pull", action="store_true", help="skip image pulls (use local images)")
+
+    args = p.parse_args(argv)
+
+    # Back-compat: --llm-katan maps to --with-llm-katan + --llm-katan-backend
+    if args.llm_katan is not None:
+        args.with_llm_katan = True
+        # echo is explicit; mock/fixture map to mock backend
+        if args.llm_katan == "echo":
+            args.llm_katan_backend = "echo"
+        else:
+            args.llm_katan_backend = args.llm_katan
+
+    # Normalize: if --with-llm-katan not set but backend is echo, imply with
+    if args.llm_katan_backend == "echo":
+        args.with_llm_katan = True
+
+    if args.hostname and not valid_hostname(args.hostname):
+        p.error(f"provide --hostname with a valid IPv4/IPv6 or DNS name, got: {args.hostname!r}")
+    if not 1 <= args.monthly_usd <= 10000:
+        p.error("--monthly-usd must be 1-10000")
+    if args.demo_fixture and args.mode != "mock":
+        p.error("--demo-fixture requires --mode mock")
+    if args.mode == "mock" and args.provider:
+        p.error("mock mode cannot configure real providers")
+    if args.mode == "real" and not args.provider:
+        if not args.plan:
+            p.error("real mode requires --provider openai and/or --provider external")
+    if "external" in args.provider and not args.external_api:
+        if args.plan:
+            args.external_api = "both"
+        else:
+            p.error("--provider external requires --external-api openai|anthropic|both")
+    # Image defaults
+    if not args.maas_image:
+        arch = oci_arch(platform.machine())
+        if platform.system() == "Darwin" and arch == "arm64":
+            args.maas_image = MAAS_LAPTOP_IMAGE_ARM64
+            if LOG_FD:
+                LOG_FD.write(f"Using MBP arm64 MaaS image: {args.maas_image}\n")
+        else:
+            args.maas_image = PUBLISHED_MAAS_IMAGE
+    if not args.metering_image:
+        args.metering_image = PUBLISHED_METERING_IMAGE
+
+    if args.image_mode == "published":
+        for field in ("maas_image", "metering_image"):
+            image = getattr(args, field)
+            if not image:
+                continue
+            if not (re.fullmatch(r"[a-z0-9][a-z0-9.:-]*/[a-z0-9_./-]+@sha256:[0-9a-f]{64}", image)
+                    or re.fullmatch(r"[a-z0-9][a-z0-9.:_-]*/[a-z0-9._/-]+:[a-zA-Z0-9._/-]+", image)
+                    or re.fullmatch(r"[a-z0-9][a-z0-9.:_-]*/[a-z0-9_./:-]+", image)):
+                if "@" in image or "/" in image:
+                    pass
+                else:
+                    p.error(f"--{field.replace('_','-')} must be a valid image reference: {image}")
+
+    args.provider = list(dict.fromkeys(args.provider))
+    return args
+
+
+# ---------------------------------------------------------------------------
+# Provider / mock helpers (reuse prepare.py logic)
+# ---------------------------------------------------------------------------
+
+def mock_inputs(managed: bool = False) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Return (gateway_native_inputs, models) for mock provider."""
+    sys.path.insert(0, str(ROOT / "scripts/pricetag"))
+    sys.path.insert(0, str(ROOT / "scripts/common"))
+    if managed:
+        from demo_config import mock_configuration, native_inputs  # type: ignore[import]
+        document = mock_configuration()
+        return native_inputs(document), document["models"]
+    models: list[dict[str, Any]] = [{"id": "fixture", "provider": "vllm", "model": "fixture",
+               "apis": ["openai", "anthropic"], "context": 32768, "output": 4096}]
+    config: dict[str, Any] = {"filter_chains": [{"name": api, "filters": [
+        {"filter": "headers", "request_remove": ["Authorization", "X-Api-Key"]},
+        {"filter": "load_balancer", "clusters": [{"name": "vllm",
+         "endpoints": ["pricetag-provider:" + port]}]}]}
+        for api, port in [("openai", "18080"), ("anthropic", "18081")]]}
+    return config, models
+
+
+def postgres_bootstrap_sql(metering_password: str, maas_password: str) -> str:
+    """Delegate to prepare.py's postgres_bootstrap (idempotent CREATE ROLE/DB)."""
+    sys.path.insert(0, str(ROOT / "scripts/pricetag"))
+    from prepare import postgres_bootstrap  # type: ignore[import]
+    return postgres_bootstrap(metering_password, maas_password)
+
+
+# ---------------------------------------------------------------------------
+# Compose generation (the core laptop artifact)
+# ---------------------------------------------------------------------------
+
+def generate_compose_yaml(
+    args: argparse.Namespace,
+    arch: str,
+    gateway_config: dict[str, Any],
+    models: list[dict[str, Any]],
+    sources: dict[str, str],
+    postgres_password: str,
+    metering_password: str,
+    maas_password: str,
+    m2m_secret: str,
+    management_secret: str,
+    session_secret: str,
+) -> str:
+    """Render compose.laptop.yaml as string (no yaml dependency).
+
+    Mirrors prepare.py's Quadlet but emits compose services. Includes
+    postgres 17.8 + hardened placeholder comment and llm-katan provider.
+    """
+    postgres_image: str = POSTGRES_IMAGE
+    llm_katan_backend: str = args.llm_katan_backend
+    with_llm: bool = bool(args.with_llm_katan)
+
+    if with_llm:
+        if llm_katan_backend == "echo":
+            # echo backend: ghcr.io/yossiovadia/llm-katan:0.22.0 native (no fixture Python)
+            # openai + anthropic on :8000, synthetic keys, failure flags disabled by default
+            # Known gaps: /v1/responses + /v1/messages/count_tokens (see shims/README.md)
+            provider_service = f"""  pricetag-provider:
+    # llm-katan echo backend (ghcr.io/yossiovadia/llm-katan:0.22.0) - openai,anthropic on :8000
+    # Env: configs/laptop/llm-katan.env (synthetic keys, failure flags disabled)
+    # Dashboard: http://127.0.0.1:8000/dashboard (loopback-only publish)
+    image: {LLM_KATAN_IMAGE}
+    container_name: pricetag-provider
+    command:
+      - --model
+      - fixture
+      - --backend
+      - echo
+      - --providers
+      - openai,anthropic
+      - --port
+      - "8000"
+      - --host
+      - "0.0.0.0"
+      - --api-keys
+      - "openai=synthetic-openai,anthropic=synthetic-anthropic"
+      - --error-rate
+      - "0.0"
+      - --latency-ms
+      - "0"
+      - --timeout-after
+      - "0"
+      - --rate-limit-after
+      - "0"
+      - --max-inflight
+      - "0"
+      - --chunk-delay-ms
+      - "0"
+      - --ttft-ms
+      - "0"
+      - --itl-ms
+      - "0"
+    env_file:
+      - ./llm-katan.env
+    environment:
+      CUSTOM_MOCK_API_KEY: synthetic-anthropic
+      OPENAI_API_KEY: synthetic-openai
+    networks:
+      pricetag-mock:
+        ipv4_address: 10.78.0.10
+      pricetag-private:
+        ipv4_address: 10.78.0.10
+    ports:
+      - "127.0.0.1:8000:8000"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8000/health || wget -qO- http://127.0.0.1:8000/health || python3 -c \\"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).read()\\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    cap_drop:
+      - ALL
+"""
+        else:
+            provider_service = f"""  pricetag-provider:
+    image: {PYTHON_IMAGE}
+    container_name: pricetag-provider
+    volumes:
+      - ./fixtures:/fixtures:ro
+    environment:
+      MOCK_STREAM_DELAY: "1"
+      MOCK_MANAGEMENT: "1"
+      LLM_KATAN_BACKEND: "{llm_katan_backend}"
+    command: ["python3", "/fixtures/run.py"]
+    networks:
+      pricetag-mock:
+        ipv4_address: 10.78.0.10
+      pricetag-private:
+        ipv4_address: 10.78.0.10
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:18080/v1/models', timeout=2).read()"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    cap_drop:
+      - ALL
+"""
+    elif llm_katan_backend in ("mock", "fixture"):
+        # Back-compat: default mock without explicit --with-llm-katan: use llm-katan echo for consistency
+        provider_service = f"""  pricetag-provider:
+    # Default mock -> llm-katan echo (ghcr.io/yossiovadia/llm-katan:0.22.0) on :8000
+    image: {LLM_KATAN_IMAGE}
+    container_name: pricetag-provider
+    command:
+      - --model
+      - fixture
+      - --backend
+      - echo
+      - --providers
+      - openai,anthropic
+      - --port
+      - "8000"
+      - --host
+      - "0.0.0.0"
+      - --api-keys
+      - "openai=synthetic-openai,anthropic=synthetic-anthropic"
+      - --error-rate
+      - "0.0"
+      - --latency-ms
+      - "0"
+      - --timeout-after
+      - "0"
+      - --rate-limit-after
+      - "0"
+      - --max-inflight
+      - "0"
+      - --chunk-delay-ms
+      - "0"
+      - --ttft-ms
+      - "0"
+      - --itl-ms
+      - "0"
+    env_file:
+      - ./llm-katan.env
+    environment:
+      CUSTOM_MOCK_API_KEY: synthetic-anthropic
+      OPENAI_API_KEY: synthetic-openai
+    networks:
+      pricetag-mock:
+        ipv4_address: 10.78.0.10
+      pricetag-private:
+        ipv4_address: 10.78.0.10
+    ports:
+      - "127.0.0.1:8000:8000"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8000/health || wget -qO- http://127.0.0.1:8000/health || python3 -c \\"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).read()\\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    cap_drop:
+      - ALL
+"""
+    elif llm_katan_backend == "vllm":
+        provider_service = f"""  pricetag-provider:
+    image: {PYTHON_IMAGE}
+    container_name: pricetag-provider
+    volumes:
+      - ./fixtures:/fixtures:ro
+    environment:
+      MOCK_STREAM_DELAY: "1"
+    command: ["python3", "/fixtures/run.py"]
+    networks:
+      pricetag-mock:
+        ipv4_address: 10.78.0.10
+      pricetag-private:
+        ipv4_address: 10.78.0.10
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:18080/v1/models', timeout=2).read()"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    cap_drop:
+      - ALL
+"""
+    else:
+        provider_service = "  # external llm-katan: provider runs outside compose; no synthetic provider\n"
+
+    compose = f"""# compose.laptop.yaml - MBP (Darwin + Podman machine applehv) deployment
+# Generated by scripts/laptop/deploy on {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}
+# Host: {args.hostname}  Mode: {args.mode}  With-llm-katan: {with_llm}  Backend: {llm_katan_backend}  Arch: {arch}
+# Podman machine spec: 10 vCPU / 16 GiB / 93 GiB Fedora 41 VM on M4 Pro 14c 48 GiB host (applehv)
+# Postgres hardened placeholder (production): {POSTGRES_HARDENED_PLACEHOLDER}
+# For laptop, using postgres:17.8: {POSTGRES_IMAGE}  ({POSTGRES_IMAGE_DIGEST})
+# MaaS image (arm64 required for MBP): {args.maas_image}
+#   Expected commit: {MAAS_COMMIT} (published) or standalone-api-key-mode@5fc83feb (laptop arm64)
+# Gateway: {PRAXIS_IMAGE}
+# To start: podman-compose -f {args.compose_file} up -d  OR  docker compose -f {args.compose_file} up -d
+# To verify: podman-compose logs -f  &&  curl -k https://{args.hostname}:8443/login --cacert ca.pem
+# Teardown: scripts/laptop/teardown --purge-volumes  (or --from-scratch to auto-purge)
+
+services:
+  pricetag-db:
+    # Postgres 17.8 for laptop; hardened would be {POSTGRES_HARDENED_PLACEHOLDER}
+    image: {postgres_image}
+    container_name: pricetag-db
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_DB: postgres
+      POSTGRES_PASSWORD: "{postgres_password}"
+      TZ: UTC
+      PGTZ: UTC
+    volumes:
+      - pricetag-data:/var/lib/postgresql/data
+      - ./initdb:/docker-entrypoint-initdb.d:ro
+    networks:
+      pricetag-private:
+        ipv4_address: 10.77.0.2
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+    tmpfs:
+      - /var/run/postgresql:rw,mode=3775
+      - /tmp
+
+{provider_service}
+  pricetag-maas:
+    image: {args.maas_image}
+    container_name: pricetag-maas
+    pull_policy: missing
+    networks:
+      pricetag-private:
+        ipv4_address: 10.77.0.10
+    environment:
+      MAAS_RUNTIME_MODE: standalone
+      MAAS_SUBSCRIPTION_MODE: standalone
+      ADDRESS: ":8080"
+      SECURE: "false"
+      DB_CONNECTION_URL_FILE: /run/secrets/maas-db-url
+      API_KEY_MAX_EXPIRATION_DAYS: "90"
+      MAAS_ADMIN_GROUPS: single-server-admin
+      MAAS_TRUSTED_PROXY_CIDRS: "127.0.0.1/32,10.77.0.10/32,10.77.0.11/32,10.77.0.12/32"
+      METRICS_SECURE: "false"
+      METRICS_ADDRESS: "127.0.0.1:9090"
+    volumes:
+      - ./maas-db-url:/run/secrets/maas-db-url:ro
+    depends_on:
+      pricetag-db:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:18086:8080"
+    restart: unless-stopped
+    user: "1001:1001"
+    read_only: false
+    cap_drop:
+      - ALL
+
+  pricetag-metering:
+    image: {args.metering_image}
+    container_name: pricetag-metering
+    pull_policy: missing
+    networks:
+      pricetag-private:
+        ipv4_address: 10.77.0.12
+    environment:
+      DATABASE_URL: "postgres://metering:{metering_password}@pricetag-db:5432/metering?sslmode=disable"
+      M2M_AUTH_REQUIRED: "true"
+      M2M_SHARED_SECRET: "{m2m_secret}"
+      SESSION_SECRET: "{session_secret}"
+      MANAGEMENT_API_SECRET: "{management_secret}"
+      MANAGEMENT_PUBLIC_ORIGIN: "https://{args.hostname}:8443"
+      WELCOME_GATEWAY_URL: "https://{args.hostname}:8443"
+      WELCOME_DASHBOARD_URL: "https://{args.hostname}:8443"
+      DEFAULT_KEY_EXPIRY_HOURS: "2160"
+      MAX_KEY_EXPIRY_HOURS: "2160"
+      GATEWAY_MODELS_FILE: /etc/gateway-catalog/models.json
+      KEY_SERVICE_URL: "http://pricetag-maas:8080"
+      KEY_SERVICE_USER_HEADER: "X-MaaS-Username"
+      KEY_SERVICE_GROUPS_HEADER: "X-MaaS-Group"
+      PARTNER_USER_KEY_GROUP: "system:authenticated"
+      SUPERADMIN_USERS: "admin"
+      MONTHLY_TOKEN_QUOTA: "10000000000"
+      TZ: UTC
+      MAAS_VALIDATE_URL: "http://pricetag-maas:8080/internal/v1/api-keys/validate"
+    volumes:
+      - ./catalog:/etc/gateway-catalog:ro
+    depends_on:
+      pricetag-db:
+        condition: service_healthy
+      pricetag-maas:
+        condition: service_started
+    ports:
+      - "127.0.0.1:18087:8080"
+    restart: unless-stopped
+    user: "1001:1001"
+    read_only: false
+    cap_drop:
+      - ALL
+
+  pricetag-gateway:
+    image: {PRAXIS_IMAGE}
+    container_name: pricetag-gateway
+    pull_policy: missing
+    networks:
+      pricetag-private:
+        ipv4_address: 10.77.0.11
+      pricetag-mock:
+    environment:
+      GATEWAY_CONFIG: /etc/praxis/gateway.json
+    volumes:
+      - ./gateway:/etc/praxis:ro
+      - ./m2m-secret:/run/secrets/pricetag-m2m:ro
+    secrets:
+      - pricetag-m2m
+    ports:
+      - "0.0.0.0:8443:8443"
+    depends_on:
+      pricetag-maas:
+        condition: service_started
+      pricetag-metering:
+        condition: service_started
+    restart: unless-stopped
+    user: "1001:1001"
+    read_only: true
+    cap_drop:
+      - ALL
+    command: ["-c", "/etc/praxis/gateway.json"]
+
+networks:
+  pricetag-private:
+    name: pricetag-private
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.77.0.0/24
+  pricetag-mock:
+    name: pricetag-mock
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.78.0.0/24
+
+volumes:
+  pricetag-data:
+    name: pricetag-data
+
+secrets:
+  pricetag-m2m:
+    file: ./m2m-secret
+"""
+    return compose
+
+
+# ---------------------------------------------------------------------------
+# Image handling (pull + verify arch + revision, platform-aware)
+# ---------------------------------------------------------------------------
+
+def verify_image_arch(image: str, expected_arch: str) -> None:
+    """Check image arch matches host; warn but don't fail on laptop (multi-arch)."""
+    engine: str = "podman" if shutil.which("podman") else "docker"
+    try:
+        arch = subprocess.run(
+            [engine, "image", "inspect", image, "--format", "{{.Architecture}}"],
+            capture_output=True, text=True, timeout=10
+        )
+        if arch.returncode == 0 and arch.stdout.strip():
+            actual: str = arch.stdout.strip()
+            if actual != expected_arch:
+                print(f"  WARN: image {image} arch {actual} != host {expected_arch} (may be manifest list; continuing)", flush=True)
+                logger.warning("Image %s arch %s != host %s", image, actual, expected_arch)
+            else:
+                print(f"  Image arch OK: {image} -> {actual}", flush=True)
+                logger.info("Image arch OK: %s -> %s", image, actual)
+    except Exception as e:
+        print(f"  WARN: could not verify image arch for {image}: {e}", flush=True)
+        logger.warning("Could not verify image arch for %s: %s", image, e)
+
+
+def acquire_images(args: argparse.Namespace, arch: str) -> tuple[str, ...]:
+    """Stage 3: Acquire application images (platform-aware amd64/arm64)."""
+    stage(3, "Acquire application images")
+    if args.image_mode == "source":
+        print("  Resolving source refs and building; this can take several minutes.", flush=True)
+        logger.info("Resolving source refs and building")
+        cache = Path("/var/cache/pricetag-installer") if platform.system() == "Linux" else Path.home() / ".cache/pricetag-installer"
+        cache.mkdir(mode=0o700, parents=True, exist_ok=True)
+
+        def checkout(repository: str, directory: Path, revision: str | None) -> None:
+            if directory.exists():
+                if directory.is_symlink() or not (directory / ".git").is_dir():
+                    raise RuntimeError("invalid source cache: " + str(directory))
+                if run(["git", "-C", str(directory), "remote", "get-url", "origin"], capture=True) != repository:
+                    raise RuntimeError("source cache has an unexpected origin")
+                if run(["git", "-C", str(directory), "status", "--porcelain"], capture=True):
+                    raise RuntimeError("source cache is dirty; review it before retrying")
+            else:
+                run(["git", "clone", repository, str(directory)])
+            if revision:
+                run(["git", "-C", str(directory), "fetch", "origin", revision])
+                run(["git", "-C", str(directory), "checkout", "--detach", "FETCH_HEAD"])
+
+        maas_repo = "https://github.com/Ladas/models-as-a-service.git"
+        metering_repo = "https://github.com/Ladas/pricetag-metering.git"
+        for component, repo in (("maas", maas_repo), ("metering", metering_repo)):
+            branch = getattr(args, component + "_branch")
+            rev = getattr(args, component + "_revision")
+            checkout(repo, cache / component, "refs/heads/" + branch if branch else rev)
+            if branch:
+                rev = run(["git", "-C", str(cache / component), "rev-parse", "HEAD"], capture=True)
+                if not re.fullmatch(r"[0-9a-f]{40}", rev or ""):
+                    raise ValueError("Source branch did not resolve to a full commit")
+                setattr(args, component + "_revision", rev)
+            print(f"  {component}: {branch or 'commit'} -> {rev}", flush=True)
+        run([str(ROOT / "scripts/pricetag/build-maas"), "--source", str(cache / "maas"),
+             "--expected-commit", args.maas_revision, "--platform", "linux/" + arch], label="Building MaaS")
+        run([sys.executable, str(ROOT / "scripts/pricetag/build-metering"), "--source", str(cache / "metering"),
+             "--revision", args.metering_revision, "--platform", "linux/" + arch], label="Building PriceTag")
+        images: tuple[str, ...] = ("localhost/pricetag-maas:standalone", "localhost/pricetag-metering:upstream-b1c5ce0")
+        for image in images:
+            verify_image_arch(image, arch)
+        return images
+
+    # Published (pull)
+    engine: str = "podman" if shutil.which("podman") else "docker"
+    images_list: list[tuple[str, str]] = [
+        ("Praxis", PRAXIS_IMAGE),
+        ("MaaS", args.maas_image),
+        ("PriceTag metering", args.metering_image),
+        ("Postgres 17.8", POSTGRES_IMAGE),
+        ("LLM-Katan (Python)", PYTHON_IMAGE),
+    ]
+    if args.no_pull:
+        print("  --no-pull: skipping pulls, using local images", flush=True)
+        logger.info("--no-pull: skipping pulls")
+        return (args.maas_image, args.metering_image)
+    for name, image in images_list:
+        if not image:
+            continue
+        print(f"  {name} image: {image}", flush=True)
+        logger.info("%s image: %s (platform linux/%s)", name, image, arch)
+        try:
+            # Platform-aware pull: include --platform when possible
+            pull_cmd: list[str] = [engine, "pull"]
+            # Podman supports --platform; docker too with buildx
+            # Only add platform for arch-sensitive images (not postgres meta)
+            if arch and name in ("MaaS", "PriceTag metering", "Praxis", "LLM-Katan (Python)"):
+                pull_cmd += ["--platform", f"linux/{arch}"]
+            pull_cmd.append(image)
+            run(pull_cmd, label=f"Pulling {name}")
+        except subprocess.CalledProcessError as e:
+            if "MaaS" in name and "yossiovadia" in image:
+                print(f"  WARN: MaaS laptop image pull failed: {e}. Build arm64 locally:", flush=True)
+                print(f"    git clone https://github.com/yossiovadia/models-as-a-service --branch feat/standalone-api-key-mode", flush=True)
+                print(f"    podman build --platform linux/{arch} -t {image} -f maas-api/Dockerfile maas-api", flush=True)
+                print("  Continuing with local image if present...", flush=True)
+                logger.warning("MaaS laptop image pull failed: %s", e)
+            else:
+                raise
+        verify_image_arch(image, arch)
+    return (args.maas_image, args.metering_image)
+
+
+def import_images(args: argparse.Namespace, arch: str, images: tuple[str, ...]) -> tuple[str, ...]:
+    """Stage 4: Import images (RHEL imports into service account; Darwin verifies local store).
+
+    For laptop Darwin, 'import' means verifying images are present locally
+    and (if using podman machine) available inside the VM. No cross-store
+    transfer is needed, but we validate digests/revision where possible.
+    """
+    stage(4, "Import images")
+    if should_delegate_to_rhel():
+        # On RHEL, this would import into praxis-svc store (delegated path never reaches here)
+        print("  RHEL path: would import into praxis-svc store (delegated)", flush=True)
+        return images
+    engine: str = "podman" if shutil.which("podman") else "docker"
+    ids: list[str] = []
+    for image in (PRAXIS_IMAGE, *images):
+        if not image:
+            continue
+        try:
+            # Check presence via inspect; if missing, error
+            img_id = run([engine, "image", "inspect", image, "--format", "{{.Id}}"], capture=True)
+            if not img_id:
+                raise RuntimeError(f"image not found after pull: {image}")
+            print(f"  OK: {image} -> {img_id[:12]}...", flush=True)
+            logger.info("OK: %s -> %s", image, img_id)
+            ids.append(img_id)
+        except subprocess.CalledProcessError:
+            print(f"  WARN: image not in local store: {image} (will pull on compose up)", flush=True)
+            logger.warning("Image not in local store: %s", image)
+            ids.append(image)
+    # For Darwin, also verify architecture of imported images
+    for img in images:
+        verify_image_arch(img, arch)
+    return tuple(ids) if ids else images
+
+
+# ---------------------------------------------------------------------------
+# Prepare: TLS, gateway.json, env files, initdb (Stage 5)
+# ---------------------------------------------------------------------------
+
+def prepare_deployment(args: argparse.Namespace, arch: str) -> dict[str, Any]:
+    """Stage 5: Configure providers, TLS and budgets. Create deploy_dir layout."""
+    stage(5, "Configure providers, TLS and budgets")
+
+    deploy_dir: Path = args.deploy_dir.resolve()
+    admin_dir: Path = args.admin_dir.resolve()
+    compose_path: Path = args.compose_file.resolve() if args.compose_file.is_absolute() else (ROOT / args.compose_file)
+
+    deploy_dir.parent.mkdir(parents=True, exist_ok=True)
+    admin_dir.parent.mkdir(parents=True, exist_ok=True)
+
+    # Idempotency: refuse if DEPLOY exists unless --from-scratch with teardown
+    if deploy_dir.exists() and not args.from_scratch:
+        raise ValueError(
+            f"{deploy_dir} already exists; this is a fresh installer, not an upgrade. "
+            f"Use --from-scratch to teardown (compose down -v, prune volumes) and reinstall, "
+            f"or run scripts/laptop/teardown --purge-volumes"
+        )
+    if admin_dir.exists() and not args.from_scratch and any(admin_dir.iterdir()):
+        print(f"  WARN: {admin_dir} already exists; reusing (use --from-scratch to reset)", flush=True)
+        logger.warning("%s already exists; reusing", admin_dir)
+
+    if args.from_scratch and deploy_dir.exists():
+        print(f"  --from-scratch: removing existing {deploy_dir}", flush=True)
+        logger.info("--from-scratch: removing %s", deploy_dir)
+        shutil.rmtree(deploy_dir, ignore_errors=True)
+
+    deploy_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    admin_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(deploy_dir, 0o700)
+    os.chmod(admin_dir, 0o700)
+
+    bundle = deploy_dir / "gateway"
+    bundle.mkdir(mode=0o750, exist_ok=True)
+    catalog_dir = deploy_dir / "catalog"
+    catalog_dir.mkdir(mode=0o750, exist_ok=True)
+    initdb = deploy_dir / "initdb"
+    initdb.mkdir(mode=0o750, exist_ok=True)
+    fixtures = deploy_dir / "fixtures"
+    fixtures.mkdir(mode=0o750, exist_ok=True)
+
+    sys.path.insert(0, str(ROOT / "scripts/pricetag"))
+    sys.path.insert(0, str(ROOT / "scripts/common"))
+
+    if args.mode == "mock":
+        managed: bool = bool(args.demo_fixture)
+        original, models = mock_inputs(managed=managed)
+        if args.demo_fixture:
+            print("  Mock mode: demo-fixture with two aliases (fixture, demo-cheap)", flush=True)
+        else:
+            print(f"  Mock mode: {len(models)} model(s)", flush=True)
+        logger.info("Mock mode: %d model(s) demo_fixture=%s", len(models), args.demo_fixture)
+        price_sources_path = ROOT / "configs/pricetag/perf-price-sources.json"
+        if price_sources_path.is_file():
+            sources: dict[str, str] = json.loads(price_sources_path.read_text())
+        else:
+            sources = {m["id"]: m.get("model", m["id"]) for m in models}
+            if managed:
+                sources = {m["id"]: "gpt-5.4-mini" for m in models}
+    else:
+        raise ValueError(
+            "Real provider mode on laptop requires external provider setup. "
+            "On MBP, use --mode mock (default) for local benchmark. "
+            "For real providers, configure via scripts/pricetag/providers on RHEL, or set "
+            "--provider openai --openai-key-file + --external-* flags and run with --yes."
+        )
+
+    from unified_config import validate  # type: ignore[import]
+    models = validate(models)
+
+    from gateway import render  # type: ignore[import]
+    gateway_config = render(original, models, [f"https://{args.hostname}:8443", "https://localhost:8443"])
+
+    if not gateway_config.get("filter_chains"):
+        raise ValueError("gateway render produced no filter chains")
+
+    tls_dir = admin_dir / "tls"
+    if tls_dir.exists() and args.from_scratch:
+        shutil.rmtree(tls_dir, ignore_errors=True)
+    tls_dir.mkdir(mode=0o700, exist_ok=True)
+
+    credentials = ROOT / "scripts/remote-gateway/credentials"
+    try:
+        run(
+            [sys.executable, str(credentials), "lab-tls",
+             "--directory", str(tls_dir), "--hostname", args.hostname,
+             "--alt-hostname", "localhost", "--alt-hostname", "127.0.0.1"],
+            label="Generating TLS certificates"
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        print("  WARN: credentials helper failed; generating self-signed cert with openssl", flush=True)
+        logger.warning("credentials helper failed; fallback to openssl")
+        subprocess.run([
+            "openssl", "req", "-x509", "-newkey", "rsa:3072", "-nodes",
+            "-sha256", "-days", "30", "-subj", f"/CN={args.hostname}",
+            "-keyout", str(tls_dir / "server-key.pem"), "-out", str(tls_dir / "server.pem")
+        ], check=True, cwd="/tmp", stdout=LOG_FD, stderr=LOG_FD)
+        subprocess.run(
+            ["openssl", "x509", "-in", str(tls_dir / "server.pem"), "-out", str(tls_dir / "ca.pem")],
+            check=True, cwd="/tmp", stdout=LOG_FD, stderr=LOG_FD
+        )
+
+    for src, dst in [(tls_dir / "server.pem", "tls.pem"), (tls_dir / "server-key.pem", "tls-key.pem")]:
+        if src.is_file():
+            shutil.copyfile(src, bundle / dst)
+            os.chmod(bundle / dst, 0o640)
+        else:
+            print(f"  WARN: TLS file missing: {src}", flush=True)
+            logger.warning("TLS file missing: %s", src)
+    (bundle / "gateway.json").write_text(json.dumps(gateway_config, indent=2) + "\n")
+    os.chmod(bundle / "gateway.json", 0o640)
+
+    ca_src = tls_dir / "ca.pem"
+    if ca_src.is_file():
+        shutil.copyfile(ca_src, deploy_dir / "ca.pem")
+        os.chmod(deploy_dir / "ca.pem", 0o644)
+    else:
+        print(f"  WARN: CA missing {ca_src}", flush=True)
+        logger.warning("CA missing %s", ca_src)
+
+    def get_or_create_secret(name: str, length: int = 32) -> str:
+        path = deploy_dir / name
+        if path.is_file() and not args.from_scratch:
+            return path.read_text().strip()
+        value = secrets.token_urlsafe(length)
+        path.write_text(value + "\n")
+        os.chmod(path, 0o600)
+        return value
+
+    postgres_password: str = get_or_create_secret("postgres-password", 32)
+    metering_password: str = get_or_create_secret("metering-password", 32)
+    maas_password: str = get_or_create_secret("maas-password", 32)
+    m2m_secret: str = get_or_create_secret("m2m-secret", 48)
+    management_secret: str = get_or_create_secret("management-secret", 48)
+    session_secret: str = get_or_create_secret("session-secret", 48)
+
+    bootstrap_sql: str = postgres_bootstrap_sql(metering_password, maas_password)
+    (initdb / "10-create-databases.sql").write_text(bootstrap_sql)
+    os.chmod(initdb / "10-create-databases.sql", 0o640)
+
+    (deploy_dir / "postgres.env").write_text(
+        f"POSTGRES_USER=postgres\nPOSTGRES_DB=postgres\nPOSTGRES_PASSWORD={postgres_password}\nTZ=UTC\nPGTZ=UTC\n"
+    )
+    os.chmod(deploy_dir / "postgres.env", 0o600)
+
+    metering_url: str = f"postgres://metering:{metering_password}@pricetag-db:5432/metering?sslmode=disable"
+    maas_url: str = f"postgres://maas:{maas_password}@pricetag-db:5432/maas?sslmode=disable"
+
+    (deploy_dir / "maas-db-url").write_text(maas_url + "\n")
+    os.chmod(deploy_dir / "maas-db-url", 0o600)
+
+    (deploy_dir / "metering.env").write_text(
+        "".join(f"{k}={v}\n" for k, v in {
+            "DATABASE_URL": metering_url,
+            "M2M_AUTH_REQUIRED": "true",
+            "M2M_SHARED_SECRET": m2m_secret,
+            "SESSION_SECRET": session_secret,
+            "MANAGEMENT_API_SECRET": management_secret,
+            "MANAGEMENT_PUBLIC_ORIGIN": f"https://{args.hostname}:8443",
+            "WELCOME_GATEWAY_URL": f"https://{args.hostname}:8443",
+            "WELCOME_DASHBOARD_URL": f"https://{args.hostname}:8443",
+            "DEFAULT_KEY_EXPIRY_HOURS": "2160",
+            "MAX_KEY_EXPIRY_HOURS": "2160",
+            "GATEWAY_MODELS_FILE": "/etc/gateway-catalog/models.json",
+            "KEY_SERVICE_URL": "http://pricetag-maas:8080",
+            "KEY_SERVICE_USER_HEADER": "X-MaaS-Username",
+            "KEY_SERVICE_GROUPS_HEADER": "X-MaaS-Group",
+            "PARTNER_USER_KEY_GROUP": "system:authenticated",
+            "SUPERADMIN_USERS": "admin",
+            "MONTHLY_TOKEN_QUOTA": "10000000000",
+            "TZ": "UTC",
+            "MAAS_VALIDATE_URL": "http://pricetag-maas:8080/internal/v1/api-keys/validate",
+        }.items())
+    )
+    os.chmod(deploy_dir / "metering.env", 0o600)
+
+    (deploy_dir / "m2m-secret").write_text(m2m_secret + "\n")
+    os.chmod(deploy_dir / "m2m-secret", 0o600)
+
+    (deploy_dir / "bootstrap.json").write_text(json.dumps({"models": models, "sources": sources, "monthly_usd": args.monthly_usd}) + "\n")
+    (deploy_dir / "models.json").write_text(json.dumps(models, indent=2) + "\n")
+    (deploy_dir / "price-sources.json").write_text(json.dumps(sources, indent=2) + "\n")
+    (catalog_dir / "models.json").write_text(json.dumps([{k: m[k] for k in ("id", "model", "provider")} for m in models]) + "\n")
+    os.chmod(deploy_dir / "bootstrap.json", 0o640)
+    os.chmod(deploy_dir / "models.json", 0o640)
+
+    (deploy_dir / "sample-users").write_text("yes\n" if args.sample_users else "no\n")
+    os.chmod(deploy_dir / "sample-users", 0o640)
+    (deploy_dir / "admin-directory").write_text(str(admin_dir) + "\n")
+    (deploy_dir / "management-secret").write_text(management_secret + "\n")
+    os.chmod(deploy_dir / "management-secret", 0o600)
+
+    common_provider = ROOT / "tests/common/provider.py"
+    pricetag_provider = ROOT / "tests/pricetag/provider.py"
+    if common_provider.is_file():
+        shutil.copyfile(common_provider, fixtures / "provider.py")
+    if pricetag_provider.is_file():
+        shutil.copyfile(pricetag_provider, fixtures / "run.py")
+    if not (fixtures / "run.py").is_file() and (fixtures / "provider.py").is_file():
+        shutil.copyfile(fixtures / "provider.py", fixtures / "run.py")
+
+    compose_yaml: str = generate_compose_yaml(
+        args, arch, gateway_config, models, sources,
+        postgres_password, metering_password, maas_password,
+        m2m_secret, management_secret, session_secret
+    )
+    (deploy_dir / "compose.laptop.yaml").write_text(compose_yaml)
+    os.chmod(deploy_dir / "compose.laptop.yaml", 0o644)
+    compose_path.write_text(compose_yaml)
+    os.chmod(compose_path, 0o644)
+    print(f"  Wrote {deploy_dir / 'compose.laptop.yaml'}", flush=True)
+    print(f"  Wrote {compose_path} (repo root)", flush=True)
+    logger.info("Wrote %s and %s", deploy_dir / "compose.laptop.yaml", compose_path)
+
+    (deploy_dir / ".prepared").write_text(f"{time.time()}\n")
+
+    return {
+        "deploy_dir": deploy_dir,
+        "admin_dir": admin_dir,
+        "compose_path": compose_path,
+        "bundle": bundle,
+        "models": models,
+        "sources": sources,
+        "gateway_config": gateway_config,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Start + verify (compose up, health checks, admin user) - Stage 6
+# ---------------------------------------------------------------------------
+
+def compose_engine() -> list[str]:
+    """Return compose command prefix (podman-compose or docker compose)."""
+    if shutil.which("podman-compose"):
+        return ["podman-compose"]
+    try:
+        r = subprocess.run(["podman", "compose", "version"], capture_output=True, text=True, timeout=10)
+        if r.returncode == 0:
+            return ["podman", "compose"]
+    except FileNotFoundError:
+        pass
+    try:
+        r = subprocess.run(["docker", "compose", "version"], capture_output=True, text=True, timeout=10)
+        if r.returncode == 0:
+            return ["docker", "compose"]
+    except FileNotFoundError:
+        pass
+    if shutil.which("docker-compose"):
+        return ["docker-compose"]
+    raise ValueError("compose engine not found; install podman-compose or docker compose")
+
+
+def start_services(args: argparse.Namespace, state: dict[str, Any]) -> None:
+    stage(6, "Start services and verify HTTPS")
+    deploy_dir: Path = state["deploy_dir"]
+    compose_path: Path = state["compose_path"]
+
+    engine: list[str] = compose_engine()
+    print(f"  Compose engine: {' '.join(engine)}", flush=True)
+    print(f"  Compose file: {compose_path}", flush=True)
+    print(f"  Deploy dir: {deploy_dir}", flush=True)
+    logger.info("Compose engine: %s file: %s dir: %s", " ".join(engine), compose_path, deploy_dir)
+
+    try:
+        run(engine + ["-f", str(compose_path), "config"], label="Validating compose config")
+    except subprocess.CalledProcessError:
+        print(f"  ERROR: compose config invalid: {compose_path}", file=sys.stderr)
+        raise
+
+    if platform.system() == "Darwin" and shutil.which("podman"):
+        try:
+            r = subprocess.run(["podman", "machine", "list", "--format", "{{.Name}} {{.Running}}"], capture_output=True, text=True, timeout=10)
+            if r.returncode == 0 and "applehv" not in r.stdout:
+                print("  WARN: podman machine 'applehv' not found in list; assuming default machine", flush=True)
+                logger.warning("podman machine applehv not found")
+        except Exception:
+            pass
+        try:
+            subprocess.run(["podman", "machine", "start"], capture_output=True, timeout=30)
+        except Exception:
+            pass
+
+    print(f"  Starting via {' '.join(engine)} up -d ...", flush=True)
+    logger.info("Starting via %s up -d", " ".join(engine))
+    run(engine + ["-f", str(compose_path), "up", "-d", "--remove-orphans"], label="Starting containers", cwd=str(deploy_dir))
+
+    print("  Waiting for Postgres (pricetag-db) health...", flush=True)
+    engine_name: str = "podman" if shutil.which("podman") else "docker"
+    for _ in range(60):
+        try:
+            r = subprocess.run(
+                [engine_name, "exec", "pricetag-db", "pg_isready", "-U", "postgres", "-d", "postgres"],
+                capture_output=True, text=True, timeout=5, cwd=str(deploy_dir)
+            )
+            if r.returncode == 0:
+                print("  Postgres ready", flush=True)
+                logger.info("Postgres ready")
+                break
+        except Exception:
+            pass
+        try:
+            r2 = subprocess.run(
+                engine + ["-f", str(compose_path), "ps", "--format", "json"],
+                capture_output=True, text=True, timeout=5, cwd=str(deploy_dir)
+            )
+            if r2.returncode == 0 and "healthy" in r2.stdout.lower():
+                break
+        except Exception:
+            pass
+        time.sleep(1)
+    else:
+        raise RuntimeError("PostgreSQL did not become ready within 60s; check logs: podman-compose logs pricetag-db")
+
+    init_sql: str = (deploy_dir / "initdb/10-create-databases.sql").read_text()
+    if not (deploy_dir / "postgres-bootstrap.done").exists():
+        print("  Bootstrapping Postgres roles/databases...", flush=True)
+        for user, db in [("postgres", "postgres"), ("metering", "metering")]:
+            try:
+                proc = subprocess.Popen(
+                    [engine_name, "exec", "-i", "pricetag-db", "psql", "-X", "-U", user, "-d", db, "-v", "ON_ERROR_STOP=1"],
+                    stdin=subprocess.PIPE, stdout=LOG_FD or subprocess.PIPE, stderr=LOG_FD or subprocess.PIPE, cwd=str(deploy_dir)
+                )
+                assert proc.stdin is not None
+                proc.communicate(input=init_sql.encode(), timeout=30)
+                if proc.returncode == 0:
+                    Path(deploy_dir / "postgres-bootstrap.done").write_text("1\n")
+                    os.chmod(deploy_dir / "postgres-bootstrap.done", 0o600)
+                    print(f"  Postgres bootstrap OK via {user}/{db}", flush=True)
+                    logger.info("Postgres bootstrap OK via %s/%s", user, db)
+                    break
+            except Exception as e:
+                print(f"  Postgres bootstrap attempt {user}/{db} failed: {e}", flush=True)
+                logger.warning("Postgres bootstrap attempt %s/%s failed: %s", user, db, e)
+                continue
+        else:
+            raise RuntimeError("Postgres bootstrap failed; check init SQL and container logs")
+    else:
+        print("  Postgres bootstrap already done (idempotent)", flush=True)
+
+    print("  Waiting for MaaS API http://127.0.0.1:18086/health ...", flush=True)
+    from urllib.request import urlopen
+    for _ in range(60):
+        try:
+            with urlopen("http://127.0.0.1:18086/health", timeout=2) as resp:
+                if resp.status == 200:
+                    print("  MaaS health OK", flush=True)
+                    logger.info("MaaS health OK")
+                    break
+        except Exception:
+            time.sleep(1)
+    else:
+        print("  WARN: MaaS health not reachable on host; trying container network...", flush=True)
+        logger.warning("MaaS health not reachable on host")
+        for _ in range(10):
+            try:
+                r = subprocess.run(
+                    [engine_name, "exec", "pricetag-metering", "python3", "-c",
+                     "import urllib.request; print(urllib.request.urlopen('http://pricetag-maas:8080/health', timeout=2).read())"],
+                    capture_output=True, text=True, timeout=10, cwd=str(deploy_dir)
+                )
+                if r.returncode == 0:
+                    print("  MaaS health OK (via container network)", flush=True)
+                    break
+            except Exception:
+                pass
+            time.sleep(1)
+        else:
+            raise RuntimeError("MaaS API did not become ready (http://127.0.0.1:18086/health); logs: podman-compose logs pricetag-maas")
+
+    admin_dir: Path = state["admin_dir"]
+    admin_key = admin_dir / "admin.key"
+    if not admin_key.exists() or not admin_key.stat().st_size:
+        print(f"  Creating MaaS admin key at {admin_key} ...", flush=True)
+        maas_key_script = ROOT / "scripts/pricetag/maas-key"
+        try:
+            run(
+                [sys.executable, str(maas_key_script), "create",
+                 "--subject", "admin", "--admin", "--name", "admin",
+                 "--url", "http://127.0.0.1:18086", "--output", str(admin_key)],
+                label="Creating admin MaaS key"
+            )
+        except subprocess.CalledProcessError as e:
+            print(f"  WARN: admin key creation failed: {e}; retrying after 5s...", flush=True)
+            logger.warning("admin key creation failed: %s", e)
+            time.sleep(5)
+            run(
+                [sys.executable, str(maas_key_script), "create",
+                 "--subject", "admin", "--admin", "--name", "admin",
+                 "--url", "http://127.0.0.1:18086", "--output", str(admin_key)],
+                label="Creating admin MaaS key (retry)"
+            )
+    else:
+        print(f"  Admin key exists: {admin_key} (idempotent)", flush=True)
+
+    print("  Waiting for metering http://127.0.0.1:18087/ready ...", flush=True)
+    for _ in range(60):
+        try:
+            with urlopen("http://127.0.0.1:18087/ready", timeout=2) as resp:
+                if resp.status == 200:
+                    print("  Metering ready OK", flush=True)
+                    logger.info("Metering ready OK")
+                    break
+        except Exception:
+            try:
+                r = subprocess.run(
+                    [engine_name, "exec", "pricetag-db", "python3", "-c",
+                     "import urllib.request; print(urllib.request.urlopen('http://pricetag-metering:8080/ready', timeout=2).read())"],
+                    capture_output=True, text=True, timeout=5
+                )
+                if r.returncode == 0:
+                    print("  Metering ready OK (via container network)", flush=True)
+                    break
+            except Exception:
+                pass
+            time.sleep(1)
+    else:
+        raise RuntimeError("Metering did not become ready (http://127.0.0.1:18087/ready); logs: podman-compose logs pricetag-metering")
+
+    bootstrap_done = deploy_dir / "bootstrap.done"
+    if not bootstrap_done.exists():
+        print("  Bootstrapping PriceTag metering (users/budgets/prices)...", flush=True)
+        try:
+            bootstrap_via_http(deploy_dir, admin_dir)
+            bootstrap_done.write_text("1\n")
+            os.chmod(bootstrap_done, 0o600)
+            print("  PriceTag bootstrap OK", flush=True)
+            logger.info("PriceTag bootstrap OK")
+        except Exception as e:
+            print(f"  WARN: bootstrap failed: {e}; check metering logs", flush=True)
+            logger.warning("bootstrap failed: %s", e)
+            if LOG_FD:
+                LOG_FD.write(f"bootstrap failed: {e}\n")
+    else:
+        print("  PriceTag bootstrap already done (idempotent)", flush=True)
+
+    try:
+        user_script = ROOT / "scripts/pricetag/user"
+        run(
+            [sys.executable, str(user_script), "--subject", "admin", "--name", "Administrator",
+             "--no-key", "--bootstrap-admin", "--maas-url", "http://127.0.0.1:18086"],
+            label="Ensuring admin partner identity"
+        )
+    except subprocess.CalledProcessError as e:
+        print(f"  WARN: admin partner identity ensure failed: {e} (may already exist)", flush=True)
+        logger.warning("admin partner identity ensure failed: %s", e)
+
+    if (deploy_dir / "sample-users").read_text().strip() == "yes":
+        for subject in ("alice", "bob"):
+            key_path = admin_dir / f"{subject}.key"
+            if not key_path.exists():
+                print(f"  Creating sample user {subject} ...", flush=True)
+                try:
+                    run(
+                        [sys.executable, str(ROOT / "scripts/pricetag/user"),
+                         "--subject", subject, "--name", subject.capitalize(),
+                         "--output", str(key_path), "--maas-url", "http://127.0.0.1:18086"],
+                        label=f"Creating user {subject}"
+                    )
+                except subprocess.CalledProcessError as e:
+                    print(f"  WARN: sample user {subject} failed: {e}", flush=True)
+                    logger.warning("sample user %s failed: %s", subject, e)
+            else:
+                print(f"  Sample user {subject} exists (idempotent)", flush=True)
+
+    print("  Waiting for gateway https://localhost:8443/login ...", flush=True)
+    import ssl
+    ca_pem = deploy_dir / "ca.pem"
+    if ca_pem.is_file():
+        context = ssl.create_default_context(cafile=str(ca_pem))
+    else:
+        context = ssl._create_unverified_context()
+    for _ in range(60):
+        try:
+            import urllib.request
+            opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=context))
+            with opener.open("https://localhost:8443/login", timeout=2) as resp:
+                if resp.status == 200:
+                    print("  Gateway HTTPS OK", flush=True)
+                    logger.info("Gateway HTTPS OK")
+                    break
+        except Exception:
+            try:
+                ctx2 = ssl._create_unverified_context()
+                opener2 = urllib.request.build_opener(urllib.request.HTTPSHandler(context=ctx2))
+                with opener2.open("https://localhost:8443/login", timeout=2) as resp:
+                    if resp.status == 200:
+                        print("  Gateway HTTPS OK (unverified CA)", flush=True)
+                        break
+            except Exception:
+                pass
+            time.sleep(0.5)
+    else:
+        print("  WARN: gateway HTTPS not ready (https://localhost:8443/login); check logs: podman-compose logs pricetag-gateway", flush=True)
+        print(f"  HINT: CA: {deploy_dir / 'ca.pem'} - copy to clients and trust, or curl -k", flush=True)
+        logger.warning("gateway HTTPS not ready")
+
+    print("\nInstallation complete", flush=True)
+    print(f"  Dashboard: https://{args.hostname}:8443/login", flush=True)
+    print(f"  CA: {deploy_dir / 'ca.pem'}  (or {admin_dir / 'tls/ca.pem'})", flush=True)
+    print(f"  Keys: {admin_dir}/{{admin,alice,bob}}.key", flush=True)
+    print(f"  Compose: {compose_path}", flush=True)
+    print(f"  Logs: podman-compose -f {compose_path} logs -f", flush=True)
+    if args.mode == "mock":
+        print(f"  Benchmark: python3 {ROOT}/scripts/pricetag/benchmark --requests 20", flush=True)
+        print(f"  Perf: python3 {ROOT}/scripts/pricetag/perf run --model fixture --url https://localhost:8443 --ca {deploy_dir / 'ca.pem'} --requests 20", flush=True)
+
+
+def bootstrap_via_http(deploy_dir: Path, admin_dir: Path) -> None:
+    """Minimal metering bootstrap for laptop (no root required)."""
+    import urllib.error
+    import urllib.request
+
+    bootstrap_path = deploy_dir / "bootstrap.json"
+    if not bootstrap_path.is_file():
+        raise FileNotFoundError(f"bootstrap.json missing: {bootstrap_path}")
+    config = json.loads(bootstrap_path.read_text())
+    management_secret: str = (deploy_dir / "management-secret").read_text().strip()
+    if not management_secret:
+        raise ValueError("management-secret missing")
+
+    base: str = "http://127.0.0.1:18087/api/v1/management"
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+    def request(method: str, resource: str, payload: Any | None = None) -> Any:
+        url = f"{base}/{resource}"
+        data = None if payload is None else json.dumps(payload).encode()
+        req = urllib.request.Request(url, data=data, method=method,
+                                     headers={"Authorization": f"Bearer {management_secret}",
+                                              "Content-Type": "application/json"})
+        try:
+            with opener.open(req, timeout=10) as resp:
+                return json.load(resp)
+        except urllib.error.HTTPError as e:
+            raise RuntimeError(f"metering {resource} returned HTTP {e.code}") from None
+
+    try:
+        request("PUT", "policy", {"default_monthly_usd": config["monthly_usd"], "enforced": True,
+                                   "allowed_over_limit_models": []})
+    except RuntimeError as e:
+        print(f"  WARN: policy put failed: {e}", flush=True)
+        logger.warning("policy put failed: %s", e)
+
+    try:
+        existing = request("GET", "prices") or []
+        existing_models = {p["Model"] for p in existing}
+        for model in config["models"]:
+            billed: str = model["model"]
+            source: str = config["sources"].get(model["id"], billed)
+            if billed in existing_models:
+                continue
+            if source not in existing_models:
+                print(f"  No source price for {billed}; using fallback", flush=True)
+                continue
+            request("PUT", "prices", {"model": billed, "provider": model["provider"], "source_model": source})
+            existing_models.add(billed)
+    except Exception as e:
+        print(f"  WARN: price bootstrap failed: {e}", flush=True)
+        logger.warning("price bootstrap failed: %s", e)
+
+    def provision(subject: str, name: str | None, budget: float | None, admin: bool = False) -> None:
+        body: dict[str, Any] = {"subject": subject}
+        if name:
+            body["name"] = name
+        if admin:
+            body["role"] = "super_admin"
+        try:
+            request("PUT", "users", body)
+        except Exception as e:
+            print(f"  WARN: provision {subject} failed: {e}", flush=True)
+            logger.warning("provision %s failed: %s", subject, e)
+        if budget is not None:
+            try:
+                request("PUT", "budgets", {"subject": subject, "monthly_usd": budget})
+            except Exception as e:
+                print(f"  WARN: budget for {subject} failed: {e}", flush=True)
+                logger.warning("budget for %s failed: %s", subject, e)
+
+    provision("admin", "Administrator", None, admin=True)
+    monthly = config.get("monthly_usd", 5)
+    if (deploy_dir / "sample-users").read_text().strip() == "yes":
+        for subj in ("alice", "bob"):
+            provision(subj, subj.capitalize(), monthly)
+
+
+# ---------------------------------------------------------------------------
+# Verify (harness + benchmark 20 requests)
+# ---------------------------------------------------------------------------
+
+def verify_deployment(args: argparse.Namespace, state: dict[str, Any]) -> None:
+    """Run harness + benchmark 20 requests, check exact ledger."""
+    print("\n[Verify] Running harness + benchmark (20 requests) ...", flush=True)
+    logger.info("Verify: harness + benchmark 20 requests")
+    deploy_dir: Path = state["deploy_dir"]
+    admin_dir: Path = state["admin_dir"]
+    ca_pem: Path = deploy_dir / "ca.pem"
+
+    try:
+        run(["curl", "--noproxy", "*", "--fail", "--silent", "--show-error",
+             "--cacert", str(ca_pem), "https://localhost:8443/login", "--output", "/dev/null"],
+            label="Verifying gateway HTTPS")
+    except Exception:
+        try:
+            run(["curl", "-k", "--fail", "--silent", "https://localhost:8443/login", "--output", "/dev/null"],
+                label="Verifying gateway HTTPS (insecure fallback)")
+        except Exception as e:
+            print(f"  WARN: gateway health check failed: {e}", flush=True)
+            logger.warning("gateway health check failed: %s", e)
+
+    admin_key = admin_dir / "admin.key"
+    if not admin_key.is_file():
+        print(f"  WARN: admin key missing {admin_key}, skipping benchmark", flush=True)
+        logger.warning("admin key missing %s", admin_key)
+        return
+
+    tmp_dir = Path(tempfile.mkdtemp(prefix="praxis-verify-", dir="/tmp"))
+    os.chmod(tmp_dir, 0o700)
+    try:
+        perf = ROOT / "scripts/pricetag/perf"
+        tokens_dir = tmp_dir / "keys"
+        report_path = tmp_dir / "requests.json"
+        try:
+            run(
+                [sys.executable, str(perf), "users", "--tokens", str(tokens_dir),
+                 "--prefix", "perf-verify", "--count", "1", "--maas-url", "http://127.0.0.1:18086",
+                 "--monthly-usd", "100"],
+                label="Creating verify user (perf-verify-00)"
+            )
+        except subprocess.CalledProcessError as e:
+            print(f"  WARN: perf users creation failed: {e}", flush=True)
+            logger.warning("perf users creation failed: %s", e)
+            return
+
+        model: str = state["models"][0]["id"] if state.get("models") else "fixture"
+        print(f"  Running perf run: model={model} url=https://localhost:8443 requests=20 ...", flush=True)
+        try:
+            run(
+                [sys.executable, str(perf), "run",
+                 "--model", model, "--url", "https://localhost:8443",
+                 "--ca", str(ca_pem), "--tokens", str(tokens_dir),
+                 "--concurrency", "1", "--requests", "20", "--think", "0",
+                 "--output", str(report_path)],
+                label="Running 20-request benchmark"
+            )
+            report = json.loads(report_path.read_text())
+            successes = sum(p.get("successes", 0) for p in report.get("phases", []))
+            print(f"  Benchmark: {successes}/20 succeeded", flush=True)
+            logger.info("Benchmark: %d/20 succeeded", successes)
+            if successes < 20:
+                print(f"  WARN: benchmark had {20 - successes} failures, inspecting report...", flush=True)
+                if LOG_FD:
+                    LOG_FD.write(report_path.read_text())
+        except subprocess.CalledProcessError as e:
+            print(f"  WARN: perf run failed: {e}", flush=True)
+            logger.warning("perf run failed: %s", e)
+            return
+
+        try:
+            engine: str = "podman" if shutil.which("podman") else "docker"
+            verify_args: list[str] = [
+                sys.executable, str(perf), "verify",
+                "--report", str(report_path),
+                "--database", "pricetag-db", "--database-name", "metering",
+            ]
+            proc = subprocess.run(verify_args, capture_output=True, text=True, timeout=30, cwd="/tmp")
+            if proc.returncode == 0:
+                print("  Ledger verification: PASS (exact per-user event/token totals)", flush=True)
+                logger.info("Ledger verification PASS")
+            else:
+                print(f"  Ledger verification: FAIL: {proc.stdout} {proc.stderr}", flush=True)
+                logger.warning("Ledger verification FAIL: %s %s", proc.stdout, proc.stderr)
+                query: str = "SELECT username,count(*),sum(prompt_tokens) FROM usage_events WHERE username LIKE 'perf-%' GROUP BY username;"
+                try:
+                    q = subprocess.run(
+                        [engine, "exec", "pricetag-db", "psql", "-U", "metering", "-d", "metering", "-At", "-c", query],
+                        capture_output=True, text=True, timeout=10
+                    )
+                    print(f"  Direct DB query: {q.stdout.strip() or '(empty)'}", flush=True)
+                except Exception as e:
+                    print(f"  Direct DB check failed: {e}", flush=True)
+        except Exception as e:
+            print(f"  WARN: ledger verify failed: {e}", flush=True)
+            logger.warning("ledger verify failed: %s", e)
+
+    finally:
+        print(f"  Verify artifacts: {tmp_dir}", flush=True)
+        if not args.from_scratch:
+            print(f"  To clean verify users: python3 {ROOT}/scripts/pricetag/perf verify ... ; rm -rf {tmp_dir}", flush=True)
+
+    print("  Verify complete", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Main install flow (Darwin compose path) - 6 stages
+# ---------------------------------------------------------------------------
+
+def install(args: argparse.Namespace) -> None:
+    print("\nRemote gateway with PriceTag (laptop)\n" + "=" * 54)
+    print(f"  Gateway    https://{args.hostname}:8443")
+    print(f"  Mode       {args.mode} ({'mock provider (benchmark)' if args.mode == 'mock' else 'real providers'})")
+    if args.demo_fixture:
+        print("  Fixture    demo-fixture (two aliases)")
+    llm_desc: str = f"{args.llm_katan_backend}" + (" (enabled)" if args.with_llm_katan else " (disabled)")
+    print(f"  LLM-Katan  {llm_desc}")
+    print(f"  Images     {args.image_mode}")
+    print(f"  Praxis     {PRAXIS_IMAGE}")
+    print(f"  Postgres   {POSTGRES_IMAGE}  ({POSTGRES_IMAGE_DIGEST})")
+    print(f"  Hardened   {POSTGRES_HARDENED_PLACEHOLDER} (placeholder, not used on laptop)")
+    print(f"  MaaS       {args.maas_image}")
+    print(f"  PriceTag   {args.metering_image}")
+    print(f"  Users      {'admin, alice, bob' if args.sample_users else 'admin only'}")
+    print(f"  Budget     ${args.monthly_usd}/month per user")
+    print(f"  Deploy     {args.deploy_dir}  (DEPLOY)")
+    print(f"  Admin      {args.admin_dir}")
+    print(f"  Compose    {args.compose_file}")
+    print("")
+    print("  1. Validate provider setup   4. Import images")
+    print("  2. Prepare host              5. Configure gateway")
+    print("  3. Acquire images            6. Start and verify services")
+    if args.plan:
+        print("\n[Plan] No host changes; would execute 6 stages above.", flush=True)
+        if args.image_mode == "published":
+            print(f"  Expected MaaS commit: {MAAS_COMMIT}", flush=True)
+            print(f"  Expected PriceTag commit: {METERING_COMMIT}", flush=True)
+        return
+
+    stage(1, "Validate provider setup")
+    arch: str = check_arch()
+    check_podman()
+    detect_compose()
+    # Disk >=30% free check (requirement)
+    check_disk_free(Path("/tmp"), required_pct=30.0)
+    check_disk_free(Path.home(), required_pct=30.0)
+    check_podman_machine_resources()
+
+    if args.mode == "real":
+        print("  Real provider validation: checking key files...", flush=True)
+        for provider in args.provider:
+            key_file: Path | None = getattr(args, f"{provider}_key_file")
+            if key_file and not Path(key_file).is_absolute():
+                raise ValueError(f"--{provider}-key-file must be absolute: {key_file}")
+            if key_file and not Path(key_file).is_file():
+                print(f"  WARN: key file not found yet: {key_file}", flush=True)
+
+    if not args.yes:
+        if sys.stdin.isatty():
+            print(f"\nSetup validated. Ready to install to {args.deploy_dir} / {args.admin_dir}")
+            answer: str = input("Install on this host? Type install: ").strip()
+            if answer != "install":
+                raise ValueError("installation cancelled (type 'install' to confirm)")
+
+    os.umask(0o077)
+    open_log()
+
+    stage(2, "Prepare host")
+    engine: str = "podman" if shutil.which("podman") else "docker"
+    if args.from_scratch:
+        print("  --from-scratch: will recreate volumes/networks and secrets (teardown)", flush=True)
+        logger.info("--from-scratch teardown")
+        try:
+            compose_path_tmp: Path = args.compose_file.resolve() if args.compose_file.is_absolute() else (ROOT / args.compose_file)
+            eng: list[str] = compose_engine()
+            subprocess.run(eng + ["-f", str(compose_path_tmp), "down", "--remove-orphans", "-v"],
+                           timeout=30, stdout=LOG_FD, stderr=LOG_FD, cwd="/tmp")
+        except Exception as e:
+            logger.debug("compose down failed: %s", e)
+        for vol in VOLUME_NAMES:
+            subprocess.run([engine, "volume", "rm", "-f", vol], timeout=10, stdout=LOG_FD, stderr=LOG_FD)
+        for net in NETWORK_NAMES:
+            subprocess.run([engine, "network", "rm", net], timeout=10, stdout=LOG_FD, stderr=LOG_FD)
+
+    print("  Host prepared (Darwin podman machine: 10 vCPU / 16 GiB / 93 GiB Fedora 41 VM on M4 Pro 14c 48 GiB)", flush=True)
+    logger.info("Host prepared")
+
+    images: tuple[str, ...] = acquire_images(args, arch)
+
+    import_ids: tuple[str, ...] = import_images(args, arch, images)
+
+    state: dict[str, Any] = prepare_deployment(args, arch)
+    # Attach import ids to state for potential use in compose (currently direct refs)
+    state["import_ids"] = import_ids
+
+    start_services(args, state)
+
+    if args.verify:
+        verify_deployment(args, state)
+
+    print(f"\nNext: open https://{args.hostname}:8443/login (trust {state['deploy_dir'] / 'ca.pem'})", flush=True)
+    print("Guide: docs/quickstarts/remote-gateway-pricetag/README.md", flush=True)
+    if args.mode == "mock":
+        print(f"Benchmark (20 req): python3 scripts/pricetag/perf run --model {state['models'][0]['id']} --url https://localhost:8443 --ca {state['deploy_dir'] / 'ca.pem'} --requests 20", flush=True)
+        print(f"Benchmark full: sudo python3 scripts/pricetag/benchmark --requests 20  (requires RHEL layout; on laptop use perf)", flush=True)
+
+    print("\nTeardown: scripts/laptop/teardown --purge-volumes  (or re-run with --from-scratch)", flush=True)
+
+
+def main() -> None:
+    if should_delegate_to_rhel():
+        raw: list[str] = sys.argv[1:]
+        laptop_only: set[str] = {"--from-scratch", "--verify", "--with-llm-katan", "--llm-katan-backend", "--llm-katan", "--deploy-dir", "--admin-dir", "--compose-file", "--no-pull"}
+        filtered: list[str] = []
+        skip_next: bool = False
+        for arg in raw:
+            if skip_next:
+                skip_next = False
+                continue
+            bare: str = arg.split("=")[0]
+            if bare in laptop_only:
+                if "=" not in arg and bare in ("--llm-katan-backend", "--llm-katan", "--deploy-dir", "--admin-dir", "--compose-file"):
+                    skip_next = True
+                continue
+            filtered.append(arg)
+        sys.exit(delegate_to_install(filtered))
+
+    args: argparse.Namespace = parse_args()
+
+    if args.plan:
+        install(args)
+        return
+
+    os.umask(0o077)
+    lock_file: Path = LOCK_PATH
+    lock_file.parent.mkdir(parents=True, exist_ok=True)
+    fd: int = os.open(str(lock_file), os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    try:
+        with os.fdopen(fd, "w") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                print(f"error: another laptop deploy is running (lock {lock_file})", file=sys.stderr)
+                sys.exit(1)
+            lock.write(f"{os.getpid()}\n{time.time()}\n")
+            lock.flush()
+            install(args)
+    except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError, KeyboardInterrupt) as error:
+        print(f"\nDeploy stopped during: {STAGE}", file=sys.stderr)
+        print(str(error) or type(error).__name__, file=sys.stderr)
+        if LOG_PATH:
+            print(f"Details: tail -n 100 {LOG_PATH}", file=sys.stderr)
+        print("No volumes were automatically deleted (use --from-scratch to purge). "
+              "Fix the failed stage and rerun; if configuration was prepared, inspect it before starting.", file=sys.stderr)
+        sys.exit(1)
+    finally:
+        if LOG_FD is not None:
+            try:
+                LOG_FD.close()
+            except Exception:
+                pass
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except EOFError:
+        print("\nDeploy cancelled (EOF)", file=sys.stderr)
+        sys.exit(1)
