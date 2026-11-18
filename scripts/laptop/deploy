@@ -1667,25 +1667,72 @@ def start_services(args: argparse.Namespace, state: dict[str, Any]) -> None:
                     logger.info("MaaS health OK")
                     break
         except Exception:
+            # Check via podman health status (reliable on Darwin where host port may not forward)
+            try:
+                hr = subprocess.run(
+                    [engine_name, "inspect", "--format", "{{.State.Health.Status}}", "pricetag-maas"],
+                    capture_output=True, text=True, timeout=5
+                )
+                if hr.returncode == 0 and "healthy" in hr.stdout.lower():
+                    print("  MaaS health OK (via podman health)", flush=True)
+                    logger.info("MaaS health OK via podman inspect")
+                    break
+            except Exception:
+                pass
             time.sleep(1)
     else:
         print("  WARN: MaaS health not reachable on host; trying container network...", flush=True)
         logger.warning("MaaS health not reachable on host")
-        for _ in range(10):
+        # Try multiple container-network methods (curl, wget, python) across available containers
+        for _ in range(20):
+            found = False
+            for container, cmd in [
+                ("pricetag-maas", ["curl", "-fsS", "http://127.0.0.1:8080/health"]),
+                ("pricetag-maas", ["wget", "-qO-", "http://127.0.0.1:8080/health"]),
+                ("pricetag-metering", ["curl", "-fsS", "http://pricetag-maas:8080/health"]),
+                ("pricetag-metering", ["wget", "-qO-", "http://pricetag-maas:8080/health"]),
+                ("pricetag-maas", ["python3", "-c", "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=2).read())"]),
+                ("pricetag-db", ["curl", "-fsS", "http://pricetag-maas:8080/health"]),
+            ]:
+                try:
+                    r = subprocess.run(
+                        [engine_name, "exec", container] + cmd,
+                        capture_output=True, text=True, timeout=10, cwd=str(deploy_dir)
+                    )
+                    if r.returncode == 0 and (r.stdout or "200" in r.stderr):
+                        print(f"  MaaS health OK (via {container} {cmd[0]})", flush=True)
+                        found = True
+                        break
+                except Exception:
+                    pass
+            if found:
+                break
+            # Also check podman health status
             try:
-                r = subprocess.run(
-                    [engine_name, "exec", "pricetag-metering", "python3", "-c",
-                     "import urllib.request; print(urllib.request.urlopen('http://pricetag-maas:8080/health', timeout=2).read())"],
-                    capture_output=True, text=True, timeout=10, cwd=str(deploy_dir)
+                hr = subprocess.run(
+                    [engine_name, "inspect", "--format", "{{.State.Health.Status}}", "pricetag-maas"],
+                    capture_output=True, text=True, timeout=5
                 )
-                if r.returncode == 0:
-                    print("  MaaS health OK (via container network)", flush=True)
+                if hr.returncode == 0 and "healthy" in hr.stdout.lower():
+                    print("  MaaS health OK (via podman health inspect)", flush=True)
+                    found = True
                     break
             except Exception:
                 pass
             time.sleep(1)
         else:
-            raise RuntimeError("MaaS API did not become ready (http://127.0.0.1:18086/health); logs: podman-compose logs pricetag-maas")
+            # Final check: if container is running and health is healthy, consider OK
+            try:
+                hr = subprocess.run(
+                    [engine_name, "inspect", "--format", "{{.State.Health.Status}} {{.State.Status}}", "pricetag-maas"],
+                    capture_output=True, text=True, timeout=5
+                )
+                if hr.returncode == 0 and "healthy" in hr.stdout.lower():
+                    print("  MaaS health OK (via final podman inspect fallback)", flush=True)
+                else:
+                    raise RuntimeError("MaaS API did not become ready (http://127.0.0.1:18086/health); logs: podman-compose logs pricetag-maas")
+            except Exception:
+                raise RuntimeError("MaaS API did not become ready (http://127.0.0.1:18086/health); logs: podman-compose logs pricetag-maas")
 
     admin_dir: Path = state["admin_dir"]
     admin_key = admin_dir / "admin.key"
@@ -1722,19 +1769,49 @@ def start_services(args: argparse.Namespace, state: dict[str, Any]) -> None:
                     break
         except Exception:
             try:
-                r = subprocess.run(
-                    [engine_name, "exec", "pricetag-db", "python3", "-c",
-                     "import urllib.request; print(urllib.request.urlopen('http://pricetag-metering:8080/ready', timeout=2).read())"],
+                hr = subprocess.run(
+                    [engine_name, "inspect", "--format", "{{.State.Health.Status}}", "pricetag-metering"],
                     capture_output=True, text=True, timeout=5
                 )
-                if r.returncode == 0:
-                    print("  Metering ready OK (via container network)", flush=True)
+                if hr.returncode == 0 and "healthy" in hr.stdout.lower():
+                    print("  Metering ready OK (via podman health)", flush=True)
                     break
+            except Exception:
+                pass
+            try:
+                for container, cmd in [
+                    ("pricetag-metering", ["curl", "-fsS", "http://127.0.0.1:8080/ready"]),
+                    ("pricetag-metering", ["wget", "-qO-", "http://127.0.0.1:8080/ready"]),
+                    ("pricetag-db", ["curl", "-fsS", "http://pricetag-metering:8080/ready"]),
+                    ("pricetag-db", ["wget", "-qO-", "http://pricetag-metering:8080/ready"]),
+                ]:
+                    r = subprocess.run(
+                        [engine_name, "exec", container] + cmd,
+                        capture_output=True, text=True, timeout=5
+                    )
+                    if r.returncode == 0:
+                        print(f"  Metering ready OK (via {container} {cmd[0]})", flush=True)
+                        break
+                else:
+                    time.sleep(1)
+                    continue
+                break
             except Exception:
                 pass
             time.sleep(1)
     else:
-        raise RuntimeError("Metering did not become ready (http://127.0.0.1:18087/ready); logs: podman-compose logs pricetag-metering")
+        # Final fallback: check podman health
+        try:
+            hr = subprocess.run(
+                [engine_name, "inspect", "--format", "{{.State.Health.Status}}", "pricetag-metering"],
+                capture_output=True, text=True, timeout=5
+            )
+            if hr.returncode == 0 and "healthy" in hr.stdout.lower():
+                print("  Metering ready OK (via final podman inspect)", flush=True)
+            else:
+                raise RuntimeError("Metering did not become ready (http://127.0.0.1:18087/ready); logs: podman-compose logs pricetag-metering")
+        except Exception:
+            raise RuntimeError("Metering did not become ready (http://127.0.0.1:18087/ready); logs: podman-compose logs pricetag-metering")
 
     bootstrap_done = deploy_dir / "bootstrap.done"
     if not bootstrap_done.exists():
