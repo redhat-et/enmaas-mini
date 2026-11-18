@@ -53,7 +53,7 @@ services:
       PGTZ: UTC
     volumes:
       - pricetag-data:/var/lib/postgresql/data
-      - ./initdb:/docker-entrypoint-initdb.d:ro
+      - {{ deploy_dir | default("~/.local/share/enmaas-mini/laptop") }}/initdb:/docker-entrypoint-initdb.d:ro
     networks:
       pricetag-private:
         ipv4_address: 10.77.0.2
@@ -108,7 +108,7 @@ services:
       - --itl-ms
       - "0"
     env_file:
-      - ./llm-katan.env
+      - {{ deploy_dir | default("~/.local/share/enmaas-mini/laptop") }}/llm-katan.env
     environment:
       # Synthetic credentials - must match gateway credential_injection (mock-guard):
       # Secret=pricetag-mock-ui-v1,type=env,target=CUSTOM_MOCK_API_KEY is represented here as env.
@@ -218,7 +218,7 @@ services:
       TZ: UTC
       MAAS_VALIDATE_URL: "http://pricetag-maas:8080/internal/v1/api-keys/validate"
     volumes:
-      - ./catalog:/etc/gateway-catalog:ro
+      - {{ deploy_dir | default("~/.local/share/enmaas-mini/laptop") }}/catalog:/etc/gateway-catalog:ro
     depends_on:
       pricetag-db:
         condition: service_healthy
@@ -253,7 +253,7 @@ services:
     environment:
       GATEWAY_CONFIG: /etc/praxis/gateway.json
     volumes:
-      - ./gateway:/etc/praxis:ro
+      - {{ deploy_dir | default("~/.local/share/enmaas-mini/laptop") }}/gateway:/etc/praxis:ro
     secrets:
       - pricetag-m2m
       - pricetag-mock-ui-v1
@@ -305,10 +305,10 @@ volumes:
 
 secrets:
   pricetag-m2m:
-    file: ./m2m-secret
+    file: {{ deploy_dir | default("~/.local/share/enmaas-mini/laptop") }}/m2m-secret
   pricetag-mock-ui-v1:
     # Synthetic provider credential; env target CUSTOM_MOCK_API_KEY.
     # Must match: configs/laptop/llm-katan.env CUSTOM_MOCK_API_KEY=synthetic-anthropic
     # and mock-guard expectation: Secret=pricetag-mock-ui-v1,type=env,target=CUSTOM_MOCK_API_KEY
-    file: ./mock-secret
+    file: {{ deploy_dir | default("~/.local/share/enmaas-mini/laptop") }}/mock-secret
     # For compose compatibility the secret is also available as ./mock-secret bind-mount.

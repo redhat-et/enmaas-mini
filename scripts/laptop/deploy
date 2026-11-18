@@ -732,8 +732,16 @@ def generate_compose_yaml(
     postgres_image: str = POSTGRES_IMAGE
     llm_katan_backend: str = args.llm_katan_backend
     with_llm: bool = bool(args.with_llm_katan)
-    # Absolute bind for maas-db-url so compose file at ROOT still resolves correctly.
-    maas_db_url_host_path: str = str((args.deploy_dir.resolve() if hasattr(args, "deploy_dir") else DEFAULT_DEPLOY_DIR.resolve()) / "maas-db-url")
+    # Absolute binds so compose file at ROOT or deploy_dir both resolve correctly.
+    deploy_dir_abs: str = str((args.deploy_dir.resolve() if hasattr(args, "deploy_dir") else DEFAULT_DEPLOY_DIR.resolve()))
+    maas_db_url_host_path: str = f"{deploy_dir_abs}/maas-db-url"
+    fixtures_path: str = f"{deploy_dir_abs}/fixtures"
+    initdb_path: str = f"{deploy_dir_abs}/initdb"
+    catalog_path: str = f"{deploy_dir_abs}/catalog"
+    gateway_path: str = f"{deploy_dir_abs}/gateway"
+    llm_katan_env_path: str = f"{deploy_dir_abs}/llm-katan.env"
+    m2m_secret_path: str = f"{deploy_dir_abs}/m2m-secret"
+    mock_secret_path: str = f"{deploy_dir_abs}/mock-secret"
 
     if with_llm:
         if llm_katan_backend == "echo":
@@ -779,7 +787,7 @@ def generate_compose_yaml(
       - --itl-ms
       - "0"
     env_file:
-      - ./llm-katan.env
+      - {llm_katan_env_path}
     environment:
       CUSTOM_MOCK_API_KEY: synthetic-anthropic
       OPENAI_API_KEY: synthetic-openai
@@ -803,7 +811,7 @@ def generate_compose_yaml(
     image: {PYTHON_IMAGE}
     container_name: pricetag-provider
     volumes:
-      - ./fixtures:/fixtures:ro
+      - {fixtures_path}:/fixtures:ro
     environment:
       MOCK_STREAM_DELAY: "1"
       MOCK_MANAGEMENT: "1"
@@ -829,7 +837,7 @@ def generate_compose_yaml(
     image: {PYTHON_IMAGE}
     container_name: pricetag-provider
     volumes:
-      - ./fixtures:/fixtures:ro
+      - {fixtures_path}:/fixtures:ro
     environment:
       MOCK_STREAM_DELAY: "1"
       MOCK_MANAGEMENT: "1"
@@ -853,7 +861,7 @@ def generate_compose_yaml(
     image: {PYTHON_IMAGE}
     container_name: pricetag-provider
     volumes:
-      - ./fixtures:/fixtures:ro
+      - {fixtures_path}:/fixtures:ro
     environment:
       MOCK_STREAM_DELAY: "1"
     command: ["python3", "/fixtures/run.py"]
@@ -901,7 +909,7 @@ services:
       PGTZ: UTC
     volumes:
       - pricetag-data:/var/lib/postgresql/data
-      - ./initdb:/docker-entrypoint-initdb.d:ro
+      - {initdb_path}:/docker-entrypoint-initdb.d:ro
     networks:
       pricetag-private:
         ipv4_address: 10.77.0.2
@@ -984,7 +992,7 @@ services:
       TZ: UTC
       MAAS_VALIDATE_URL: "http://pricetag-maas:8080/internal/v1/api-keys/validate"
     volumes:
-      - ./catalog:/etc/gateway-catalog:ro
+      - {catalog_path}:/etc/gateway-catalog:ro
     depends_on:
       pricetag-db:
         condition: service_healthy
@@ -1016,7 +1024,7 @@ services:
     environment:
       GATEWAY_CONFIG: /etc/praxis/gateway.json
     volumes:
-      - ./gateway:/etc/praxis:ro
+      - {gateway_path}:/etc/praxis:ro
     secrets:
       - pricetag-m2m
       - pricetag-mock-ui-v1
@@ -1065,9 +1073,9 @@ volumes:
 
 secrets:
   pricetag-m2m:
-    file: ./m2m-secret
+    file: {m2m_secret_path}
   pricetag-mock-ui-v1:
-    file: ./mock-secret
+    file: {mock_secret_path}
 """
     return compose
 
