@@ -88,6 +88,7 @@ do_tests(){
   echo "$TOKEN" > /tmp/perf-bootstrap/$SUBJ.key; chmod 600 /tmp/perf-bootstrap/$SUBJ.key
   MGMT=$(cat "$DEPLOY_DIR/management-secret"); curl -s -X PUT -H "Authorization: Bearer $MGMT" -H "Content-Type: application/json" -d "{\"subject\":\"$SUBJ\",\"name\":\"$SUBJ\"}" http://127.0.0.1:18087/api/v1/management/users >/dev/null; curl -s -X PUT -H "Authorization: Bearer $MGMT" -H "Content-Type: application/json" -d "{\"subject\":\"$SUBJ\",\"monthly_usd\":100}" http://127.0.0.1:18087/api/v1/management/budgets >/dev/null
   echo "bench user $SUBJ ready"
+  rm -f /tmp/perf-bootstrap.json
   python3 "$ROOT/scripts/pricetag/perf" run --model fixture --url https://localhost:8443 --ca "$CA" --tokens /tmp/perf-bootstrap --concurrency 1 --requests 20 --think 0 --output /tmp/perf-bootstrap.json 2>&1 | tail -n 5
   python3 "$ROOT/scripts/pricetag/perf" verify --report /tmp/perf-bootstrap.json --database pricetag-db 2>&1 | tail -n 5
 }
