@@ -50,7 +50,11 @@ def main():
     key = keyfile.read_text().strip()
     tls = ssl.create_default_context(cafile='/etc/praxis-pricetag/ca.pem')
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), urllib.request.HTTPSHandler(context=tls))
-    data = json.dumps({'model': 'fixture', 'messages': [{'role': 'user', 'content': 'synthetic quota probe'}],
+    models = json.loads(Path('/etc/praxis-pricetag/models.json').read_text())
+    gateway_alias = next((m['id'] for m in models if m['model'] == 'fixture'), None)
+    if gateway_alias is None:
+        raise ValueError('mock catalog must expose a fixture model alias; install mock mode with --demo-fixture')
+    data = json.dumps({'model': gateway_alias, 'messages': [{'role': 'user', 'content': 'synthetic quota probe'}],
                        'max_tokens': 16}).encode()
 
     def request(token=key):

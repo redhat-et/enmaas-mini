@@ -1,3 +1,4 @@
 {
-  "fixture": "gpt-5.4-mini"
+  "fixture": "gpt-5.4-mini",
+  "mock/fixture": "gpt-5.4-mini"
 }

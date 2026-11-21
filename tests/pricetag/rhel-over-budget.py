@@ -83,10 +83,10 @@ def main():
     user_key = keyfile.read_text().strip()
     observations = []
 
-    def infer(label, spoof=None):
+    def infer(label, spoof=None, body_model=None):
         headers = {'Authorization': 'Bearer ' + user_key, **(spoof or {})}
         status, _ = call('/v1/chat/completions', 'POST',
-            {'model': model['id'], 'messages': [{'role': 'user', 'content': 'quota test'}],
+            {'model': body_model or model['id'], 'messages': [{'role': 'user', 'content': 'quota test'}],
              'max_tokens': 16}, headers)
         observations.append({'case': label, 'status': status})
         if not label.startswith('spend probe') or status != 200:
@@ -117,9 +117,13 @@ def main():
         time.sleep(17)
         spoofed = infer('different exception cannot be selected by spoofed headers',
             {'X-Model': 'different-model', 'X-Gateway-Model': 'different-model'})
+        unknown = infer('unknown model denied before budget evaluation',
+            body_model='unknown/model')
         (args.output / 'observations.json').write_text(json.dumps(observations, indent=2) + '\n')
-        if (denied, allowed) != (429, 200) or spoofed not in (403, 429):
+        if (denied, allowed) != (429, 200) or spoofed != 429:
             raise RuntimeError('post-budget exception contract failed; inspect sanitized observations')
+        if unknown not in (403, 404):
+            raise RuntimeError('unknown-model denial failed; inspect sanitized observations')
     finally:
         status, _ = call(policy_path, 'PUT', restore)
         if status != 200:
