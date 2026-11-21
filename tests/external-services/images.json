@@ -7,6 +7,30 @@
     "version": "quay.io/keycloak/keycloak:26.8.2",
     "image": "quay.io/keycloak/keycloak@sha256:c68e286cacd87b942ac1939a0a1481461109d6acd3a57dc496969a319a76bbf0"
   },
+  "perses": {
+    "version": "docker.io/persesdev/perses:v0.55.1",
+    "image": "docker.io/persesdev/perses@sha256:292605f009770f07aa17217e70f877fabbc74858d0af9054d395064e1c411c06"
+  },
+  "auth": {
+    "version": "quay.io/oauth2-proxy/oauth2-proxy:v7.15.6",
+    "image": "quay.io/oauth2-proxy/oauth2-proxy@sha256:c3415e8660af553f5e18f5d90db050614c02493c0ac6260ac59442f6d9b12048"
+  },
+  "prometheus": {
+    "version": "docker.io/prom/prometheus:v3.16.0",
+    "image": "docker.io/prom/prometheus@sha256:e04987641b57704f408e31f6373ba4138ecf27cb4a165d24aabb6c38fddd0f06"
+  },
+  "loki": {
+    "version": "docker.io/grafana/loki:3.7.9",
+    "image": "docker.io/grafana/loki@sha256:0db216b630ae1f348a1584c67f3cead8b4c1fc839169a39501db664744158e28"
+  },
+  "tempo": {
+    "version": "docker.io/grafana/tempo:3.1.1",
+    "image": "docker.io/grafana/tempo@sha256:64e2fbd56d9c2b3412a4b430a58ea59e91a670b1e75f920a0c702213ad145044"
+  },
+  "collector": {
+    "version": "docker.io/otel/opentelemetry-collector-contrib:0.165.0",
+    "image": "docker.io/otel/opentelemetry-collector-contrib@sha256:e40d61f10c9a617cca1ffd1be4d7e2b3a4b0f0001798ff07e58cabe82e618cea"
+  },
   "praxis": {
     "version": "quay.io/opendatahub/praxis-experimental:sha-5667c4acecd0",
     "image": "quay.io/opendatahub/praxis-experimental@sha256:502f120fed7b8e516ce1d78396045c8f72673672351432b9dc2e61baf5c13ac8"

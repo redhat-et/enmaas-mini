@@ -1,0 +1,98 @@
+{
+  "kind": "Dashboard",
+  "metadata": {
+    "name": "enmaas-trace-detail",
+    "project": "praxis"
+  },
+  "spec": {
+    "display": {
+      "name": "enMAAS gateway \u2014 trace detail"
+    },
+    "duration": "15m",
+    "panels": {
+      "navigation": {
+        "kind": "Panel",
+        "spec": {
+          "display": {
+            "name": "Monitoring navigation"
+          },
+          "plugin": {
+            "kind": "Markdown",
+            "spec": {
+              "text": "[Main monitoring](/projects/praxis/dashboards/enmaas-monitoring) \u00b7 [Gateway traffic](/projects/praxis/dashboards/enmaas-gateway) \u00b7 [Host](/projects/praxis/dashboards/enmaas-host) \u00b7 [Components](/projects/praxis/dashboards/enmaas-components) \u00b7 [Accounting / DB](/projects/praxis/dashboards/enmaas-accounting) \u00b7 [Alerts](/projects/praxis/dashboards/enmaas-alerts) \u00b7 [Inference traces](/projects/praxis/dashboards/enmaas-traces) \u00b7 [Service events](/projects/praxis/dashboards/enmaas-logs)"
+            }
+          }
+        }
+      },
+      "0": {
+        "kind": "Panel",
+        "spec": {
+          "display": {
+            "name": "Request spans",
+            "description": "Timing and sanitized attributes from the selected stored trace."
+          },
+          "plugin": {
+            "kind": "TracingGanttChart",
+            "spec": {}
+          },
+          "queries": [
+            {
+              "kind": "TraceQuery",
+              "spec": {
+                "plugin": {
+                  "kind": "TempoTraceQuery",
+                  "spec": {
+                    "datasource": {
+                      "kind": "TempoDatasource",
+                      "name": "tempo"
+                    },
+                    "query": "${traceId}"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "layouts": [
+      {
+        "kind": "Grid",
+        "spec": {
+          "items": [
+            {
+              "x": 0,
+              "y": 0,
+              "width": 24,
+              "height": 3,
+              "content": {
+                "$ref": "#/spec/panels/navigation"
+              }
+            },
+            {
+              "x": 0,
+              "y": 3,
+              "width": 24,
+              "height": 16,
+              "content": {
+                "$ref": "#/spec/panels/0"
+              }
+            }
+          ]
+        }
+      }
+    ],
+    "variables": [
+      {
+        "kind": "TextVariable",
+        "spec": {
+          "name": "traceId",
+          "value": "",
+          "display": {
+            "name": "Trace ID"
+          }
+        }
+      }
+    ]
+  }
+}
