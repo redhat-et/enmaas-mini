@@ -23,8 +23,11 @@ sudo scripts/common/install --prepare
 
 Pull the same digest-pinned images as the installer:
 
+> The praxis image lives in a private Quay repository (`redhat-services-prod`).
+> Log in first: `sudo podman login quay.io` with credentials that can pull it.
+
 ```console
-PRAXIS_REF=quay.io/opendatahub/praxis-experimental@sha256:502f120fed7b8e516ce1d78396045c8f72673672351432b9dc2e61baf5c13ac8
+PRAXIS_REF=quay.io/redhat-services-prod/enmaas-tenant/praxis-ai@sha256:bcc31cac1dbb5316ed57601d13d702997b3f4e3e6ead665c9fe01300e61db00a
 MAAS_REF=quay.io/redhat-et/secure-single-server-maas-standalone@sha256:0bec6ef57fa5b10a7bef8f4df8d98f932c9d7fc96798f7bfc0cd77b504790fa8
 METERING_REF=quay.io/redhat-et/secure-single-server-pricetag-metering@sha256:dabb2f35f54c30c2c387b3bf298b66f3b84a4110ddf3a78a204c7d59c5de2f1a
 (

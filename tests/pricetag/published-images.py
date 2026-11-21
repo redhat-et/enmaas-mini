@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify anonymous pulls and provenance of the installer's released image set."""
+"""Verify pulls and provenance of the installer's released image set."""
 import argparse
 import importlib.util
 import json
@@ -20,9 +20,18 @@ def verify_metadata(metadata, revision=None):
         raise ValueError('image revision does not match the installer source pin')
 
 
+def pull_and_inspect(engine, image, revision, env, pull):
+    subprocess.run([*pull, image], check=True, env=env)
+    metadata = json.loads(subprocess.check_output(
+        [engine, 'image', 'inspect', image], env=env, text=True))[0]
+    verify_metadata(metadata, revision)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--engine', choices=('docker', 'podman'), default='docker')
+    parser.add_argument('--praxis-authfile', type=Path, default=None,
+                        help='registry credentials (config.json) for the private Praxis tenant image')
     args = parser.parse_args()
     # Load deployment dependencies only in the standalone CLI process. Unit
     # discovery also imports a test fixture named gateway in its own process.
@@ -32,8 +41,10 @@ def main():
     sys.path.insert(0, str(ROOT / 'scripts/pricetag'))
     from prepare import POSTGRES
 
+    # The Praxis tenant image lives in a private registry repository, so it
+    # cannot be part of the anonymous-pull evidence; CI verifies it with
+    # dedicated credentials via --praxis-authfile instead.
     images = (
-        ('Praxis', installer.PRAXIS_IMAGE, installer.PRAXIS_REVISION),
         ('MaaS', installer.PUBLISHED_MAAS_IMAGE, installer.MAAS_COMMIT),
         ('PriceTag', installer.PUBLISHED_METERING_IMAGE, installer.METERING_COMMIT),
         ('PostgreSQL', POSTGRES, None),
@@ -49,11 +60,20 @@ def main():
             pull = [args.engine, 'pull', '--platform', 'linux/amd64']
             if args.engine == 'podman':
                 pull += ['--authfile', str(authfile)]
-            subprocess.run([*pull, image], check=True, env=env)
-            metadata = json.loads(subprocess.check_output(
-                [args.engine, 'image', 'inspect', image], env=env, text=True))[0]
-            verify_metadata(metadata, revision)
-    print('PASS: all installer images are public linux/amd64 images with expected application revisions')
+            pull_and_inspect(args.engine, image, revision, env, pull)
+    print('PASS: all public installer images are anonymous-pullable linux/amd64 images with expected application revisions')
+    if args.praxis_authfile:
+        print(f'Checking private Praxis image: {installer.PRAXIS_IMAGE}', flush=True)
+        env = {**os.environ}
+        pull = [args.engine, 'pull', '--platform', 'linux/amd64']
+        if args.engine == 'podman':
+            pull += ['--authfile', str(args.praxis_authfile)]
+        else:
+            env['DOCKER_CONFIG'] = str(args.praxis_authfile.parent)
+        pull_and_inspect(args.engine, installer.PRAXIS_IMAGE, installer.PRAXIS_REVISION, env, pull)
+        print('PASS: Praxis tenant image verified with registry credentials')
+    else:
+        print('SKIP: private Praxis tenant image not verified (no --praxis-authfile)')
 
 
 if __name__ == '__main__':
