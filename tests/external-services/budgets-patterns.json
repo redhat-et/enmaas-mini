@@ -1,0 +1,13 @@
+{
+  "mock_only": true,
+  "phase_seconds": 600,
+  "phases": [
+    {
+      "name": "budget_mix",
+      "users": 25,
+      "streams_per_user": 1,
+      "rate_limit_rps": 1000,
+      "offered_rps": 10
+    }
+  ]
+}

@@ -44,6 +44,12 @@ external_database_loader.exec_module(external_database)
 
 
 class PreparationTest(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.database_ca = Path(temporary.name)/'ca.pem'
+        self.database_ca.write_text('certificate fixture\n')
+
     def test_routing_requests_are_paced_without_retries(self):
         spec = importlib.util.spec_from_file_location('paced_routing', ROOT / 'tests/pricetag/rhel-routing.py')
         routing = importlib.util.module_from_spec(spec)
@@ -217,25 +223,31 @@ class PreparationTest(unittest.TestCase):
         self.assertIn("rolname='metering'", sql)
         self.assertIn("datname='maas'", sql)
 
+    def test_external_database_rejects_encryption_without_identity_verification(self):
+        for mode in ('require', 'prefer', 'allow', 'disable', 'verify-ca'):
+            url = 'postgresql://maas:secret@db.example:5432/maas?sslmode=' + mode
+            with self.assertRaisesRegex(ValueError, 'verify-full'):
+                prepare.validate_external_database_url(url, ca_required=False)
+
     def test_external_database_urls_require_complete_secure_connections(self):
-        valid = 'postgresql://maas:secret@db.example:5432/maas?sslmode=require'
-        parsed = prepare.validate_external_database_url(valid)
+        valid = 'postgresql://maas:secret@db.example:5432/maas?sslmode=verify-full'
+        parsed = prepare.validate_external_database_url(valid, self.database_ca)
         self.assertEqual((parsed['host'], parsed['port'], parsed['database']), ('db.example', 5432, 'maas'))
         for invalid in (
                 'postgres://maas:secret@db.example:5432/maas?sslmode=disable',
                 'postgresql://maas:secret@db.example:5432/maas',
-                'postgresql://maas@db.example:5432/maas?sslmode=require',
-                'mysql://maas:secret@db.example:5432/maas?sslmode=require'):
+                'postgresql://maas@db.example:5432/maas?sslmode=verify-full',
+                'mysql://maas:secret@db.example:5432/maas?sslmode=verify-full'):
             with self.assertRaises(ValueError):
                 prepare.validate_external_database_url(invalid)
 
     def test_external_database_environment_and_application_url_are_derived_safely(self):
         url = ('postgresql://maas:p%40ss%2Fword@db.example:5432/maas'
-               '?sslmode=require&connect_timeout=3&application_name=test')
+               '?sslmode=verify-full&connect_timeout=3&application_name=test')
         environment = prepare.external_client_environment(url, 'maas', False)
         self.assertEqual(environment, {
             'PGHOST': 'db.example', 'PGPORT': '5432', 'PGUSER': 'maas',
-            'PGDATABASE': 'maas', 'PGSSLMODE': 'require',
+            'PGDATABASE': 'maas', 'PGSSLMODE': 'verify-full',
             'PGCONNECT_TIMEOUT': '3'})
         self.assertEqual(prepare.external_password_file('p@ss word'),
                          "export PGPASSWORD='p@ss word'\n")
@@ -246,34 +258,34 @@ class PreparationTest(unittest.TestCase):
 
     def test_external_database_url_rejects_target_and_credential_query_overrides(self):
         url = ('postgresql://maas:secret@db.example:5432/maas'
-               '?sslmode=require&host=other.example&user=other&dbname=other')
+               '?sslmode=verify-full&host=other.example&user=other&dbname=other')
         with self.assertRaisesRegex(ValueError, 'unsupported query parameters'):
-            prepare.validate_external_database_url(url)
+            prepare.validate_external_database_url(url, self.database_ca)
 
     def test_external_database_url_rejects_duplicates_and_encoded_control_characters(self):
-        base = 'postgresql://maas:secret@db.example:5432/maas?sslmode=require'
-        for suffix in ('&sslmode=verify-full', '&sslmode=require&sslmode=require'):
+        base = 'postgresql://maas:secret@db.example:5432/maas?sslmode=verify-full'
+        for suffix in ('&sslmode=verify-full', '&sslmode=verify-full&sslmode=verify-full'):
             with self.assertRaisesRegex(ValueError, 'repeat query parameters'):
                 prepare.validate_external_database_url(base + suffix)
         for url in (
-                'postgresql://maas:sec%0Aret@db.example:5432/maas?sslmode=require',
-                'postgresql://maas:secret@db.example:5432/maas?sslmode=require&application_name=ba%0Ad'):
+                'postgresql://maas:sec%0Aret@db.example:5432/maas?sslmode=verify-full',
+                'postgresql://maas:secret@db.example:5432/maas?sslmode=verify-full&application_name=ba%0Ad'):
             with self.assertRaisesRegex(ValueError, 'control characters'):
-                prepare.validate_external_database_url(url)
+                prepare.validate_external_database_url(url, self.database_ca)
 
     def test_external_database_url_validates_hostaddr_and_connection_timeout(self):
-        base = 'postgresql://maas:secret@db.example:5432/maas?sslmode=require'
+        base = 'postgresql://maas:secret@db.example:5432/maas?sslmode=verify-full'
         for query in ('hostaddr=db.example', 'connect_timeout=0', 'connect_timeout=31',
                       'connect_timeout=three'):
             with self.assertRaises(ValueError):
                 prepare.validate_external_database_url(base + '&' + query)
-        parsed = prepare.validate_external_database_url(base + '&hostaddr=10.0.0.8&connect_timeout=5')
+        parsed = prepare.validate_external_database_url(base + '&hostaddr=10.0.0.8&connect_timeout=5', self.database_ca)
         self.assertEqual(parsed['hostaddr'], '10.0.0.8')
         self.assertEqual(parsed['connect_timeout'], '5')
 
     def test_external_database_hostaddr_controls_helper_connections(self):
-        url = 'postgresql://maas:secret@db.example:5432/maas?sslmode=require&hostaddr=10.0.0.8'
-        parsed = prepare.validate_external_database_url(url)
+        url = 'postgresql://maas:secret@db.example:5432/maas?sslmode=verify-full&hostaddr=10.0.0.8'
+        parsed = prepare.validate_external_database_url(url, self.database_ca)
         self.assertEqual(parsed['hostaddr'], '10.0.0.8')
         self.assertEqual(prepare.external_database_server(parsed), ('10.0.0.8', 5432))
         environment = prepare.external_client_environment(url, 'maas', False)
@@ -281,28 +293,28 @@ class PreparationTest(unittest.TestCase):
         self.assertEqual(environment['PGHOSTADDR'], '10.0.0.8')
 
     def test_external_database_urls_must_use_the_same_effective_server(self):
-        maas = 'postgresql://maas:secret@10.0.0.8:5432/maas?sslmode=require'
-        metering = 'postgresql://metering:secret@db.example:5432/metering?sslmode=require&hostaddr=10.0.0.9'
+        maas = 'postgresql://maas:secret@10.0.0.8:5432/maas?sslmode=verify-full'
+        metering = 'postgresql://metering:secret@db.example:5432/metering?sslmode=verify-full&hostaddr=10.0.0.9'
         with self.assertRaisesRegex(ValueError, 'external maas URL must not use hostaddr'):
             prepare.validate_external_database_urls(
-                maas.replace('10.0.0.8', 'db.example') + '&hostaddr=10.0.0.8', metering)
+                maas.replace('10.0.0.8', 'db.example') + '&hostaddr=10.0.0.8', metering, self.database_ca)
         with self.assertRaisesRegex(ValueError, 'same effective database server'):
-            prepare.validate_external_database_urls(maas, metering)
+            prepare.validate_external_database_urls(maas, metering, self.database_ca)
         metering_matching = metering.replace('hostaddr=10.0.0.9', 'hostaddr=10.0.0.8')
         matching = prepare.validate_external_database_urls(
-            maas, metering_matching)
+            maas, metering_matching, self.database_ca)
         self.assertEqual(prepare.external_database_server(matching['maas']),
                          prepare.external_database_server(matching['metering']))
 
     def test_external_database_urls_require_matching_component_targets(self):
-        maas = 'postgresql://maas:secret@db.example:5432/maas?sslmode=require'
-        metering = 'postgresql://metering:secret@db.example:5432/metering?sslmode=require'
+        maas = 'postgresql://maas:secret@db.example:5432/maas?sslmode=verify-full'
+        metering = 'postgresql://metering:secret@db.example:5432/metering?sslmode=verify-full'
         with self.assertRaisesRegex(ValueError, 'external metering URL must target'):
             prepare.validate_external_database_urls(
-                maas, metering.replace('/metering?', '/maas?'))
+                maas, metering.replace('/metering?', '/maas?'), self.database_ca)
         with self.assertRaisesRegex(ValueError, 'external metering URL must target'):
             prepare.validate_external_database_urls(
-                maas, metering.replace('metering:', 'maas:'))
+                maas, metering.replace('metering:', 'maas:'), self.database_ca)
 
     def test_external_application_url_normalizes_sslmode_case(self):
         rendered = prepare.external_application_url(

@@ -56,6 +56,7 @@ sudo scripts/pricetag/install --hostname "$GATEWAY_HOST" \
   --mode mock --image-mode published --non-interactive --yes
 ```
 
-This flag changes prompt behavior only. It does not install Keycloak or an
+`--non-interactive` controls prompts; `--mode mock` selects synthetic provider
+profiles. This command does not install Keycloak or an
 observability stack. Use the [manual installation](manual.md) guide when you need
 to run individual stages yourself.

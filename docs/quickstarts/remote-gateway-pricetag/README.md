@@ -1,5 +1,7 @@
 # Remote gateway with PriceTag
 
+[Choose a deployment](deployment-options.md): one node, external services, or a separate test environment.
+
 Run Praxis, MaaS and PriceTag on one RHEL host, with either the default local
 PostgreSQL deployment or two pre-provisioned external databases. Connect local
 OpenCode with a user key and a monthly USD budget.

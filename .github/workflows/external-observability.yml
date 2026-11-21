@@ -1,0 +1,89 @@
+name: External observability contracts and transport
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/external-observability.yml'
+      - 'tests/external-services/**'
+      - 'scripts/pricetag/**'
+      - 'tests/pricetag/api.py'
+      - 'scripts/common/**'
+      - 'tests/pricetag/browser/package*.json'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/external-observability.yml'
+      - 'tests/external-services/**'
+      - 'scripts/pricetag/**'
+      - 'tests/pricetag/api.py'
+      - 'scripts/common/**'
+      - 'tests/pricetag/browser/package*.json'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: external-observability-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  transport:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install test tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y podman openssl shellcheck python3-yaml zsh util-linux python3-venv
+          python3 -m venv .state/contracts-venv
+          .state/contracts-venv/bin/pip install -r tests/aws/requirements.txt -r tests/external-services/stress-requirements.txt
+      - name: Check inputs and installers
+        run: |
+          PYTHONPATH=tests/external-services .state/contracts-venv/bin/python -m unittest discover -s tests/external-services/unit -v
+          python3 tests/pricetag/api.py
+          bash -n tests/external-services/install-observability
+          bash -n tests/external-services/install-telemetry-agent
+          shellcheck -x tests/external-services/install-observability tests/external-services/install-telemetry-agent
+      - name: Install pinned browser tools
+        run: |
+          npm ci --prefix tests/pricetag/browser --ignore-scripts
+          sudo tests/pricetag/browser/node_modules/.bin/playwright install --with-deps chromium
+      - name: Pull pinned images for the runner architecture
+        run: |
+          python3 - <<'PY'
+          import json, subprocess, sys
+          from pathlib import Path
+          sys.path.insert(0, 'scripts/pricetag')
+          import prepare
+          images = json.loads(Path('tests/external-services/images.json').read_text())
+          required = [prepare.PYTHON] + [images[name]['image'] for name in
+              ('keycloak', 'auth', 'collector', 'prometheus', 'loki', 'tempo', 'perses')]
+          for image in required:
+              subprocess.run(['sudo', 'podman', 'pull', image], check=True, timeout=300)
+          PY
+      - name: Check private SSO, mTLS, redaction and storage
+        run: |
+          sudo python3 tests/external-services/transfer-runtime.py
+          sudo python3 tests/external-services/private-issuer-runtime.py --keycloak --provisioning
+          sudo python3 tests/external-services/redaction.py
+          sudo python3 tests/external-services/test-alert-rules.py
+          sudo env NODE_PATH="$GITHUB_WORKSPACE/tests/pricetag/browser/node_modules" python3 tests/external-services/telemetry-runtime.py --browser
+      - name: Make synthetic browser evidence readable by artifact uploader
+        if: failure()
+        run: |
+          if [ -d .state/monitoring-browser ] && [ ! -L .state/monitoring-browser ]; then
+            sudo chown -R --no-dereference "$(id -u):$(id -g)" .state/monitoring-browser
+          fi
+      - name: Retain synthetic browser failure evidence
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: observability-browser-failure
+          path: .state/monitoring-browser/
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 7

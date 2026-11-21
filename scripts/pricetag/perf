@@ -2,6 +2,7 @@
 """Bounded multi-user HTTPS load and ledger reconciliation for a mock-only pilot."""
 import argparse
 from concurrent.futures import ThreadPoolExecutor
+from decimal import Decimal, ROUND_HALF_UP
 import http.client
 import json
 import math
@@ -28,7 +29,7 @@ def identities(directory):
     for path in sorted(directory.glob('*.key')):
         token = private(path)
         subject = path.stem
-        if not re.fullmatch(r'perf-[a-z0-9-]{1,100}', subject):
+        if not re.fullmatch(r'perf-[a-z0-9-]{1,100}(?:@example\.test)?', subject):
             raise ValueError('use dedicated perf-* users, never admin or real user tokens')
         result.append((subject, token))
     if len({s for s, _ in result}) != len(result) or not result:
@@ -149,38 +150,108 @@ def run(args):
                    for p in report['phases'] for s in p['samples']))
 
 
+def ledger_query(args, query):
+    """Read the selected local or externally configured metering database."""
+    if not re.fullmatch(r'[a-z_][a-z0-9_]{0,62}', args.database_name):
+        raise ValueError('invalid database name')
+    if (ROOT / 'scripts/pricetag/external-database').exists() and Path('/etc/praxis-pricetag/external-maas-db.env').is_file():
+        return subprocess.check_output(['python3', str(ROOT / 'scripts/pricetag/external-database'),
+                                       'query', query], text=True, cwd='/tmp', timeout=30)
+    prefix = []
+    if args.service_user:
+        uid = subprocess.check_output(['id', '-u', args.service_user], text=True, timeout=10).strip()
+        prefix = ['sudo', '-u', args.service_user, 'env', 'XDG_RUNTIME_DIR=/run/user/' + uid,
+                  'DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/' + uid + '/bus']
+    return subprocess.check_output(prefix + ['podman', 'exec', args.database, 'psql', '-U', 'metering',
+        '-d', args.database_name, '-At', '-v', 'ON_ERROR_STOP=1', '-c', query], text=True, cwd='/tmp', timeout=30)
+
+
+def mock_request_cost(args, model, tokens=(2,3)):
+    if not isinstance(model,str) or not re.fullmatch(r'[A-Za-z0-9_./-]{1,256}',model):
+        raise ValueError('invalid mock model ID')
+    raw=ledger_query(args,"SELECT input_cost_per_mtok,output_cost_per_mtok FROM model_pricing WHERE model='"+model+"';")
+    rows=raw.strip().splitlines()
+    if len(rows)!=1 or len(rows[0].split('|'))!=2:
+        raise ValueError('mock model requires one explicit imported price')
+    rates=[Decimal(value) for value in rows[0].split('|')]
+    if any(not value.is_finite() or value<0 for value in rates):
+        raise ValueError('invalid mock price')
+    if (not isinstance(tokens,(tuple,list)) or len(tokens)!=2 or
+            any(type(v) is not int or not 1<=v<=32768 for v in tokens)):
+        raise ValueError('invalid mock token quantities')
+    return ((rates[0]*tokens[0]+rates[1]*tokens[1])/1000000).quantize(Decimal('0.00000001'),rounding=ROUND_HALF_UP)
+
+
 def verify(args):
     """Validate benchmark replies and reconcile them with metering data."""
     if not re.fullmatch(r"[a-z_][a-z0-9_]{0,62}", args.database_name):
         raise ValueError("invalid database name")
     report = json.loads(args.report.read_text())
-    counts = {}
-    for phase in report['phases']:
-        for sample in phase['samples']:
-            subject = sample['subject']
-            if not re.fullmatch(r'perf-[a-z0-9-]{1,100}', subject):
-                raise ValueError('unexpected subject in report')
-            counts[subject] = counts.get(subject, 0) + int(sample['ok'])
-    prefix = []
-    if args.service_user:
-        uid = subprocess.check_output(['id', '-u', args.service_user], text=True).strip()
-        prefix = ['sudo', '-u', args.service_user, 'env', 'XDG_RUNTIME_DIR=/run/user/' + uid,
-                  'DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/' + uid + '/bus']
-    query = "SELECT username,count(*),sum(prompt_tokens),sum(completion_tokens),sum(total_tokens) FROM usage_events WHERE username IN (" + ','.join("'" + s + "'" for s in counts) + ') GROUP BY username;'
-    expected = {s: [n, n * 2, n * 3, n * 5] for s, n in counts.items() if n}
+    cost=None
+    if 'expected_usd_per_request' in report:
+        value=report['expected_usd_per_request']
+        if not isinstance(value,str) or not re.fullmatch(r'[0-9]{1,12}(?:\.[0-9]{1,8})?',value):
+            raise ValueError('invalid expected USD cost')
+        cost=Decimal(value)
+    if report.get('schema') == 'enmaas-mock-counts-v1':
+        # Duration-based runs keep bounded per-user counts instead of retaining
+        # every response in memory. The same independent ledger check applies.
+        counts = report.get('completed_mock_requests')
+        if not isinstance(counts, dict) or not 1 <= len(counts) <= 100:
+            raise ValueError('expected 1–100 mock user counts')
+        if any(not isinstance(subject, str) or not re.fullmatch(r'perf-[a-z0-9-]{1,100}(?:@example\.test)?', subject)
+               or type(count) is not int or not 0 <= count <= 100000000
+               for subject, count in counts.items()):
+            raise ValueError('invalid mock user count')
+    else:
+        counts = {}
+        for phase in report['phases']:
+            for sample in phase['samples']:
+                subject = sample['subject']
+                if not re.fullmatch(r'perf-[a-z0-9-]{1,100}(?:@example\.test)?', subject):
+                    raise ValueError('unexpected subject in report')
+                counts[subject] = counts.get(subject, 0) + int(sample['ok'])
+        if not counts:
+            raise ValueError('no mock subjects to reconcile')
+    costs=report.get('expected_usd_per_user_request')
+    if costs is not None:
+        if not isinstance(costs,dict) or set(costs)!=set(counts) or any(
+                not isinstance(v,str) or not re.fullmatch(r'[0-9]{1,12}(?:\.[0-9]{1,8})?',v)
+                for v in costs.values()):
+            raise ValueError('invalid per-user expected costs')
+        costs={k:Decimal(v) for k,v in costs.items()}
+        cost=Decimal(0)  # Enable exact cost reconciliation columns.
+    denials=report.get('expected_budget_denials')
+    if denials is not None and (cost is None or not isinstance(denials,dict) or set(denials)!=set(counts) or any(type(v) is not int or not 0<=v<=100000000 for v in denials.values())):
+        raise ValueError('invalid expected budget denials')
+    columns=',count(cost_usd),coalesce(sum(cost_usd),0)' if cost is not None else ''
+    if denials is not None:
+        columns+=',count(*) FILTER (WHERE status_code=200),count(*) FILTER (WHERE status_code=429 AND prompt_tokens=0 AND completion_tokens=0 AND total_tokens=0 AND cost_usd=0)'
+    query = "SELECT username,count(*),sum(prompt_tokens),sum(completion_tokens),sum(total_tokens)"+columns+" FROM usage_events WHERE username IN (" + ','.join("'" + s + "'" for s in counts) + ') GROUP BY username;'
+    tokens=report.get('expected_tokens_per_request',{s:[2,3] for s in counts})
+    if not isinstance(tokens,dict) or set(tokens)!=set(counts) or any(
+            not isinstance(v,list) or len(v)!=2 or any(type(n) is not int or not 1<=n<=32768 for n in v) for v in tokens.values()):
+        raise ValueError('invalid mock token quantities')
+    expected = {s: [n, n*tokens[s][0], n*tokens[s][1], n*sum(tokens[s])] for s,n in counts.items() if n}
+    if cost is not None:
+        for subject,values in expected.items():values.extend([counts[subject],(costs[subject] if costs is not None else cost)*counts[subject]])
+    if denials is not None:
+        for subject,n in counts.items():
+            d=denials[subject]
+            if n or d:
+                expected[subject]=[n+d,n*tokens[subject][0],n*tokens[subject][1],n*sum(tokens[subject]),n+d,(costs[subject] if costs is not None else cost)*n,n,d]
     for _ in range(30):
-        if (ROOT / 'scripts/pricetag/external-database').exists() and Path('/etc/praxis-pricetag/external-maas-db.env').is_file():
-            raw = subprocess.check_output(['python3', str(ROOT / 'scripts/pricetag/external-database'),
-                                           'query', query], text=True, cwd='/tmp')
-        else:
-            raw = subprocess.check_output(prefix + ['podman', 'exec', args.database, 'psql', '-U', 'metering',
-                '-d', args.database_name, '-At', '-c', query], text=True, cwd='/tmp')
-        actual = {parts[0]: list(map(int, parts[1:])) for parts in (line.split('|') for line in raw.splitlines())}
+        raw=ledger_query(args,query)
+        actual={}
+        for parts in (line.split('|') for line in raw.splitlines()):
+            if cost is not None:
+                actual[parts[0]]=list(map(int,parts[1:6]))+[Decimal(parts[6])]+list(map(int,parts[7:]))
+            else:actual[parts[0]]=list(map(int,parts[1:]))
         if actual == expected:
-            print('PASS: exact per-user event and token totals match completed mock requests')
+            print('PASS: exact per-user event, token'+(' and USD' if cost is not None else '')+' totals match completed mock requests')
             return 0
         time.sleep(1)
-    print(json.dumps({'expected': expected, 'actual': actual}))
+    print(json.dumps({'expected': expected, 'actual': actual},default=str))
     return 1
 
 

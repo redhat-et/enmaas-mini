@@ -20,15 +20,15 @@ ROOT = Path(__file__).resolve().parents[2]
 MAAS_COMMIT = '6ac4c80ebc95f590e5f24593ac15bb80c7f9fa1d'
 # Published image provenance remains separate from the source-build candidate.
 METERING_COMMIT = 'ce9c6c51b8dff178637003945b517255c54fc853'
-SOURCE_METERING_COMMIT = 'b1c5ce0e82b4bd63525a7eccd9ecd4d010e153d5'
+SOURCE_METERING_COMMIT = '2281e1a84bfc3b998e7db36bc01bae88130bfcdd'
 MAAS_REPO = 'https://github.com/Ladas/models-as-a-service.git'
 MAAS_BRANCH = 'feat/standalone-runtime-minimal'
 METERING_REPO = 'https://github.com/Ladas/pricetag-metering.git'
-METERING_BRANCH = 'feat/latest-upstream-standalone'
+METERING_BRANCH = 'fix/oidc-logout-form-policy'
 PRAXIS_IMAGE = 'quay.io/opendatahub/praxis-experimental@sha256:502f120fed7b8e516ce1d78396045c8f72673672351432b9dc2e61baf5c13ac8'
 PRAXIS_REVISION = '5667c4acecd0981ae5114cbbf2ee3dcccec9c248'
 MAAS_IMAGE = 'localhost/pricetag-maas:standalone'
-METERING_IMAGE = 'localhost/pricetag-metering:upstream-b1c5ce0'
+METERING_IMAGE = 'localhost/pricetag-metering:upstream-2281e1a'
 PUBLISHED_MAAS_IMAGE = 'quay.io/redhat-et/secure-single-server-maas-standalone@sha256:0bec6ef57fa5b10a7bef8f4df8d98f932c9d7fc96798f7bfc0cd77b504790fa8'
 PUBLISHED_METERING_IMAGE = 'quay.io/redhat-et/secure-single-server-pricetag-metering@sha256:dabb2f35f54c30c2c387b3bf298b66f3b84a4110ddf3a78a204c7d59c5de2f1a'
 CACHE = Path('/var/cache/pricetag-installer')
@@ -178,6 +178,7 @@ def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--mode', choices=('real', 'mock'), default='real',
                    help='real providers (default); use mock for synthetic benchmarks')
+    p.add_argument('--mock-profiles', action='store_true', help='mock the standard openai/external profiles for later real-provider replacement')
     p.add_argument('--demo-fixture', action='store_true', help='mock mode only: two model aliases for the UI demo')
     p.add_argument('--hostname', help='public IPv4 or DNS name; no scheme, path or port')
     p.add_argument('--provider', action='append', choices=('openai', 'external', 'pricetag'), default=[],
@@ -244,6 +245,10 @@ def parse_args(argv=None):
             args.provider = ['openai', 'external'] if selected == 'both' else [selected]
         else:
             p.error('real mode requires --provider openai and/or --provider external')
+    if args.mock_profiles and (args.mode != 'mock' or args.demo_fixture):
+        p.error('--mock-profiles requires --mode mock without --demo-fixture')
+    # Fresh benchmark installs use the same provider identities as real installs.
+    args.mock_profiles = args.mode == 'mock' and not args.demo_fixture
     if args.demo_fixture and args.mode != 'mock':
         p.error('--demo-fixture requires --mode mock')
     if args.mode == 'mock' and args.provider:
@@ -408,7 +413,7 @@ def install(args):
                  'pricetag': 'External (legacy PriceTag profile)'}
     print('\nRemote gateway with PriceTag\n' + '=' * 54)
     print(f'  Gateway    https://{args.hostname}:8443')
-    print('  Providers  ' + ('Mock providers (benchmark)' if args.mode == 'mock' else
+    print('  Providers  ' + ('OpenAI (mock), External OpenAI/Messages (mock)' if args.mock_profiles else 'Mock providers (benchmark)' if args.mode == 'mock' else
                             ', '.join(providers[name] for name in args.provider)))
     print(f'  Images     {args.image_mode}')
     print('  Praxis     ' + PRAXIS_IMAGE)
@@ -478,6 +483,9 @@ def install(args):
     for name, settings, key in prepared:
         helper.save_provider(name, settings, key)
     prepared.clear()
+    if args.mock_profiles:
+        from mock_profiles import save_inputs
+        save_inputs(helper)
     command = [sys.executable, ROOT / 'scripts/pricetag/prepare.py', '--hostname', args.hostname,
                '--praxis-image', ids[0], '--maas-image', ids[1], '--metering-image', ids[2],
                '--monthly-usd', str(args.monthly_usd)]
@@ -493,7 +501,12 @@ def install(args):
     if not args.sample_users:
         command += ['--no-sample-users']
     if args.mode == 'mock':
-        command += ['--mock-provider', '--price-sources', ROOT / 'configs/pricetag/perf-price-sources.json']
+        command += ['--mock-provider']
+        if args.mock_profiles:
+            command += ['--mock-profiles', '--provider-unit', INPUTS / 'provider-secrets.container',
+                        '--price-sources', INPUTS / 'prices.json']
+        else:
+            command += ['--price-sources', ROOT / 'configs/pricetag/perf-price-sources.json']
         if args.demo_fixture:
             subprocess.run([*prefix, 'podman', 'secret', 'create', 'pricetag-mock-ui-v1', '-'],
                            input=b'synthetic-anthropic', check=True, stdout=subprocess.DEVNULL, cwd='/tmp')
@@ -536,7 +549,8 @@ def main():
         install(args)
 
 
-if __name__ == '__main__':
+def cli():
+    """Report failures consistently and close the private log on every exit."""
     try:
         main()
     except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError, EOFError, KeyboardInterrupt) as error:
@@ -550,3 +564,7 @@ if __name__ == '__main__':
     finally:
         if LOG is not None:
             LOG.close()
+
+
+if __name__ == '__main__':
+    cli()

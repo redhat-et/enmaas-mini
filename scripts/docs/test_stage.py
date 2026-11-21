@@ -30,6 +30,15 @@ class StageTests(unittest.TestCase):
             "docs/testing/pricetag.md",
             "docs/testing/aws-pricetag.md",
             "docs/testing/pricetag-perf.md",
+            "docs/testing/external-services/local-podman.md",
+            "docs/testing/external-services/topology.md",
+            "docs/testing/external-services/security-acceptance.md",
+            "docs/testing/external-services/providers.md",
+            "docs/testing/external-services/keycloak-users.md",
+            "docs/testing/external-services/certificates.md",
+            "docs/quickstarts/remote-gateway-pricetag/deployment-options.md",
+            "docs/quickstarts/remote-gateway-pricetag/full-deployment.md",
+            "docs/quickstarts/remote-gateway-pricetag/sizing.md",
         ):
             self.assertIn(path, staged_paths)
 
