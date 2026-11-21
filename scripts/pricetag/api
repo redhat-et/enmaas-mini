@@ -34,7 +34,10 @@ def private(path):
 
 
 def endpoint(origin, path):
+    if any(ord(c) <= 32 or ord(c) == 127 for c in origin) or '\\' in origin:
+        raise ValueError('url must be an HTTPS origin')
     url = urllib.parse.urlsplit(origin)
+    _ = url.port  # Validate malformed/out-of-range ports before network activity.
     if url.scheme != 'https' or not url.hostname or url.username or url.password or url.path not in ('', '/') or url.query or url.fragment:
         raise ValueError('url must be an HTTPS origin')
     route = urllib.parse.urlsplit(path)
@@ -46,17 +49,33 @@ def endpoint(origin, path):
     return origin.rstrip('/'), path
 
 
+def session_origin(transport, configured):
+    """Use the configured browser origin only over literal loopback TLS.
+
+    This does not grant authorization: login still requires a valid user key and
+    the server checks the current role. No origin controls are changed server-side.
+    """
+    transport, _ = endpoint(transport, '/api/v1/whoami')
+    if configured is None:
+        return transport
+    if urllib.parse.urlsplit(transport).hostname not in ('127.0.0.1', '::1'):
+        raise ValueError('origin override requires literal loopback HTTPS transport')
+    return endpoint(configured, '/api/v1/whoami')[0]
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('method', choices=('GET','POST','PUT','PATCH','DELETE'))
     parser.add_argument('path')
     parser.add_argument('--url', required=True)
+    parser.add_argument('--origin', help='configured public HTTPS origin; only with --url on 127.0.0.1 or ::1 for SSH-local management')
     parser.add_argument('--key-file', required=True, type=Path)
     parser.add_argument('--ca-file', type=Path)
     parser.add_argument('--input', type=Path)
     parser.add_argument('--output', required=True, type=Path, help='new private response file; may contain a one-time key')
     args = parser.parse_args()
     origin, path = endpoint(args.url, args.path)
+    browser_origin = session_origin(origin, args.origin)
     if args.method == 'GET' and args.input:
         parser.error('GET cannot have an input body')
     key = private(args.key_file).strip()
@@ -71,7 +90,7 @@ def main():
     # Reserve output before any side effects. Credentials/session never go to disk.
     fd=os.open(args.output,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
     with os.fdopen(fd,'wb') as output:
-        login=urllib.request.Request(origin+'/login',urllib.parse.urlencode({'api_key':key}).encode(),headers={'Origin':origin})
+        login=urllib.request.Request(origin+'/login',urllib.parse.urlencode({'api_key':key}).encode(),headers={'Origin':browser_origin})
         try:
             client.open(login,timeout=15).close()
             raise ValueError('expected login redirect')
@@ -79,7 +98,7 @@ def main():
             valid=error.code==302 and any(c.name=='metering_session' for c in cookies)
             error.close()
             if not valid: raise ValueError('login rejected') from None
-        req=urllib.request.Request(origin+path,body,method=args.method,headers={'Origin':origin,'Content-Type':'application/json'})
+        req=urllib.request.Request(origin+path,body,method=args.method,headers={'Origin':browser_origin,'Content-Type':'application/json'})
         try:
             with client.open(req,timeout=60) as response:
                 data=response.read(8*1024*1024+1)

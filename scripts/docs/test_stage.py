@@ -30,6 +30,7 @@ class StageTests(unittest.TestCase):
             "docs/testing/pricetag.md",
             "docs/testing/aws-pricetag.md",
             "docs/testing/pricetag-perf.md",
+            "docs/testing/external-services/local-podman.md",
         ):
             self.assertIn(path, staged_paths)
 

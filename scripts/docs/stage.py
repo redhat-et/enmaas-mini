@@ -38,6 +38,10 @@ PUBLISHED_TESTING_DOCS = frozenset(
         "docs/testing/aws-pricetag.md",
         "docs/testing/pricetag-perf.md",
         "docs/testing/external-services/keycloak-rhel.md",
+        "docs/testing/external-services/observability-rhel.md",
+        "docs/testing/external-services/monitoring.md",
+        "docs/testing/external-services/three-host-install.md",
+        "docs/testing/external-services/local-podman.md",
     )
 )
 EXCLUDED_SOURCES: tuple[Path, ...] = ()

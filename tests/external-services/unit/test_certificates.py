@@ -4,11 +4,16 @@ import importlib.util
 from pathlib import Path
 import subprocess
 import ssl
+import shlex
+import sys
+from unittest.mock import patch
 import tempfile
 import unittest
 
 spec=importlib.util.spec_from_file_location('certificates',(Path(__file__).resolve().parents[1] / 'certificates.py'))
 certs=importlib.util.module_from_spec(spec);spec.loader.exec_module(certs)
+spec=importlib.util.spec_from_file_location('certificate_transfer',(Path(__file__).resolve().parents[1] / 'transfer-client.py'))
+transfer=importlib.util.module_from_spec(spec);spec.loader.exec_module(transfer)
 
 def handshake(ca, certificate, key, hostname, *, client_ca=None, client_certificate=None, client_key=None):
     client_context=ssl.create_default_context(cafile=str(ca))
@@ -48,6 +53,23 @@ class Certificates(unittest.TestCase):
                 self.assertEqual(result.returncode,0)
                 self.assertFalse(any(p.name.endswith('ca.key') for p in bundle.rglob('*')))
                 self.assertEqual((bundle/'server.key').stat().st_mode&0o777,0o600)
+            # Exercise real generated PEM through the exact remote bundle writer.
+            # Substitute only the UID and destination; no SSH/cloud connection.
+            ssh_key=root/'ssh-key';ssh_key.write_text('fixture');ssh_key.chmod(0o600)
+            known=root/'known-hosts';known.write_text('fixture');known.chmod(0o600)
+            original_run=subprocess.run
+            for role in transfer.BUNDLES:
+                destination=root/(role+'-received')
+                def remote(argv,**kwargs):
+                    command=shlex.split(argv[-1]);script=command[4]
+                    script=script.replace('os.geteuid()!=0','os.geteuid()!=os.getuid()').replace('s.st_uid!=0','s.st_uid!=os.getuid()')
+                    return original_run([sys.executable,'-c',script,str(destination),command[-1]],**kwargs)
+                with patch.object(transfer.subprocess,'run',side_effect=remote):
+                    transfer.transfer_bundle('ec2-user@192.0.2.10',role,root/role,ssh_key,known)
+                self.assertEqual(set(x.name for x in destination.iterdir()),set(transfer.BUNDLES[role]))
+                for name in transfer.BUNDLES[role]:
+                    self.assertEqual((destination/name).read_bytes(),(root/role/name).read_bytes())
+                handshake(destination/'ca.pem',destination/'server.pem',destination/'server.key','localhost')
             client=root/'gateway/telemetry-client.pem'
             valid=subprocess.run(['openssl','verify','-CAfile',str(root/'trust/telemetry-ca.pem'),
                 '-purpose','sslclient',str(client)],capture_output=True)
