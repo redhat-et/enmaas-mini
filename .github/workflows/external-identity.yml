@@ -34,7 +34,7 @@ jobs:
       - name: Install test tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y podman openssl shellcheck
+          sudo apt-get install -y podman openssl shellcheck python3-yaml zsh
       - name: Validate identity inputs and installer
         run: |
           python3 -m unittest discover -s tests/external-services/unit -v

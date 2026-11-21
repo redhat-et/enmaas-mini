@@ -116,8 +116,8 @@ def validate_external_database_url(url_text, ca_file=None, ca_required=True):
         except ValueError as error:
             raise ValueError('external database URL hostaddr must be an IPv4 or IPv6 address') from error
     sslmode = query.get('sslmode', '').lower()
-    if sslmode not in ('require', 'verify-full'):
-        raise ValueError('external database URL must set sslmode=require or sslmode=verify-full')
+    if sslmode != 'verify-full':
+        raise ValueError('external database URL must set sslmode=verify-full to verify server identity')
     if sslmode == 'verify-full' and ca_required:
         if ca_file is None:
             raise ValueError('sslmode=verify-full requires --external-database-ca-file')

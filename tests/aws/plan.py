@@ -20,6 +20,18 @@ loader.exec_module(vm)
 
 
 class PlanTest(unittest.TestCase):
+    def test_group_tags_are_derived_from_run_and_legacy_tags_are_unchanged(self):
+        prefix = 'em-demo-0123456789ab'
+        for role, scenario in [('gateway', 'remote-gateway'), ('keycloak', 'keycloak'), ('observability', 'observability')]:
+            tags = {row['Key']: row['Value'] for row in vm.tags(prefix+'-'+role, scenario)}
+            self.assertEqual(tags['enmaas:group'], 'demo')
+            self.assertEqual(tags['enmaas:run'], prefix)
+            self.assertEqual(tags['enmaas:purpose'], 'external-services-test')
+        with self.assertRaises(ValueError):
+            vm.tags(prefix+'-gateway', 'keycloak')
+        for legacy in ('enmaas-0123456789abcdef-gateway', 'pricetag-test-real'):
+            self.assertNotIn('enmaas:group', {row['Key']: row['Value'] for row in vm.tags(legacy, 'remote-gateway')})
+
     def test_capacity_report_lists_only_public_subnets_without_claiming_free_instances(self):
         aws = vm.Aws("eu-central-1", None, False)
         args = SimpleNamespace(account_id="123456789012", instance_type="g6.2xlarge", subnet_id="subnet-a")
@@ -104,6 +116,22 @@ class PlanTest(unittest.TestCase):
                     self.assertEqual(len(proposal["Ingress"]), 2 if scenario == "remote-gateway" else 1)
                     self.assertTrue(all(call.args[1] in vm.READS for call in calls.call_args_list))
                     self.assertFalse(args.state_file.exists())
+                    if scenario == 'all-in-one' and inference == 'none' and arch == 'amd64':
+                        args.ami_id='ami-test'
+                        with patch.object(aws,'call',side_effect=responses),patch.object(vm.subprocess,'run'):
+                            self.assertEqual(vm.plan(aws,args)['ImageId'],'ami-test')
+                        for case in ('missing-image','subnet','routes','existing-instance','existing-group','existing-key'):
+                            changed=copy.deepcopy(responses)
+                            if case=='missing-image':changed[2]['Images']=[]
+                            elif case=='subnet':changed[3]['Subnets'][0]['State']='pending'
+                            elif case=='routes':
+                                changed[5]={'RouteTables':[]}
+                                changed.insert(6,{'RouteTables':[]})
+                            elif case=='existing-instance':changed[6]['Reservations']=[{'Instances':[{'InstanceId':'i-existing'}]}]
+                            elif case=='existing-group':changed[7]['SecurityGroups']=[{'GroupId':'sg-existing'}]
+                            elif case=='existing-key':changed[8]['KeyPairs']=[{'KeyName':'existing'}]
+                            with self.subTest(case=case),patch.object(aws,'call',side_effect=changed),patch.object(vm.subprocess,'run'),self.assertRaises(ValueError):
+                                vm.plan(aws,args)
 
     def settings(self, **overrides):
         return SimpleNamespace(**dict.fromkeys(vm.CONFIG_KEYS | {"config"}) | overrides)
@@ -204,8 +232,30 @@ class PlanTest(unittest.TestCase):
                 vm.apply_retry(aws, args, state, state)
             self.assertEqual([call.args[1] for call in calls.call_args_list], ["run-instances"])
             self.assertEqual(calls.call_args.kwargs["client_token"], "original-token")
+            self.assertEqual([row["ResourceType"] for row in calls.call_args.kwargs["tag_specifications"]],
+                             ["instance", "volume"])
             self.assertEqual(calls.call_args.kwargs["network_interfaces"][0]["Groups"], ["sg-original"])
             self.assertEqual(json.loads(args.state_file.read_text())["InstanceId"], "i-retry")
+
+    def test_new_launch_tag_contract_survives_retry_and_rejects_unknown_types(self):
+        for tag_types in (["instance", "volume", "network-interface"], ["instance", "snapshot"]):
+            with self.subTest(tag_types=tag_types), tempfile.TemporaryDirectory() as directory:
+                args, proposal, aws = self.apply_inputs(directory)
+                state = {**proposal, "ClientToken": "original-token", "SecurityGroupId": "sg-original",
+                         "KeyPairName": args.prefix, "ApplyStatus": "launch-requested",
+                         "LaunchTagResourceTypes": tag_types}
+                vm.save_state(args.state_file, state)
+                with patch.object(aws, "call", return_value={"Instances": [{"InstanceId": "i-retry"}]}) as calls, \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    if "snapshot" in tag_types:
+                        with self.assertRaisesRegex(ValueError, "launch-tag contract"):
+                            vm.launch_instance(aws, args, proposal, state)
+                        calls.assert_not_called()
+                    else:
+                        vm.launch_instance(aws, args, proposal, state)
+                        self.assertEqual(calls.call_args.kwargs["client_token"], "original-token")
+                        self.assertEqual([row["ResourceType"] for row in calls.call_args.kwargs["tag_specifications"]], tag_types)
+                        self.assertEqual(json.loads(args.state_file.read_text())["LaunchTagResourceTypes"], tag_types)
 
     def retry_inputs(self, directory):
         args = self.settings(config=ROOT / "configs/aws/vllm-gpu.json", scenario="all-in-one",
@@ -236,6 +286,20 @@ class PlanTest(unittest.TestCase):
             "describe-key-pairs": {"KeyPairs": [{"KeyName": args.prefix, "Tags": owned, "PublicKey": args.public_key.read_text()}]}}
         return args, state, replies
 
+    def test_retry_refuses_replacement_key_pair_with_same_name(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args,state,replies=self.retry_inputs(directory)
+            state['KeyPairId']='key-1234567890abcdef0'
+            aws=vm.Aws(args.region,None,False)
+            for current in (None,'key-abcdef12345678900','key-1234567890abcdef0'):
+                replies['describe-key-pairs']['KeyPairs'][0]['KeyPairId']=current
+                with patch.object(aws,'call',side_effect=lambda service,action,**options:replies[action]):
+                    if current==state['KeyPairId']:
+                        self.assertEqual(vm.retry_plan(aws,args,state)['KeyPairId'],current)
+                    else:
+                        with self.assertRaisesRegex(ValueError,'key-pair ID'):
+                            vm.retry_plan(aws,args,state)
+
     def test_retry_plan_reconciles_resources_without_changing_the_journal(self):
         with tempfile.TemporaryDirectory() as directory:
             args, state, replies = self.retry_inputs(directory)
@@ -265,7 +329,7 @@ class PlanTest(unittest.TestCase):
     def test_retry_refuses_resource_drift_and_recovers_only_its_own_instance(self):
         with tempfile.TemporaryDirectory() as directory:
             args, state, original = self.retry_inputs(directory)
-            for case in ("ingress", "owner", "key", "instance"):
+            for case in ("ingress", "owner", "key", "instance", "subnet", "routes", "group-name", "multiple", "launch-drift"):
                 replies = copy.deepcopy(original)
                 if case == "ingress":
                     replies["describe-security-groups"]["SecurityGroups"][0]["IpPermissions"] = []
@@ -273,6 +337,17 @@ class PlanTest(unittest.TestCase):
                     replies["describe-security-groups"]["SecurityGroups"][0]["Tags"] = []
                 elif case == "key":
                     replies["describe-key-pairs"]["KeyPairs"][0]["PublicKey"] = "ssh-ed25519 different-key"
+                elif case == 'subnet':
+                    replies['describe-subnets']['Subnets'][0]['AvailableIpAddressCount']=0
+                elif case == 'routes':
+                    replies['describe-route-tables']={'RouteTables':[]}
+                elif case == 'group-name':
+                    replies['describe-security-groups']['SecurityGroups'][0]['GroupName']='foreign'
+                elif case == 'multiple':
+                    replies['describe-instances']={'Reservations':[{'Instances':[{'InstanceId':'i-one'},{'InstanceId':'i-two'}]}]}
+                elif case == 'launch-drift':
+                    replies['describe-instances']={'Reservations':[{'Instances':[{'InstanceId':'i-test',
+                        'ClientToken':'foreign','Tags':vm.tags(args.prefix,args.scenario)}]}]}
                 else:
                     replies["describe-instances"] = {"Reservations": [{"Instances": [{"InstanceId": "i-other", "Tags": []}]}]}
                 aws = vm.Aws(args.region, None, False)
@@ -321,7 +396,7 @@ class PlanTest(unittest.TestCase):
     def test_capacity_failure_is_recorded_for_explicit_zone_change(self):
         with tempfile.TemporaryDirectory() as directory:
             args, proposal, aws = self.apply_inputs(directory)
-            responses = [{"GroupId": "sg-test"}, {}, {}, vm.AwsError("InsufficientInstanceCapacity", "capacity")]
+            responses = [{"GroupId": "sg-test"}, {}, {"KeyName":args.prefix,"KeyPairId":"key-1234567890abcdef0"}, vm.AwsError("InsufficientInstanceCapacity", "capacity")]
             with patch.object(aws, "call", side_effect=responses), \
                     contextlib.redirect_stdout(io.StringIO()), self.assertRaises(vm.AwsError):
                 vm.apply_plan(aws, args, proposal)
@@ -356,6 +431,10 @@ class PlanTest(unittest.TestCase):
 
     def test_public_ssh_is_explicit_and_does_not_open_https_or_backends(self):
         for scenario in vm.SCENARIOS:
+            if scenario in vm.AUXILIARY:
+                with self.assertRaises(ValueError):
+                    vm.ingress(scenario, "192.0.2.1/32", ssh_access="public")
+                continue
             rules = vm.ingress(scenario, "192.0.2.1/32", ssh_access="public")
             self.assertEqual(rules[0]["IpRanges"], [{"CidrIp": "0.0.0.0/0"}])
             self.assertEqual([rule["FromPort"] for rule in rules],
@@ -847,7 +926,10 @@ class PlanTest(unittest.TestCase):
                 if action == "create-security-group":
                     return {"GroupId": "sg-test"}
                 self.assertEqual(state["SecurityGroupId"], "sg-test")
+                if action == "import-key-pair":
+                    return {"KeyName":args.prefix,"KeyPairId":"key-1234567890abcdef0"}
                 if action == "run-instances":
+                    self.assertEqual(state["KeyPairId"], "key-1234567890abcdef0")
                     self.assertEqual(state["ApplyStatus"], "launch-requested")
                     self.assertEqual(state["KeyPairName"], args.prefix)
                     self.assertEqual(options["client_token"], state["ClientToken"])
@@ -857,6 +939,10 @@ class PlanTest(unittest.TestCase):
                     self.assertEqual(len(options["network_interfaces"]), 1)
                     self.assertTrue(options["network_interfaces"][0]["DeleteOnTermination"])
                     self.assertTrue(options["network_interfaces"][0]["AssociatePublicIpAddress"])
+                    self.assertEqual([row["ResourceType"] for row in options["tag_specifications"]],
+                                     ["instance", "volume", "network-interface"])
+                    self.assertTrue(all(row["Tags"] == vm.tags(args.prefix, args.scenario)
+                                        for row in options["tag_specifications"]))
                     self.assertEqual(len(options["block_device_mappings"]), 1)
                     self.assertTrue(options["block_device_mappings"][0]["Ebs"]["DeleteOnTermination"])
                     return {"Instances": [{"InstanceId": "i-test"}]}
@@ -869,10 +955,23 @@ class PlanTest(unittest.TestCase):
             self.assertEqual(operations, ["create-security-group", "authorize-security-group-ingress",
                                           "import-key-pair", "run-instances"])
 
+    def test_ambiguous_key_import_never_launches_instance(self):
+        for reply in ({}, {'KeyName':'foreign','KeyPairId':'key-1234567890abcdef0'},
+                      {'KeyName':'test-remote','KeyPairId':'invalid'}):
+            with self.subTest(reply=reply),tempfile.TemporaryDirectory() as directory:
+                args,proposal,aws=self.apply_inputs(directory)
+                with patch.object(aws,'call',side_effect=[{'GroupId':'sg-test'},{},reply]) as calls, \
+                     contextlib.redirect_stdout(io.StringIO()),self.assertRaisesRegex(ValueError,'key import'):
+                    vm.apply_plan(aws,args,proposal)
+                self.assertEqual(calls.call_count,3)
+                state=json.loads(args.state_file.read_text())
+                self.assertEqual(state['ApplyStatus'],'key-import-requested')
+                self.assertNotIn('KeyPairId',state)
+
     def test_launch_failure_keeps_recovery_identifiers(self):
         with tempfile.TemporaryDirectory() as directory:
             args, proposal, aws = self.apply_inputs(directory)
-            responses = [{"GroupId": "sg-test"}, {}, {}, ValueError("launch response lost")]
+            responses = [{"GroupId": "sg-test"}, {}, {"KeyName":args.prefix,"KeyPairId":"key-1234567890abcdef0"}, ValueError("launch response lost")]
             with patch.object(aws, "call", side_effect=responses), \
                     contextlib.redirect_stdout(io.StringIO()), self.assertRaises(ValueError):
                 vm.apply_plan(aws, args, proposal)
@@ -920,6 +1019,34 @@ class PlanTest(unittest.TestCase):
             with patch.object(aws, "call", side_effect=responses) as calls, contextlib.redirect_stdout(io.StringIO()):
                 vm.verify(aws, args)
                 self.assertTrue(all(call.args[1] in vm.READS for call in calls.call_args_list))
+            # Verify each independent host boundary against a clean live response.
+            for field,value,message in (
+                    ('Tags',[],'ownership'),('ImageId','ami-foreign','image/type'),
+                    ('InstanceType','m7i.large','image/type'),
+                    ('MetadataOptions',{'HttpTokens':'optional','HttpPutResponseHopLimit':1,'HttpEndpoint':'enabled'},'metadata'),
+                    ('IamInstanceProfile',{'Arn':'arn:foreign'},'metadata'),
+                    ('SecurityGroups',[{'GroupId':'sg-foreign'}],'attached security')):
+                changed=copy.deepcopy(responses)
+                changed[1]['Reservations'][0]['Instances'][0][field]=value
+                with self.subTest(field=field),patch.object(aws,'call',side_effect=changed),self.assertRaisesRegex(ValueError,message):
+                    vm.verify(aws,args)
+            changed=copy.deepcopy(responses)
+            changed[3]['SecurityGroups'][0]['Tags']=[]
+            with patch.object(aws,'call',side_effect=changed),self.assertRaisesRegex(ValueError,'security-group ownership'):
+                vm.verify(aws,args)
+            for field,value in (('Encrypted',False),('Size',1)):
+                changed=copy.deepcopy(responses)
+                changed[4]['Volumes'][0][field]=value
+                with self.subTest(field=field),patch.object(aws,'call',side_effect=changed),self.assertRaisesRegex(ValueError,'root-disk'):
+                    vm.verify(aws,args)
+            for mode in ('account','missing-instance'):
+                bad=copy.deepcopy(state)
+                if mode=='account':bad['AccountId']='999999999999'
+                else:del bad['InstanceId']
+                vm.update_state(args.state_file,bad)
+                with self.subTest(mode=mode),patch.object(aws,'call',side_effect=responses),self.assertRaises(ValueError):
+                    vm.verify(aws,args)
+            vm.update_state(args.state_file,state)
             state["ManagedGrants"] = ["sg-client"]
             vm.update_state(args.state_file, state)
             managed_rule = {"IpProtocol": "tcp", "FromPort": 8000, "ToPort": 8000,

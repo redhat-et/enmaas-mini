@@ -131,3 +131,11 @@ sudo python3 scripts/pricetag/manage POST key-revocations \
 
 A partial upstream failure is reported explicitly. Retrying revocation is safe;
 never automatically retry key issuance.
+
+### Management from the gateway host
+
+For SSH-local automation, use `--url https://127.0.0.1:8443` with
+`--origin https://YOUR_GATEWAY:8443`. The latter must match the gateway's configured
+browser origin. The helper permits this override only with literal loopback TLS;
+the CA, key authentication and current-role checks still apply. Responses are
+written to the new private file supplied with `--output`.
