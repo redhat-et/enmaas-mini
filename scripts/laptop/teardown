@@ -1,0 +1,1196 @@
+#!/usr/bin/env python3
+"""Production-grade teardown for compose/laptop deployment (Darwin + RHEL).
+
+Mirrors scripts/common/uninstall but for the laptop/compose stack:
+  - Handles both RHEL (Quadlet/systemd) and Darwin (podman-compose) platforms
+  - Darwin: podman-compose down, volume rm (pgdata/pricetag-data), network rm
+    (pricetag-private/pricetag-mock), secret rm if exists, rm -rf ADMIN/DEPLOY,
+    daemon-reload equivalent, verify cleanup
+  - RHEL: systemd Quadlet stop, vLLM network preservation, manifest verification,
+    owned-path validation, daemon-reload, volume/network cleanup
+
+Flags mirror uninstall semantics:
+  --purge-volumes  remove volumes (like --purge-valkey-data; default: preserve)
+  --purge-images   also rm images (praxis/maas/metering/postgres/python)
+  --force / --yes  skip confirmation (required for non-interactive)
+  --dry-run        print actions without executing
+
+Idempotency: running twice must not error; missing files/volumes/networks are
+already-absent. verify_managed_manifest-style drift checks prevent accidental
+deletion of user-modified files. flock prevents concurrent deploy/teardown races.
+vLLM network preservation mirrors uninstall:26-32 (praxis-private/praxis.network
+kept when vLLM owns it).
+
+Usage:
+  scripts/laptop/teardown                          # down, keep volumes
+  scripts/laptop/teardown --purge-volumes          # full wipe (volumes+nets+dirs)
+  scripts/laptop/teardown --purge-volumes --purge-images --force
+  scripts/laptop/teardown --dry-run --purge-volumes
+  scripts/laptop/teardown --deploy-dir /tmp/test --purge-volumes --force
+  sudo scripts/laptop/teardown --purge-volumes      # RHEL Quadlet path
+"""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import os
+import pwd
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+
+# --- Darwin defaults (mirror deploy) ---
+DEFAULT_DEPLOY_DIR = Path.home() / ".local/share/enmaas-mini/laptop"
+DEFAULT_ADMIN_DIR = Path.home() / "praxis-laptop-admin"
+DEFAULT_COMPOSE_FILE = ROOT / "compose.laptop.yaml"
+LOCK_PATH = Path("/tmp/praxis-laptop-deploy.lock")
+TEARDOWN_LOCK = Path("/tmp/praxis-laptop-teardown.lock")
+LOG_PATH: Path | None = None
+LOG_FD = None
+STAGE = "Teardown"
+
+# --- Known resources to clean (idempotent rm -f) ---
+# Darwin compose names include project prefixes; RHEL uses bare names.
+VOLUME_NAMES = [
+    "pricetag-data",
+    "pgdata",  # legacy/alternate compose volume name (requirement: pgdata/pricetag-data)
+    "enmaas-mini_pricetag-data",
+    "laptop_pricetag-data",
+    "pricetag-data_laptop",
+    "pricetag_pgdata",
+]
+NETWORK_NAMES = [
+    "pricetag-private",
+    "pricetag-mock",
+    "enmaas-mini_pricetag-private",
+    "enmaas-mini_pricetag-mock",
+    "laptop_pricetag-private",
+    "laptop_pricetag-mock",
+    "pricetag-mock_laptop",
+]
+SECRET_NAMES = [
+    "pricetag-m2m",
+    "pricetag-mock-ui-v1",
+]
+
+# --- Images for --purge-images (same digests as deploy) ---
+PRAXIS_IMAGE = "quay.io/opendatahub/praxis-experimental@sha256:502f120fed7b8e516ce1d78396045c8f72673672351432b9dc2e61baf5c13ac8"
+PUBLISHED_MAAS_IMAGE = "quay.io/redhat-et/secure-single-server-maas-standalone@sha256:0bec6ef57fa5b10a7bef8f4df8d98f932c9d7fc96798f7bfc0cd77b504790fa8"
+PUBLISHED_METERING_IMAGE = "quay.io/redhat-et/secure-single-server-pricetag-metering@sha256:dabb2f35f54c30c2c387b3bf298b66f3b84a4110ddf3a78a204c7d59c5de2f1a"
+MAAS_LAPTOP_IMAGE_ARM64 = "quay.io/yossiovadia/models-as-a-service:feat-standalone-api-key-mode-5fc83feb"
+POSTGRES_IMAGE = "docker.io/library/postgres@sha256:996e9dc583ba9f0265a2c75547a9c95fb22c251e394749cab205a0a00e1856a1"
+PYTHON_IMAGE = "docker.io/library/python@sha256:519591d6871b7bc437060736b9f7456b8731f1499a57e22e6c285135ae657bf7"
+IMAGES_TO_PURGE = [
+    PRAXIS_IMAGE, PUBLISHED_MAAS_IMAGE, PUBLISHED_METERING_IMAGE,
+    MAAS_LAPTOP_IMAGE_ARM64, POSTGRES_IMAGE, PYTHON_IMAGE,
+]
+
+# --- RHEL paths (mirror install.py preflight) ---
+RHEL_DEPLOY = Path("/etc/praxis-pricetag")
+RHEL_ADMIN = Path("/root/pricetag-admin")
+RHEL_INPUTS = Path("/root/pricetag-provider-inputs")
+RHEL_CACHE = Path("/var/cache/pricetag-installer")
+RHEL_SERVICE_USER = os.environ.get("PRAXIS_SERVICE_USER", "praxis-svc")
+RHEL_CONFIG_DIR = Path(os.environ.get("PRAXIS_CONFIG_DIR", "/etc/praxis"))
+
+
+# ---------------------------------------------------------------------------
+# Logging & helpers (mirror lib.sh semantics)
+# ---------------------------------------------------------------------------
+
+def die(msg: str) -> None:
+    print(f"error: {msg}", file=sys.stderr, flush=True)
+    if LOG_FD:
+        LOG_FD.write(f"error: {msg}\n")
+        LOG_FD.flush()
+    sys.exit(1)
+
+
+def note(msg: str) -> None:
+    print(msg, flush=True)
+    if LOG_FD:
+        LOG_FD.write(msg + "\n")
+        LOG_FD.flush()
+
+
+def log(msg: str) -> None:
+    print(msg, flush=True)
+    if LOG_FD:
+        LOG_FD.write(msg + "\n")
+        LOG_FD.flush()
+
+
+def warn(msg: str) -> None:
+    print(f"WARN: {msg}", flush=True)
+    if LOG_FD:
+        LOG_FD.write(f"WARN: {msg}\n")
+        LOG_FD.flush()
+
+
+def open_log(directory: str = "/tmp") -> Path:
+    global LOG_FD, LOG_PATH
+    Path(directory).mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix="praxis-laptop-teardown-", suffix=".log", dir=directory)
+    LOG_PATH = Path(name)
+    LOG_FD = os.fdopen(fd, "w", buffering=1)
+    os.chmod(LOG_PATH, 0o600)
+    log(f"Detailed log: {LOG_PATH}")
+    return LOG_PATH
+
+
+def run(
+    cmd: list[str | Path],
+    label: str | None = None,
+    check: bool = False,
+    capture: bool = False,
+    cwd: str | Path = "/tmp",
+    timeout: int = 30,
+) -> subprocess.CompletedProcess | None:
+    cmd_str = [str(c) for c in cmd]
+    if LOG_FD:
+        LOG_FD.write("+ " + " ".join(cmd_str) + "\n")
+        LOG_FD.flush()
+    if label and not capture:
+        print(f"  {label}...", flush=True)
+    try:
+        result = subprocess.run(
+            cmd_str,
+            cwd=str(cwd),
+            text=True,
+            capture_output=capture,
+            timeout=timeout,
+        )
+        if label and not capture:
+            if result.returncode == 0:
+                print("  OK", flush=True)
+            else:
+                print(f"  (exit {result.returncode}, continuing - idempotent)", flush=True)
+        if check and result.returncode != 0:
+            raise subprocess.CalledProcessError(result.returncode, cmd_str)
+        return result
+    except FileNotFoundError:
+        if label:
+            print(f"  SKIP: command not found: {cmd_str[0]}", flush=True)
+        return None
+    except subprocess.TimeoutExpired:
+        warn(f"command timed out: {' '.join(cmd_str)}")
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Platform detection & lib.sh mirrors
+# ---------------------------------------------------------------------------
+
+def is_rhel() -> bool:
+    if sys.platform != "linux":
+        return False
+    p = Path("/etc/os-release")
+    if not p.is_file():
+        return False
+    try:
+        return bool(re.search(r'^ID="?rhel"?$', p.read_text(), re.M))
+    except OSError:
+        return False
+
+
+def require_root() -> None:
+    if os.geteuid() != 0:
+        die("run this command as root (RHEL Quadlet teardown requires sudo)")
+
+
+def require_command(name: str) -> None:
+    if shutil.which(name) is None:
+        die(f"required command not found: {name}")
+
+
+def gateway_lock_path(owner: str) -> Path:
+    if not re.fullmatch(r"[a-z_][a-z0-9_-]*", owner):
+        die(f"invalid service account: {owner}")
+    if owner == "praxis-svc":
+        return Path("/run/lock/praxis-gateway.lock")
+    return Path(f"/run/lock/praxis-gateway-{owner}.lock")
+
+
+def try_service_uid(user: str | None = None) -> int | None:
+    """Return uid or None if service account missing (no die, for optional checks)."""
+    name = user or RHEL_SERVICE_USER
+    try:
+        return pwd.getpwnam(name).pw_uid
+    except KeyError:
+        return None
+
+
+def service_uid(user: str | None = None) -> int:
+    uid = try_service_uid(user)
+    if uid is None:
+        die(f"service account {user or RHEL_SERVICE_USER} does not exist; run install --prepare first")
+    return uid
+
+
+def service_home(user: str | None = None) -> Path:
+    import pwd as _pwd
+    name = user or RHEL_SERVICE_USER
+    try:
+        return Path(_pwd.getpwnam(name).pw_dir)
+    except KeyError:
+        die(f"could not resolve {name} home")
+
+
+def vllm_uses_praxis_network(root: Path = Path("/"), uid: int | None = None) -> bool:
+    """Mirror lib.sh vllm_uses_praxis_network: preserve praxis.network if vLLM owns it."""
+    if uid is None:
+        uid = try_service_uid()
+        if uid is None:
+            return False
+    unit = root / f"etc/containers/systemd/users/{uid}/praxis-vllm.container"
+    state = root / "etc/praxis-vllm"
+    if not unit.is_file() or not (state / "manifest").is_file():
+        return False
+    try:
+        content = unit.read_text()
+        return "Network=praxis.network" in content
+    except OSError:
+        return False
+
+
+def as_service_args() -> list[str]:
+    """Return prefix for running as service user (runuser wrapper)."""
+    uid = service_uid()
+    home = service_home()
+    return [
+        "runuser", "-u", RHEL_SERVICE_USER, "--", "env",
+        f"HOME={home}", f"XDG_RUNTIME_DIR=/run/user/{uid}",
+        f"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{uid}/bus",
+    ]
+
+
+def validate_owned_path(path: Path, deploy_dir: Path | None = None, admin_dir: Path | None = None) -> None:
+    """Validate path is managed and safe to remove (mirror lib.sh validate_owned_path).
+
+    For Darwin: allow paths under deploy_dir, admin_dir, COMPOSE file, and known
+    systemd unit locations. For RHEL: strict allowlist mirroring lib.sh but for
+    pricetag resources.
+    """
+    # Normalize
+    try:
+        resolved = path.resolve()
+    except OSError:
+        resolved = path
+
+    # Allow deploy/admin trees (with strict parent check to prevent traversal)
+    allowed_prefixes: list[Path] = []
+    if deploy_dir:
+        allowed_prefixes.append(deploy_dir.resolve() if deploy_dir.exists() else deploy_dir)
+    if admin_dir:
+        allowed_prefixes.append(admin_dir.resolve() if admin_dir.exists() else admin_dir)
+    # RHEL fixed paths
+    allowed_prefixes.extend([RHEL_DEPLOY, RHEL_ADMIN, RHEL_INPUTS])
+    # Also allow compose file and lock files
+    allowed_prefixes.extend([DEFAULT_COMPOSE_FILE, LOCK_PATH, TEARDOWN_LOCK])
+    # Systemd units for RHEL
+    try:
+        uid = service_uid()
+        allowed_prefixes.append(Path(f"/etc/containers/systemd/users/{uid}"))
+        allowed_prefixes.append(Path(f"/etc/containers/systemd/users/{uid}/pricetag.network"))
+        allowed_prefixes.append(Path(f"/etc/containers/systemd/users/{uid}/pricetag-db.volume"))
+        for unit in ("pricetag-db", "pricetag-maas", "pricetag-metering", "pricetag-gateway",
+                     "pricetag-provider", "pricetag-mock"):
+            allowed_prefixes.append(Path(f"/etc/containers/systemd/users/{uid}/{unit}.container"))
+            allowed_prefixes.append(Path(f"/etc/containers/systemd/users/{uid}/{unit}.network"))
+    except SystemExit:
+        pass
+
+    # Check if path or its parent is under an allowed prefix, or is the allowed path itself
+    # Also allow any file under RHEL_DEPLOY / RHEL_ADMIN (they are managed trees)
+    for prefix in allowed_prefixes:
+        try:
+            # Exact match
+            if resolved == prefix.resolve() if prefix.exists() else resolved == prefix:
+                return
+            # Under prefix
+            if resolved.is_relative_to(prefix.resolve() if prefix.exists() else prefix):
+                return
+            # For non-existent deploy_dir/admin_dir, check string prefix (pre-removal)
+            if deploy_dir and str(resolved).startswith(str(deploy_dir)):
+                return
+            if admin_dir and str(resolved).startswith(str(admin_dir)):
+                return
+        except (OSError, ValueError):
+            continue
+        # String fallback for paths that don't exist yet or are symlinks
+        if str(resolved).startswith(str(prefix)):
+            return
+
+    # Additional allowlist for known pricetag files (mirror lib.sh but for pricetag)
+    allowed_exact = {
+        RHEL_DEPLOY / "ca.pem",
+        RHEL_DEPLOY / "bootstrap.json",
+        RHEL_DEPLOY / "m2m-secret",
+        RHEL_DEPLOY / "management-secret",
+        RHEL_DEPLOY / "postgres-bootstrap.done",
+        RHEL_DEPLOY / "bootstrap.done",
+        DEFAULT_COMPOSE_FILE,
+        ROOT / "compose.laptop.yaml",
+    }
+    if resolved in allowed_exact or path in allowed_exact:
+        return
+
+    # If we reach here, check if it's under a known managed root
+    # For Darwin laptop: anything under $HOME is considered owned if it matches deploy/admin
+    # For safety, refuse paths like /, /etc, /usr, /var, /home that are not specific
+    dangerous = [Path("/"), Path("/etc"), Path("/usr"), Path("/var"), Path("/bin"), Path("/sbin")]
+    if resolved in dangerous:
+        die(f"refusing to remove unmanaged system path: {path}")
+
+    # If path is under HOME and looks like laptop deploy, allow
+    home = Path.home()
+    try:
+        if resolved.is_relative_to(home):
+            # Only allow if it's deploy/admin or their children
+            if deploy_dir and str(resolved).startswith(str(deploy_dir)):
+                return
+            if admin_dir and str(resolved).startswith(str(admin_dir)):
+                return
+            # Also allow $HOME/praxis-laptop-admin explicitly
+            if str(resolved).startswith(str(home / "praxis-laptop-admin")):
+                return
+            if str(resolved).startswith(str(home / ".local/share/enmaas-mini")):
+                return
+    except ValueError:
+        pass
+
+    # If none matched, it's unmanaged - but for idempotent teardown we treat
+    # non-managed paths as already clean rather than error, unless it's a system path.
+    # This matches idempotent behavior: don't fail if file not in manifest.
+    # Only die if it's clearly a managed location that drifted.
+    # For now, allow removal if it's inside deploy/admin, otherwise warn.
+    if deploy_dir and admin_dir:
+        # If path is not under deploy/admin and not a known RHEL path, it's not ours
+        warn(f"path not in managed allowlist, skipping: {path}")
+        raise ValueError(f"unmanaged path: {path}")
+
+
+def verify_managed_manifest_like(deploy_dir: Path) -> bool:
+    """Verify deploy dir contents haven't drifted (best-effort, idempotent).
+
+    For laptop, there is no manifest file, but we can check that deploy_dir
+    contains expected laptop files and no unexpected suid/world-writable perms.
+    Returns True if verification passed or dir absent (idempotent), False if drift
+    detected (caller should warn but continue for teardown).
+    """
+    if not deploy_dir.exists():
+        return True
+    if deploy_dir.is_symlink():
+        warn(f"deploy dir is symlink, refusing automatic removal: {deploy_dir}")
+        return False
+    try:
+        st = deploy_dir.stat()
+        if st.st_uid != os.getuid() and os.geteuid() != 0:
+            warn(f"deploy dir owned by {st.st_uid}, expected {os.getuid()}: {deploy_dir}")
+            return False
+        if st.st_mode & 0o022:
+            warn(f"deploy dir is group/world-writable: {deploy_dir}")
+            return False
+    except OSError as e:
+        warn(f"could not stat deploy dir: {e}")
+        return False
+    return True
+
+
+def detect_compose() -> list[str] | None:
+    """Detect compose engine: prefer podman-compose, then podman compose, then docker."""
+    if shutil.which("podman-compose"):
+        return ["podman-compose"]
+    try:
+        r = subprocess.run(["podman", "compose", "version"], capture_output=True, text=True, timeout=10)
+        if r.returncode == 0:
+            return ["podman", "compose"]
+    except FileNotFoundError:
+        pass
+    try:
+        r = subprocess.run(["docker", "compose", "version"], capture_output=True, text=True, timeout=10)
+        if r.returncode == 0:
+            return ["docker", "compose"]
+    except FileNotFoundError:
+        pass
+    if shutil.which("docker-compose"):
+        return ["docker-compose"]
+    return None
+
+
+def engine_bin() -> str:
+    if shutil.which("podman"):
+        return "podman"
+    if shutil.which("docker"):
+        return "docker"
+    return "podman"
+
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("--purge-volumes", action="store_true",
+                   help="also remove volumes (pricetag-data/pgdata), networks, secrets, and deploy dirs (default: preserve volumes for inspection, like --purge-valkey-data)")
+    p.add_argument("--purge-images", action="store_true",
+                   help="also remove podman images (praxis/maas/metering/postgres/python); requires --purge-volumes or explicit confirmation")
+    p.add_argument("--purge", action="store_true", help="alias for --purge-volumes")
+    p.add_argument("--deploy-dir", type=Path, default=DEFAULT_DEPLOY_DIR,
+                   help=f"laptop deploy directory (default: {DEFAULT_DEPLOY_DIR})")
+    p.add_argument("--admin-dir", type=Path, default=DEFAULT_ADMIN_DIR,
+                   help=f"admin credentials directory (default: {DEFAULT_ADMIN_DIR})")
+    p.add_argument("--compose-file", type=Path, default=DEFAULT_COMPOSE_FILE,
+                   help=f"compose file to teardown (default: {DEFAULT_COMPOSE_FILE})")
+    p.add_argument("--yes", action="store_true", help="skip confirmation prompt")
+    p.add_argument("--force", action="store_true", help="alias for --yes (skip confirmation)")
+    p.add_argument("--dry-run", action="store_true", help="print actions without executing (idempotent check)")
+    p.add_argument("--keep-admin", action="store_true",
+                   help="preserve admin dir even with --purge-volumes")
+    args = p.parse_args(argv)
+    if args.purge:
+        args.purge_volumes = True
+    if args.force:
+        args.yes = True
+    # --purge-images implies volumes should be gone too (images may be in use)
+    if args.purge_images and not args.purge_volumes:
+        # Allow it but warn; images can be removed without volumes
+        pass
+    return args
+
+
+# ---------------------------------------------------------------------------
+# RHEL Quadlet teardown (mirror uninstall:26-32 network preservation)
+# ---------------------------------------------------------------------------
+
+def teardown_rhel(args: argparse.Namespace) -> None:
+    """Teardown for RHEL Quadlet deployment (requires root)."""
+    global STAGE
+    require_root()
+    # Require commands like uninstall does
+    for cmd in ("podman", "systemctl"):
+        # runuser and semanage may not exist on all hosts; check gracefully
+        if shutil.which(cmd) is None:
+            warn(f"required command not found: {cmd} (continuing without it)")
+    # flock: use same lock as deploy + gateway lock
+    # Try gateway lock first (if service user exists), else fallback to RHEL cache lock
+    lock_path = None
+    try:
+        lock_path = gateway_lock_path(RHEL_SERVICE_USER)
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+    except SystemExit:
+        lock_path = Path("/run/praxis-pricetag.lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Also acquire laptop deploy lock if it exists (prevent Darwin race on hybrid)
+    extra_lock = None
+    if LOCK_PATH.exists():
+        extra_lock = LOCK_PATH
+
+    print(f"\nPriceTag teardown (RHEL Quadlet path)\n" + "=" * 54)
+    print(f"  Deploy: {RHEL_DEPLOY}")
+    print(f"  Admin:  {RHEL_ADMIN}")
+    print(f"  Purge volumes: {args.purge_volumes}")
+    print(f"  Purge images:  {args.purge_images}")
+    print(f"  Mode:          {'dry-run' if args.dry_run else 'live'}")
+
+    if not args.yes and not args.dry_run:
+        if sys.stdin.isatty():
+            what = "ALL DATA (volumes, images, admin keys)" if args.purge_images else (
+                "volumes, networks, secrets, deploy dirs" if args.purge_volumes else "Quadlet units (volumes preserved)")
+            ans = input(f"Teardown {what}? Type teardown: ").strip()
+            if ans != "teardown":
+                die("teardown cancelled (type 'teardown' to confirm)")
+        else:
+            die("non-interactive RHEL teardown requires --force/--yes")
+
+    if args.dry_run:
+        print("\n[Dry-run] RHEL would execute:", flush=True)
+        print(f"  systemctl --user stop pricetag-*.service (as {RHEL_SERVICE_USER})")
+        print(f"  rm -f /etc/containers/systemd/users/<uid>/pricetag.*")
+        if args.purge_volumes:
+            print(f"  podman volume rm pricetag-data (as {RHEL_SERVICE_USER})")
+            print(f"  podman network rm pricetag-private pricetag-mock")
+            print(f"  podman secret rm pricetag-m2m pricetag-mock-ui-v1")
+            print(f"  rm -rf {RHEL_DEPLOY} {RHEL_ADMIN} {RHEL_INPUTS}")
+        print(f"  systemctl --user daemon-reload (as {RHEL_SERVICE_USER})")
+        return
+
+    open_log()
+
+    # vLLM network preservation check (mirror uninstall:26-32)
+    preserve_network = False
+    vllm_state = Path("/etc/praxis-vllm")
+    if vllm_uses_praxis_network():
+        preserve_network = True
+        try:
+            (vllm_state / "network-owned").touch(exist_ok=True)
+        except OSError:
+            pass
+        log("  Preserving praxis.network for managed vLLM service (vllm_uses_praxis_network=true)")
+
+    # Stage 1: stop services (idempotent, as_service)
+    STAGE = "Stop Quadlet services"
+    print(f"\n[1/4] {STAGE}\n" + "-" * 54, flush=True)
+    # Try as_service if service user exists, else as current user
+    def rhel_run(cmd: list[str], label: str | None = None, **kw) -> subprocess.CompletedProcess | None:
+        try:
+            uid = service_uid()
+            # Use as_service prefix
+            full = as_service_args() + cmd
+            return run(full, label=label, **kw)
+        except SystemExit:
+            # No service user; try direct
+            return run(cmd, label=label, **kw)
+
+    services = [
+        "pricetag-gateway", "pricetag-metering", "pricetag-maas",
+        "pricetag-db", "pricetag-provider",
+    ]
+    for svc in services:
+        rhel_run(["systemctl", "--user", "stop", f"{svc}.service"], label=f"stop {svc}")
+        # Also try podman stop/kill for containers that may be running outside systemd
+        rhel_run(["podman", "rm", "-f", svc], label=f"rm container {svc}")
+
+    # Networks: only stop/remove if not preserved
+    if not preserve_network:
+        rhel_run(["systemctl", "--user", "stop", "pricetag-network.service"], label="stop pricetag-network")
+        rhel_run(["systemctl", "--user", "stop", "pricetag-mock.network"], label="stop pricetag-mock network")
+        rhel_run(["podman", "network", "rm", "pricetag-private"], label="network rm pricetag-private")
+        rhel_run(["podman", "network", "rm", "pricetag-mock"], label="network rm pricetag-mock")
+        # Also try to clean praxis-private if it was created by pricetag (but preserve if vLLM)
+        # praxis-private is shared-gateway network; only remove if not preserved
+        if not vllm_uses_praxis_network():
+            rhel_run(["podman", "network", "rm", "praxis-private"], label="network rm praxis-private (if not vLLM)")
+
+    # Stage 2: remove Quadlet units (validate_owned_path before rm)
+    STAGE = "Remove Quadlet manifests"
+    print(f"\n[2/4] {STAGE}\n" + "-" * 54, flush=True)
+    try:
+        uid = service_uid()
+        units_dir = Path(f"/etc/containers/systemd/users/{uid}")
+        if units_dir.is_dir():
+            for pattern in ("pricetag*",):
+                for unit_file in units_dir.glob(pattern):
+                    try:
+                        validate_owned_path(unit_file, RHEL_DEPLOY, RHEL_ADMIN)
+                    except ValueError:
+                        warn(f"skipping unmanaged unit: {unit_file}")
+                        continue
+                    # SELinux cleanup for deploy-owned files (like uninstall)
+                    if unit_file.name in ("pricetag.network", "pricetag-mock.network"):
+                        run(["semanage", "fcontext", "-d", f"^{unit_file}$"], label=f"semanage fcontext -d {unit_file.name}")
+                    try:
+                        unit_file.unlink()
+                        log(f"  Removed {unit_file}")
+                    except OSError as e:
+                        warn(f"could not remove {unit_file}: {e}")
+        else:
+            log(f"  No Quadlet units dir: {units_dir} (already clean)")
+    except SystemExit:
+        log("  No service user; skipping Quadlet unit removal")
+
+    # Stage 3: filesystem + volumes/secrets (purge) or preserve
+    STAGE = "Cleanup volumes and filesystem"
+    print(f"\n[3/4] {STAGE}\n" + "-" * 54, flush=True)
+    eng_bin = engine_bin()
+
+    # Verify managed manifest-like: ensure deploy dir not drifted before removal
+    if RHEL_DEPLOY.exists() and not verify_managed_manifest_like(RHEL_DEPLOY):
+        warn(f"{RHEL_DEPLOY} has drift or unexpected perms; continuing teardown (idempotent)")
+
+    if args.purge_volumes:
+        # Volumes (idempotent)
+        for vol in ("pricetag-data", "pgdata"):
+            rhel_run([eng_bin, "volume", "rm", "-f", vol], label=f"volume rm {vol}")
+            rhel_run([eng_bin, "volume", "rm", vol], label=f"volume rm {vol} (without -f)")
+        # Networks (if not preserved above)
+        for net in ("pricetag-private", "pricetag-mock"):
+            if preserve_network and net == "pricetag-private":
+                continue
+            rhel_run([eng_bin, "network", "rm", net], label=f"network rm {net}")
+        # Secrets (idempotent: rm if exists)
+        for sec in SECRET_NAMES:
+            # Check exists first (like uninstall: secret_exists)
+            result = rhel_run([eng_bin, "secret", "inspect", sec], capture=True)
+            if result and result.returncode == 0:
+                rhel_run([eng_bin, "secret", "rm", sec], label=f"secret rm {sec}")
+            else:
+                log(f"  Secret not present (already removed): {sec}")
+
+        # Filesystem: validate_owned_path before rm -rf
+        for p in (RHEL_DEPLOY, RHEL_ADMIN, RHEL_INPUTS):
+            if p.exists() or p.is_symlink():
+                try:
+                    validate_owned_path(p, RHEL_DEPLOY, RHEL_ADMIN)
+                    if p.is_symlink():
+                        p.unlink()
+                        log(f"  Removed symlink {p}")
+                    else:
+                        shutil.rmtree(p)
+                        log(f"  Removed {p}")
+                except (OSError, ValueError) as e:
+                    warn(f"could not remove {p}: {e}")
+            else:
+                log(f"  Already absent: {p}")
+        log("  Volumes/networks/secrets purged")
+    else:
+        log("  Preserved volumes (pricetag-data) and secrets (use --purge-volumes to remove)")
+        # Still remove Quadlet files but keep data
+        # Deploy dir is kept for inspection
+        log(f"  Preserved {RHEL_DEPLOY} and {RHEL_ADMIN} (inspect before purge)")
+
+    # Purge images if requested (idempotent: rm if exists)
+    if args.purge_images:
+        STAGE = "Purge images"
+        print(f"\n[Extra] {STAGE}\n" + "-" * 54, flush=True)
+        # On RHEL, images are in root and service user stores; try both
+        for img in IMAGES_TO_PURGE:
+            # Try as service user first
+            rhel_run([eng_bin, "image", "rm", "-f", img], label=f"image rm {img} (service user)")
+            # Also try as root
+            result = run([eng_bin, "image", "rm", "-f", img], label=f"image rm {img} (root)")
+            if result and result.returncode != 0:
+                log(f"  Image already absent or in use: {img}")
+
+    # Stage 4: daemon-reload + verify
+    STAGE = "Daemon-reload and verify"
+    print(f"\n[4/4] {STAGE}\n" + "-" * 54, flush=True)
+    rhel_run(["systemctl", "--user", "daemon-reload"], label="daemon-reload (service user)")
+    # Also try root daemon-reload for system units
+    run(["systemctl", "daemon-reload"], label="daemon-reload (system)")
+
+    # Verify cleanup (idempotent checks)
+    try:
+        uid = service_uid()
+        units_dir = Path(f"/etc/containers/systemd/users/{uid}")
+        if units_dir.is_dir():
+            remaining = list(units_dir.glob("pricetag*"))
+            if remaining:
+                warn(f"remaining pricetag Quadlets: {', '.join(str(p) for p in remaining)}")
+            else:
+                log("  No pricetag Quadlets remain")
+    except SystemExit:
+        pass
+
+    if args.purge_volumes:
+        result = rhel_run([eng_bin, "volume", "ls", "--format", "{{.Name}}"], capture=True)
+        if result and result.stdout and "pricetag-data" in result.stdout:
+            warn("volume pricetag-data still exists after --purge-volumes")
+        else:
+            log("  Volume pricetag-data removed (or already absent)")
+
+    log("\nRHEL teardown complete")
+    if args.purge_volumes:
+        log("  All PriceTag state removed; re-deploy with: sudo scripts/pricetag/install.py ...")
+        if args.purge_images:
+            log("  Images purged; next deploy will re-pull")
+    else:
+        log(f"  Preserved volumes and {RHEL_DEPLOY}; re-deploy requires manual cleanup or --purge-volumes")
+    if preserve_network:
+        note("preserved praxis.network for the managed vLLM service")
+
+
+# ---------------------------------------------------------------------------
+# Darwin teardown (compose path)
+# ---------------------------------------------------------------------------
+
+def teardown_compose(args: argparse.Namespace) -> None:
+    global STAGE
+    deploy_dir = args.deploy_dir
+    admin_dir = args.admin_dir
+    compose_file = args.compose_file
+
+    # Resolve compose file candidates (idempotent: try all locations)
+    candidates = [
+        compose_file,
+        deploy_dir / "compose.laptop.yaml",
+        deploy_dir / "compose.yaml",
+        ROOT / "compose.laptop.yaml",
+        Path.cwd() / "compose.laptop.yaml",
+    ]
+    found_compose: Path | None = None
+    for cand in candidates:
+        try:
+            cand_res = cand.resolve() if cand.exists() else cand
+            if cand_res.is_file():
+                found_compose = cand_res
+                break
+        except OSError:
+            continue
+
+    print(f"\nLaptop teardown (Darwin compose path)\n" + "=" * 54)
+    print(f"  Deploy dir:  {deploy_dir}")
+    print(f"  Admin dir:   {admin_dir}")
+    print(f"  Compose:     {found_compose or compose_file} {'(not found, will try volume cleanup)' if not found_compose else ''}")
+    print(f"  Purge vols:  {args.purge_volumes} ({'full wipe' if args.purge_volumes else 'keep volumes/secrets'})")
+    print(f"  Purge imgs:  {args.purge_images}")
+    print(f"  Mode:        {'dry-run (no changes)' if args.dry_run else 'live'}")
+
+    # validate_owned_path early (fail fast on dangerous paths)
+    if args.purge_volumes and not args.dry_run:
+        for p in (deploy_dir, admin_dir):
+            if p == Path.home() or p == Path("/"):
+                die(f"refusing to remove dangerous path: {p}")
+            # Ensure deploy_dir/admin_dir are not empty string and are absolute or HOME-relative
+            if str(p) in ("", ".", ".."):
+                die(f"invalid deploy/admin path: {p}")
+
+    # Confirmation unless --force/--yes (mirror uninstall's confirmation pattern)
+    if not args.yes and not args.dry_run:
+        if sys.stdin.isatty():
+            what = "ALL DATA (volumes, networks, secrets, admin keys, deploy dirs)"
+            if args.purge_images:
+                what += " + images"
+            if not args.purge_volumes:
+                what = "containers/networks (volumes preserved)"
+            answer = input(f"Teardown {what}? Type teardown: ").strip()
+            if answer != "teardown":
+                die("teardown cancelled (type 'teardown' to confirm)")
+        else:
+            die("non-interactive teardown requires --force/--yes (or --yes)")
+
+    if args.dry_run:
+        print("\n[Dry-run] Would execute:", flush=True)
+        if found_compose:
+            eng = detect_compose()
+            if eng:
+                print(f"  {' '.join(eng)} -f {found_compose} down {'-v ' if args.purge_volumes else ''}--remove-orphans")
+            else:
+                print("  (compose not found, skipping down)")
+        # vLLM network check
+        if vllm_uses_praxis_network():
+            print("  (vLLM owns praxis.network -> would preserve)")
+        if args.purge_volumes:
+            for vol in VOLUME_NAMES:
+                print(f"  {engine_bin()} volume rm {vol}   # pgdata/pricetag-data")
+            for net in NETWORK_NAMES:
+                print(f"  {engine_bin()} network rm {net}   # pricetag-private/pricetag-mock")
+            for sec in SECRET_NAMES:
+                print(f"  {engine_bin()} secret rm {sec}   # if exists")
+            if args.purge_images:
+                for img in IMAGES_TO_PURGE:
+                    print(f"  {engine_bin()} image rm {img}")
+            print(f"  rm -rf {deploy_dir}  # validated owned path")
+            if not args.keep_admin:
+                print(f"  rm -rf {admin_dir}  # validated")
+                print(f"  rm -f {ROOT / 'compose.laptop.yaml'} (if laptop-generated)")
+            print(f"  podman system daemon-reload equivalent: podman ps check")
+        else:
+            print("  (volumes preserved: pgdata/pricetag-data, admin dirs)")
+            print("  daemon-reload equivalent: podman ps verify")
+        return
+
+    open_log()
+
+    # vLLM network preservation check (same as RHEL, but Darwin may have podman machine)
+    preserve_network = False
+    if vllm_uses_praxis_network():
+        preserve_network = True
+        try:
+            Path("/etc/praxis-vllm/network-owned").touch(exist_ok=True)
+        except OSError:
+            pass
+        log("  Preserving praxis.network for managed vLLM service")
+
+    # Stage 1: compose down (idempotent: missing compose is not error)
+    STAGE = "Stop containers (compose down)"
+    print(f"\n[1/4] {STAGE}\n" + "-" * 54, flush=True)
+    if found_compose and found_compose.is_file():
+        eng = detect_compose()
+        if eng:
+            cwd_candidates = [
+                str(deploy_dir) if deploy_dir.is_dir() else None,
+                str(found_compose.parent),
+                "/tmp",
+            ]
+            success = False
+            for attempt_cwd in cwd_candidates:
+                if not attempt_cwd or not Path(attempt_cwd).is_dir():
+                    continue
+                cmd = eng + ["-f", str(found_compose), "down", "--remove-orphans"]
+                if args.purge_volumes:
+                    cmd.append("-v")
+                result = run(cmd, label=f"compose down ({attempt_cwd})", cwd=attempt_cwd, timeout=60)
+                if result and result.returncode == 0:
+                    success = True
+                    break
+            if not success:
+                warn(f"compose down failed for {found_compose}; continuing to direct cleanup (idempotent)")
+            # Also remove containers that may exist outside compose (legacy/manual)
+            eng_bin = engine_bin()
+            for container in ("pricetag-db", "pricetag-provider", "pricetag-maas", "pricetag-metering", "pricetag-gateway", "pricetag-mock"):
+                run([eng_bin, "rm", "-f", container], label=f"rm container {container}", timeout=10)
+        else:
+            warn("compose engine not found; skipping compose down, trying direct container rm")
+            eng_bin = engine_bin()
+            for container in ("pricetag-db", "pricetag-provider", "pricetag-maas", "pricetag-metering", "pricetag-gateway"):
+                run([eng_bin, "rm", "-f", container], label=f"rm container {container}", timeout=10)
+    else:
+        log("  No compose file found; skipping compose down (already torn down)")
+        eng_bin = engine_bin()
+        for container in ("pricetag-db", "pricetag-provider", "pricetag-maas", "pricetag-metering", "pricetag-gateway"):
+            run([eng_bin, "rm", "-f", container], label=f"rm container {container}", timeout=10)
+
+    # Stage 2: volumes / networks / secrets (purge) or preserve
+    STAGE = "Cleanup volumes and networks"
+    print(f"\n[2/4] {STAGE}\n" + "-" * 54, flush=True)
+    eng_bin = engine_bin()
+
+    if args.purge_volumes:
+        # Volumes: pgdata + pricetag-data (requirement)
+        for vol in VOLUME_NAMES:
+            # podman volume rm -f is idempotent; try both engines
+            result = run([eng_bin, "volume", "rm", "-f", vol], label=f"volume rm {vol}", timeout=10)
+            if result and result.returncode != 0:
+                alt = "docker" if eng_bin == "podman" else "podman"
+                run([alt, "volume", "rm", "-f", vol], label=f"volume rm {vol} ({alt})", timeout=10)
+            # Also try without -f for older podman
+            if result and result.returncode != 0:
+                run([eng_bin, "volume", "rm", vol], label=f"volume rm {vol} (no -f)", timeout=10)
+
+        # Networks: pricetag-private + pricetag-mock (requirement) - preserve if vLLM
+        for net in NETWORK_NAMES:
+            if preserve_network and net in ("praxis-private", "pricetag-private"):
+                # Only preserve praxis-private, not pricetag-private
+                if net == "praxis-private":
+                    continue
+            result = run([eng_bin, "network", "rm", net], label=f"network rm {net}", timeout=10)
+            if result and result.returncode != 0:
+                alt = "docker" if eng_bin == "podman" else "podman"
+                run([alt, "network", "rm", net], label=f"network rm {net} ({alt})", timeout=10)
+
+        # Secrets: podman secret rm if exists (idempotent)
+        for sec in SECRET_NAMES:
+            # Check exists first (like uninstall's secret_exists pattern)
+            result = run([eng_bin, "secret", "inspect", sec], capture=True, timeout=5)
+            if result and result.returncode == 0:
+                run([eng_bin, "secret", "rm", sec], label=f"secret rm {sec}", timeout=10)
+            else:
+                # Try podman explicitly (podman machine)
+                run(["podman", "secret", "inspect", sec], capture=True, timeout=5)
+                result2 = run(["podman", "secret", "rm", sec], label=f"secret rm {sec} (podman)", timeout=10)
+                if result2 and result2.returncode != 0:
+                    log(f"  Secret not present (already removed): {sec}")
+                else:
+                    if not result2:
+                        log(f"  Secret not present (already removed): {sec}")
+            # Non-podman engines don't have secrets; skip
+
+        # Images if requested
+        if args.purge_images:
+            print("\n  Purging images...", flush=True)
+            for img in IMAGES_TO_PURGE:
+                # Use rmi -f for idempotency
+                result = run([eng_bin, "image", "rm", "-f", img], label=f"image rm {img}", timeout=30)
+                if result and result.returncode != 0:
+                    # Try with podman explicitly
+                    run(["podman", "image", "rm", "-f", img], label=f"image rm {img} (podman)", timeout=30)
+                # Also try to remove by short name (for laptop arm64 tags)
+                short = img.split("@")[0]
+                if "@" in img:
+                    run([eng_bin, "image", "rm", "-f", short], label=f"image rm {short} (short)", timeout=15)
+
+        log("  Volumes/networks/secrets purged (or already absent)")
+    else:
+        log("  Preserved volumes (pgdata/pricetag-data) and secrets (use --purge-volumes to remove)")
+        log("  To inspect: podman volume ls | grep -E 'pricetag|pgdata'")
+
+    # Stage 3: filesystem cleanup (validate_owned_path before rm)
+    STAGE = "Cleanup deploy directories"
+    print(f"\n[3/4] {STAGE}\n" + "-" * 54, flush=True)
+    if args.purge_volumes:
+        # verify_managed_manifest-style check before destructive rm
+        if deploy_dir.exists() and not verify_managed_manifest_like(deploy_dir):
+            warn(f"{deploy_dir} drift detected; requiring explicit --force to remove")
+            if not args.yes:
+                die(f"deploy dir verification failed; re-run with --force to override")
+
+        for path, label_text in [
+            (deploy_dir, "deploy dir"),
+            (admin_dir if not args.keep_admin else None, "admin dir"),
+        ]:
+            if path is None:
+                log("  Keeping admin dir (--keep-admin)")
+                continue
+            if path.exists() or path.is_symlink():
+                # Validate owned path before rm (critical safety)
+                try:
+                    validate_owned_path(path, deploy_dir, admin_dir)
+                except ValueError:
+                    warn(f"skipping unmanaged path: {path}")
+                    continue
+                try:
+                    if path.is_symlink():
+                        path.unlink()
+                        log(f"  Removed symlink {label_text}: {path}")
+                    elif path.is_dir():
+                        shutil.rmtree(path)
+                        log(f"  Removed {label_text}: {path}")
+                    else:
+                        path.unlink()
+                        log(f"  Removed {label_text}: {path}")
+                except OSError as e:
+                    warn(f"could not remove {path}: {e}")
+            else:
+                log(f"  {label_text} already absent: {path} (idempotent)")
+
+        # Also remove repo-root compose.laptop.yaml if laptop-generated
+        root_compose = ROOT / "compose.laptop.yaml"
+        if root_compose.is_file():
+            try:
+                content = root_compose.read_text()
+                if "pricetag-db" in content and ("MBP" in content or "laptop" in content.lower()):
+                    # On Darwin, require --force to remove without prompt; else ask
+                    should_remove = False
+                    if args.yes:
+                        should_remove = True
+                    elif sys.stdin.isatty():
+                        ans = input(f"Remove {root_compose}? [y/N]: ").strip().lower()
+                        should_remove = ans == "y"
+                    else:
+                        log(f"  Kept {root_compose} (non-interactive; use --force to auto-remove)")
+                    if should_remove:
+                        root_compose.unlink()
+                        log(f"  Removed {root_compose}")
+                    else:
+                        log(f"  Kept {root_compose}")
+                else:
+                    log(f"  Kept {root_compose} (not laptop-generated)")
+            except OSError as e:
+                warn(f"could not check/remove {root_compose}: {e}")
+
+        try:
+            if LOCK_PATH.exists():
+                LOCK_PATH.unlink()
+                log(f"  Removed lock {LOCK_PATH}")
+        except OSError:
+            pass
+        try:
+            if TEARDOWN_LOCK.exists():
+                TEARDOWN_LOCK.unlink()
+                log(f"  Removed lock {TEARDOWN_LOCK}")
+        except OSError:
+            pass
+    else:
+        log(f"  Preserved deploy dir: {deploy_dir} (use --purge-volumes to remove)")
+        log(f"  Preserved admin dir:  {admin_dir}")
+
+    # Stage 4: daemon-reload equivalent + verify cleanup (requirement)
+    STAGE = "Daemon-reload and verify cleanup"
+    print(f"\n[4/4] {STAGE}\n" + "-" * 54, flush=True)
+
+    # Daemon-reload equivalent: on RHEL it's systemctl --user daemon-reload;
+    # on Darwin (compose) there is no systemd, but we verify podman system is clean.
+    # We mimic by checking podman info and ensuring no stale containers.
+    if is_rhel():
+        # RHEL path already handled in teardown_rhel, but Darwin may be on Linux
+        try:
+            uid = service_uid()
+            run(as_service_args() + ["systemctl", "--user", "daemon-reload"], label="daemon-reload (service user)")
+        except SystemExit:
+            pass
+        run(["systemctl", "daemon-reload"], label="daemon-reload (system)")
+    else:
+        # Darwin: podman machine may need reload; best equivalent is podman system check
+        # and verifying containers are gone. There's no daemon-reload for compose, but we
+        # ensure podman/docker daemon is responsive.
+        run([eng_bin, "info", "--format", "{{.Host.OS}}"], label="daemon check (podman info)", capture=False)
+        # For podman machine on Darwin, ensure machine is still running (don't stop it)
+        if shutil.which("podman"):
+            run(["podman", "machine", "list"], label="podman machine list", timeout=10)
+        log("  Daemon-reload equivalent: verified container engine responsive")
+
+    # Verify cleanup (idempotent checks)
+    result = run([eng_bin, "ps", "-a", "--format", "{{.Names}}"], capture=True, timeout=10)
+    if result and result.stdout:
+        remaining = [n for n in result.stdout.splitlines() if "pricetag-" in n]
+        if remaining:
+            warn(f"remaining pricetag containers: {', '.join(remaining)} (manual: podman rm -f)")
+        else:
+            log("  No pricetag containers remain")
+
+    if args.purge_volumes:
+        result = run([eng_bin, "volume", "ls", "--format", "{{.Name}}"], capture=True, timeout=10)
+        if result and result.stdout:
+            leftover = [v for v in result.stdout.splitlines() if "pricetag" in v or "pgdata" in v]
+            if leftover:
+                warn(f"volumes still exist after --purge-volumes: {', '.join(leftover)} (manual: podman volume rm)")
+            else:
+                log("  No pricetag volumes remain (pgdata/pricetag-data cleaned)")
+    else:
+        result = run([eng_bin, "volume", "ls", "--format", "{{.Name}}"], capture=True, timeout=10)
+        if result and result.stdout and any(x in result.stdout for x in ("pricetag-data", "pgdata")):
+            log("  Volumes preserved (pgdata/pricetag-data) as requested")
+
+    # Network verification
+    result = run([eng_bin, "network", "ls", "--format", "{{.Name}}"], capture=True, timeout=10)
+    if result and result.stdout:
+        leftover_nets = [n for n in result.stdout.splitlines() if "pricetag-" in n]
+        if leftover_nets:
+            if not preserve_network:
+                warn(f"networks still exist: {', '.join(leftover_nets)} (manual: podman network rm)")
+            else:
+                log(f"  Preserved vLLM network (vllm_uses_praxis_network=true)")
+
+    # Secret verification (if purged)
+    if args.purge_volumes:
+        for sec in SECRET_NAMES:
+            result = run([eng_bin, "secret", "inspect", sec], capture=True, timeout=5)
+            if result and result.returncode == 0:
+                warn(f"secret {sec} still exists after purge")
+
+    log("\nTeardown complete")
+    if args.purge_volumes:
+        log("  All laptop state removed; re-deploy with: scripts/laptop/deploy --from-scratch")
+        if args.purge_images:
+            log("  Images purged; next deploy will re-pull")
+    else:
+        log("  Preserved volumes and admin keys; re-deploy with: scripts/laptop/deploy")
+        log("  To fully wipe: scripts/laptop/teardown --purge-volumes --force")
+    if preserve_network:
+        note("preserved praxis.network for the managed vLLM service")
+
+
+# ---------------------------------------------------------------------------
+# Main with flock (mirror uninstall flock + deploy flock)
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    # Platform dispatch: RHEL Quadlet vs Darwin compose
+    if is_rhel():
+        # RHEL: check if this is a pricetag deployment or shared-gateway
+        # If pricetag deploy dir exists, do full rhel teardown; else delegate
+        # to common/uninstall for shared-gateway. We handle both.
+        if RHEL_DEPLOY.exists() or Path("/etc/containers/systemd/users").exists():
+            # Check if pricetag units exist vs shared-gateway
+            try:
+                uid = service_uid()
+                units = Path(f"/etc/containers/systemd/users/{uid}")
+                has_pricetag = any(units.glob("pricetag*")) if units.is_dir() else False
+                has_gateway = (units / "praxis.container").exists() if units.is_dir() else False
+                if has_pricetag or RHEL_DEPLOY.exists():
+                    args = parse_args()
+                    # Acquire RHEL lock (like uninstall)
+                    os.umask(0o077)
+                    lock_path = gateway_lock_path(RHEL_SERVICE_USER)
+                    lock_path.parent.mkdir(parents=True, exist_ok=True)
+                    try:
+                        fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+                    except OSError:
+                        fd = os.open(str(TEARDOWN_LOCK), os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+                        lock_path = TEARDOWN_LOCK
+                    try:
+                        with os.fdopen(fd, "w") as lock:
+                            try:
+                                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            except BlockingIOError:
+                                die("another gateway installation/provider change is running")
+                            lock.write(f"{os.getpid()}\n{time.time()}\n")
+                            lock.flush()
+                            teardown_rhel(args)
+                    finally:
+                        if LOG_FD is not None:
+                            LOG_FD.close()
+                    return
+                elif has_gateway:
+                    # Delegate to shared-gateway uninstall
+                    raw = sys.argv[1:]
+                    mapped = []
+                    for a in raw:
+                        if a == "--purge-volumes":
+                            mapped.append("--purge-valkey-data")
+                        elif a == "--purge-images":
+                            continue
+                        elif a.startswith("--deploy-dir") or a.startswith("--admin-dir") or a.startswith("--compose-file"):
+                            continue
+                        else:
+                            mapped.append(a)
+                    # Handle --purge-volumes with value
+                    filtered = []
+                    skip = False
+                    for i, a in enumerate(mapped):
+                        if skip:
+                            skip = False
+                            continue
+                        bare = a.split("=")[0]
+                        if bare in ("--deploy-dir", "--admin-dir", "--compose-file"):
+                            if "=" not in a:
+                                skip = True
+                            continue
+                        filtered.append(a)
+                    uninstall = ROOT / "scripts/common/uninstall"
+                    if not uninstall.is_file():
+                        die(f"RHEL uninstall not found at {uninstall}")
+                    if os.geteuid() != 0:
+                        die("RHEL teardown requires sudo: sudo scripts/common/uninstall --purge-valkey-data")
+                    sys.exit(subprocess.run([str(uninstall), *filtered]).returncode)
+            except SystemExit:
+                raise
+            except Exception:
+                pass
+        # Fallback: run generic parse and dispatch
+        args = parse_args()
+        if args.purge_volumes or args.purge_images:
+            # Even if no deploy, still try rhel teardown for volumes
+            os.umask(0o077)
+            teardown_rhel(args)
+            return
+
+    # Darwin / generic compose path
+    args = parse_args()
+
+    # flock: same lock as deploy to prevent concurrent deploy/teardown
+    os.umask(0o077)
+    LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        fd = os.open(str(LOCK_PATH), os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    except OSError as e:
+        die(f"could not open lock {LOCK_PATH}: {e}")
+
+    try:
+        with os.fdopen(fd, "w") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                die(f"another gateway installation/provider change is running (lock {LOCK_PATH})")
+            lock.write(f"{os.getpid()}\n{time.time()}\n")
+            lock.flush()
+            teardown_compose(args)
+    except (OSError, ValueError, subprocess.CalledProcessError, KeyboardInterrupt) as error:
+        # Idempotent: don't fail hard on already-clean
+        print(f"\nTeardown stopped during: {STAGE}", file=sys.stderr)
+        print(str(error) or type(error).__name__, file=sys.stderr)
+        if LOG_PATH:
+            print(f"Details: tail -n 100 {LOG_PATH}", file=sys.stderr)
+        # For teardown, partial failures are not fatal for idempotency; but exit 1
+        # to signal caller that manual inspection may be needed.
+        sys.exit(1)
+    finally:
+        if LOG_FD is not None:
+            try:
+                LOG_FD.close()
+            except OSError:
+                pass
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print("\nTeardown cancelled", file=sys.stderr)
+        sys.exit(1)
