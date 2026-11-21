@@ -8,18 +8,29 @@ import tarfile
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
-REVISION = 'b1c5ce0e82b4bd63525a7eccd9ecd4d010e153d5'
+REVISION = 'e4ba826d5b1469d7f1167428792e498ffb4d92c7'
+SOURCE = 'https://github.com/redhat-et/pricetag-metering'
+
+
+def default_tag(revision):
+    # Standalone use defaults to the tag the fresh installer imports
+    # (scripts/pricetag/install.py METERING_IMAGE); deriving it from the
+    # revision actually built keeps a --revision override from landing
+    # under a stale label.
+    return 'localhost/pricetag-metering:standalone-' + revision[:7]
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--source', required=True, type=Path, help='PriceTag Git checkout containing the selected revision')
     parser.add_argument('--platform', choices=['linux/amd64', 'linux/arm64'], help='defaults to container-engine host architecture')
-    parser.add_argument('--tag', default='localhost/pricetag-metering:upstream-b1c5ce0')
+    parser.add_argument('--tag', help='defaults to a standalone tag derived from the selected revision')
     parser.add_argument('--revision', default=REVISION, help='full source commit to test; defaults to the pinned source candidate')
     args = parser.parse_args()
     if not re.fullmatch(r'[0-9a-f]{40}', args.revision):
         parser.error('--revision must be a full lowercase Git commit SHA')
+    if not args.tag:
+        args.tag = default_tag(args.revision)
     with tempfile.TemporaryDirectory(prefix='pricetag-build-') as directory:
         path = Path(directory)
         archive = path / 'source.tar'
@@ -30,12 +41,12 @@ def main():
         with tarfile.open(archive) as source:
             source.extractall(context, filter='data')
         command = ['podman', 'build', '--label', 'org.opencontainers.image.revision=' + args.revision,
-                   '--label', 'org.opencontainers.image.source=https://github.com/Ladas/pricetag-metering',
+                   '--label', 'org.opencontainers.image.source=' + SOURCE,
                    '-f', str(ROOT / 'configs/pricetag/Containerfile.metering'), '-t', args.tag]
         if args.platform:
             command.extend(['--platform', args.platform])
         subprocess.run([*command, str(context)], check=True)
-    print('Built PriceTag fork revision ' + args.revision + '; inspect the image ID before deployment.')
+    print('Built PriceTag metering revision ' + args.revision + '; inspect the image ID before deployment.')
 
 
 if __name__ == '__main__':

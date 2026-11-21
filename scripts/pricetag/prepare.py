@@ -357,6 +357,7 @@ def main():
     env('metering.env', {'DATABASE_URL': metering_url,
         'M2M_AUTH_REQUIRED': 'true', 'M2M_SHARED_SECRET': m2m_secret,
         'SESSION_SECRET': secrets.token_urlsafe(48),
+        'DEPLOYMENT_MODE': 'standalone',
         'MANAGEMENT_API_SECRET': management_secret,
         'MANAGEMENT_PUBLIC_ORIGIN': f'https://{args.hostname}:8443',
         'WELCOME_GATEWAY_URL': f'https://{args.hostname}:8443',

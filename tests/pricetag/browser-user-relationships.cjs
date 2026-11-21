@@ -1,6 +1,7 @@
 'use strict';
 const downloadKey=require('./key-download.cjs');
 require('./mock-guard.cjs')();
+const collectUsers=require('./management-users.cjs');
 const {chromium}=require('playwright');
 const fs=require('node:fs'),path=require('node:path');
 const {X509Certificate,createHash}=require('node:crypto');
@@ -20,7 +21,7 @@ let stage='setup';
   const prefix='demo-relationship-'+Date.now(),names=[prefix+'-lead-a',prefix+'-lead-b',prefix+'-member'];
   stage='create three users through UI';
   for(const subject of names){await admin.locator('#user [name=subject]').fill(subject);await admin.locator('#user [name=name]').fill(subject);await done(admin,()=>admin.getByRole('button',{name:'Save user',exact:true}).click());}
-  async function users(){return await admin.evaluate(async()=>await(await fetch('/api/v1/management/users')).json());}
+  async function users(){return await admin.evaluate(collectUsers);}
   const initial=await users(),ids=names.map(n=>initial.find(u=>u.logins.includes(n)).user_id);
   async function relationship(user,manager,success=true){
    await admin.locator('#partner-users-search').fill(user);

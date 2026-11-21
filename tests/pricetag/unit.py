@@ -80,6 +80,29 @@ class PreparationTest(unittest.TestCase):
         self.assertNotIn({'model': 'model'}, routing.invalid_bodies(body, 'model', {'provider/model', 'model'}))
         self.assertIn({'model': 'model'}, routing.invalid_bodies(body, 'model', {'provider/model'}))
 
+    def test_demo_fixture_cleanup_walks_both_management_users_shapes(self):
+        spec = importlib.util.spec_from_file_location('demo_fixture', ROOT / 'tests/pricetag/rhel-demo-fixture.py')
+        fixture = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(fixture)
+        # The source-pinned metering build returns a paginated {data, has_more}
+        # envelope; the walk must advance the offset by the rows received.
+        pages = [{'data': [{'user_id': 'one'}, {'user_id': 'two'}], 'has_more': True},
+                 {'data': [{'user_id': 'three'}], 'has_more': False}]
+        requests = []
+
+        def envelope_page(offset):
+            requests.append(offset)
+            return pages.pop(0)
+        self.assertEqual(fixture.directory_rows(envelope_page),
+                         [{'user_id': 'one'}, {'user_id': 'two'}, {'user_id': 'three'}])
+        self.assertEqual(requests, [0, 2])
+        # An empty page ends the walk even when has_more is still set.
+        self.assertEqual(fixture.directory_rows(
+            lambda offset: {'data': [], 'has_more': True}), [])
+        # The published image returns a bare array in a single response.
+        bare = [{'user_id': 'one'}, {'user_id': 'two'}]
+        self.assertEqual(fixture.directory_rows(lambda offset: bare), bare)
+
     def test_alias_candidates_select_native_clusters_without_changing_models(self):
         original, models = prepare.mock_inputs(managed=True)
         result = prepare.render(original, models)

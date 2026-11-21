@@ -17,7 +17,7 @@ app-sre-prod and app-sre-stage environments; they require Quay credentials with
 | Component | This repository (previous) | EnMaaS-opps app-sre pin | Status |
 | --- | --- | --- | --- |
 | Praxis gateway | `quay.io/opendatahub/praxis-experimental@sha256:502f120f…` (praxis-proxy/experimental line, rev `5667c4ac`) | `quay.io/redhat-services-prod/enmaas-tenant/praxis-ai@sha256:bcc31cac…` (redhat-et/praxis-ai line, rev `d7ef08ce`) | Switched |
-| Metering | `quay.io/redhat-et/secure-single-server-pricetag-metering@sha256:dabb2f35…` | `quay.io/redhat-services-prod/enmaas-tenant/metering-service@sha256:4c2d485a…` | Blocked — needs the standalone layer upstreamed (see below) |
+| Metering | `quay.io/redhat-et/secure-single-server-pricetag-metering@sha256:dabb2f35…` | `quay.io/redhat-services-prod/enmaas-tenant/metering-service@sha256:4c2d485a…` | Unblocked — the standalone management layer is [PR #149](https://github.com/redhat-et/pricetag-metering/pull/149); this repository builds and deploys that source (validated 2026-11-12), and the tenant digest swap lands when the PR merges and Konflux rebuilds |
 | MaaS | `quay.io/redhat-et/secure-single-server-maas-standalone@sha256:0bec6ef5…` | `quay.io/enmaas/maas-api@sha256:bbf5b77a…` | Blocked — no standalone mode upstream (see below) |
 | PostgreSQL | `docker.io/library/postgres@sha256:996e9dc5…` | CNPG cluster / RDS (Kubernetes-specific) | Not applicable |
 
@@ -72,9 +72,16 @@ What is missing, confirmed against the running image:
 Upstream the standalone patch sets (the forks exist specifically to carry
 them), then switch the pins once EnMaaS builds include them:
 
-1. Metering: port `Ladas/pricetag-metering:feat/latest-upstream-standalone`
-   (management layer, file catalog) to `redhat-et/pricetag-metering`, from
-   where Konflux builds the tenant image.
+1. Metering: **done** — the fork consolidated its standalone layer into a
+   single commit that rebases cleanly onto current main; it is offered as
+   [redhat-et/pricetag-metering PR #149](https://github.com/redhat-et/pricetag-metering/pull/149)
+   (qualified by this repository's CI container suites and a full
+   single-host deployment on 2026-11-12). This repository builds that
+   source directly from `redhat-et/pricetag-metering` (the
+   `standalone-management` branch carries the pull request); once it
+   merges, follow `main`, let the image workflow publish, pin the
+   digest, and the EnMaaS tenant digest follows on Konflux's next build
+   cycle.
 2. MaaS: the official standalone home already exists — `redhat-et/maas-api`
    with its `MAAS_DEPLOYMENT_PROFILE=enmaas` profile. What is missing is a
    published image (no CI yet, though a `Dockerfile.konflux` is in tree).
