@@ -151,12 +151,24 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == "/v1/responses":
+            # The shim translates Chat Completions JSON, not SSE. Reject streaming
+            # explicitly instead of json.loads() failing on an SSE body (502).
+            if body.get("stream"):
+                data = json.dumps({"error": {
+                    "message": "streaming /v1/responses is not supported by this shim; retry with stream:false",
+                    "type": "invalid_request_error",
+                    "param": "stream",
+                }}).encode()
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
             chat_body = responses_to_chat(body)
             upstream_body = self._proxy_json("POST", "/v1/chat/completions", chat_body)
             if upstream_body is None:
                 return
-            # Handle streaming: passthrough with minimal translation would be more work;
-            # for now return non-streaming response even if stream was requested.
             result = json.loads(upstream_body)
             shaped = chat_to_responses(result, body.get("model", "fixture"))
             data = json.dumps(shaped).encode()

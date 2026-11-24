@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import json
 import os
 import pwd
 import re
@@ -707,10 +708,36 @@ def teardown_rhel(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 
 def teardown_compose(args: argparse.Namespace) -> None:
-    global STAGE
+    global STAGE, VOLUME_NAMES, NETWORK_NAMES, SECRET_NAMES
     deploy_dir = args.deploy_dir
     admin_dir = args.admin_dir
     compose_file = args.compose_file
+
+    # Ownership manifest: refuse to purge fixed-name resources without it.
+    manifest_path = deploy_dir / ".deploy-manifest.json"
+    manifest = None
+    if manifest_path.is_file():
+        try:
+            manifest = json.loads(manifest_path.read_text())
+        except (OSError, ValueError) as e:
+            die(f"invalid deployment manifest {manifest_path}: {e}")
+    if args.purge_volumes:
+        if manifest is None:
+            die(
+                f"refusing --purge-volumes: no deployment manifest at {manifest_path}; "
+                "re-run scripts/laptop/bootstrap --from-scratch or remove resources manually"
+            )
+        if Path(manifest.get("deploy_dir", "")).resolve() != deploy_dir.resolve():
+            die(f"refusing --purge-volumes: manifest deploy_dir mismatch ({manifest.get('deploy_dir')})")
+        VOLUME_NAMES = list(manifest.get("volumes") or [])
+        NETWORK_NAMES = list(manifest.get("networks") or [])
+        SECRET_NAMES = list(manifest.get("secrets") or [])
+        if not VOLUME_NAMES or not NETWORK_NAMES:
+            die("refusing --purge-volumes: manifest has no volumes/networks")
+    containers = (manifest.get("containers") if manifest else None) or [
+        "pricetag-db", "pricetag-provider", "pricetag-maas",
+        "pricetag-metering", "pricetag-gateway",
+    ]
 
     # Resolve compose file candidates (idempotent: try all locations)
     candidates = [
@@ -829,36 +856,30 @@ def teardown_compose(args: argparse.Namespace) -> None:
             if not success:
                 warn(f"compose down failed for {found_compose}; continuing to direct cleanup (idempotent)")
             # Also remove containers that may exist outside compose (legacy/manual)
-            eng_bin = engine_bin()
-            for container in ("pricetag-db", "pricetag-provider", "pricetag-maas", "pricetag-metering", "pricetag-gateway", "pricetag-mock"):
+            eng_bin = manifest.get("engine", engine_bin()) if manifest else engine_bin()
+            for container in containers:
                 run([eng_bin, "rm", "-f", container], label=f"rm container {container}", timeout=10)
         else:
             warn("compose engine not found; skipping compose down, trying direct container rm")
-            eng_bin = engine_bin()
-            for container in ("pricetag-db", "pricetag-provider", "pricetag-maas", "pricetag-metering", "pricetag-gateway"):
+            eng_bin = manifest.get("engine", engine_bin()) if manifest else engine_bin()
+            for container in containers:
                 run([eng_bin, "rm", "-f", container], label=f"rm container {container}", timeout=10)
     else:
         log("  No compose file found; skipping compose down (already torn down)")
-        eng_bin = engine_bin()
-        for container in ("pricetag-db", "pricetag-provider", "pricetag-maas", "pricetag-metering", "pricetag-gateway"):
+        eng_bin = manifest.get("engine", engine_bin()) if manifest else engine_bin()
+        for container in containers:
             run([eng_bin, "rm", "-f", container], label=f"rm container {container}", timeout=10)
 
     # Stage 2: volumes / networks / secrets (purge) or preserve
     STAGE = "Cleanup volumes and networks"
     print(f"\n[2/4] {STAGE}\n" + "-" * 54, flush=True)
-    eng_bin = engine_bin()
+    eng_bin = manifest.get("engine", engine_bin()) if manifest else engine_bin()
 
     if args.purge_volumes:
         # Volumes: pgdata + pricetag-data (requirement)
         for vol in VOLUME_NAMES:
-            # podman volume rm -f is idempotent; try both engines
-            result = run([eng_bin, "volume", "rm", "-f", vol], label=f"volume rm {vol}", timeout=10)
-            if result and result.returncode != 0:
-                alt = "docker" if eng_bin == "podman" else "podman"
-                run([alt, "volume", "rm", "-f", vol], label=f"volume rm {vol} ({alt})", timeout=10)
-            # Also try without -f for older podman
-            if result and result.returncode != 0:
-                run([eng_bin, "volume", "rm", vol], label=f"volume rm {vol} (no -f)", timeout=10)
+            # Only the manifest engine; never touch another engine's store.
+            run([eng_bin, "volume", "rm", "-f", vol], label=f"volume rm {vol}", timeout=10)
 
         # Networks: pricetag-private + pricetag-mock (requirement) - preserve if vLLM
         for net in NETWORK_NAMES:
@@ -866,38 +887,21 @@ def teardown_compose(args: argparse.Namespace) -> None:
                 # Only preserve praxis-private, not pricetag-private
                 if net == "praxis-private":
                     continue
-            result = run([eng_bin, "network", "rm", net], label=f"network rm {net}", timeout=10)
-            if result and result.returncode != 0:
-                alt = "docker" if eng_bin == "podman" else "podman"
-                run([alt, "network", "rm", net], label=f"network rm {net} ({alt})", timeout=10)
+            run([eng_bin, "network", "rm", net], label=f"network rm {net}", timeout=10)
 
-        # Secrets: podman secret rm if exists (idempotent)
+        # Secrets: only the manifest engine (no cross-engine fallback)
         for sec in SECRET_NAMES:
-            # Check exists first (like uninstall's secret_exists pattern)
             result = run([eng_bin, "secret", "inspect", sec], capture=True, timeout=5)
             if result and result.returncode == 0:
                 run([eng_bin, "secret", "rm", sec], label=f"secret rm {sec}", timeout=10)
             else:
-                # Try podman explicitly (podman machine)
-                run(["podman", "secret", "inspect", sec], capture=True, timeout=5)
-                result2 = run(["podman", "secret", "rm", sec], label=f"secret rm {sec} (podman)", timeout=10)
-                if result2 and result2.returncode != 0:
-                    log(f"  Secret not present (already removed): {sec}")
-                else:
-                    if not result2:
-                        log(f"  Secret not present (already removed): {sec}")
-            # Non-podman engines don't have secrets; skip
+                log(f"  Secret not present (already removed): {sec}")
 
-        # Images if requested
+        # Images if requested (manifest engine only)
         if args.purge_images:
             print("\n  Purging images...", flush=True)
             for img in IMAGES_TO_PURGE:
-                # Use rmi -f for idempotency
-                result = run([eng_bin, "image", "rm", "-f", img], label=f"image rm {img}", timeout=30)
-                if result and result.returncode != 0:
-                    # Try with podman explicitly
-                    run(["podman", "image", "rm", "-f", img], label=f"image rm {img} (podman)", timeout=30)
-                # Also try to remove by short name (for laptop arm64 tags)
+                run([eng_bin, "image", "rm", "-f", img], label=f"image rm {img}", timeout=30)
                 short = img.split("@")[0]
                 if "@" in img:
                     run([eng_bin, "image", "rm", "-f", short], label=f"image rm {short} (short)", timeout=15)

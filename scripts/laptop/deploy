@@ -762,6 +762,8 @@ def generate_compose_yaml(
     llm_katan_env_path: str = f"{deploy_dir_abs}/llm-katan.env"
     m2m_secret_path: str = f"{deploy_dir_abs}/m2m-secret"
     mock_secret_path: str = f"{deploy_dir_abs}/mock-secret"
+    # Loopback by default; expose on 0.0.0.0 only when a non-loopback hostname is requested.
+    gateway_bind: str = "127.0.0.1" if args.hostname in ("localhost", "127.0.0.1", "::1") else "0.0.0.0"
 
     if with_llm:
         if llm_katan_backend == "echo":
@@ -1050,7 +1052,7 @@ services:
       - pricetag-m2m
       - pricetag-mock-ui-v1
     ports:
-      - "0.0.0.0:8443:8443"
+      - "{gateway_bind}:8443:8443"
     depends_on:
       pricetag-maas:
         condition: service_started
@@ -1558,6 +1560,23 @@ def prepare_deployment(args: argparse.Namespace, arch: str) -> dict[str, Any]:
     logger.info("Wrote %s and %s", deploy_dir / "compose.laptop.yaml", compose_path)
 
     (deploy_dir / ".prepared").write_text(f"{time.time()}\n")
+    # Deployment manifest: teardown refuses to purge fixed-name resources without it.
+    engine_name = "podman" if shutil.which("podman") else "docker"
+    manifest = {
+        "version": 1,
+        "deployment_id": secrets.token_hex(16),
+        "compose_file": str(compose_path),
+        "deploy_dir": str(deploy_dir),
+        "admin_dir": str(admin_dir),
+        "engine": engine_name,
+        "containers": ["pricetag-db", "pricetag-provider", "pricetag-maas",
+                       "pricetag-metering", "pricetag-gateway"],
+        "volumes": ["pricetag-data"],
+        "networks": ["pricetag-private", "pricetag-mock"],
+        "secrets": ["pricetag-m2m", "pricetag-mock-ui-v1"],
+    }
+    (deploy_dir / ".deploy-manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    os.chmod(deploy_dir / ".deploy-manifest.json", 0o600)
 
     return {
         "deploy_dir": deploy_dir,
@@ -1898,17 +1917,12 @@ def start_services(args: argparse.Namespace, state: dict[str, Any]) -> None:
     bootstrap_done = deploy_dir / "bootstrap.done"
     if not bootstrap_done.exists():
         print("  Bootstrapping PriceTag metering (users/budgets/prices)...", flush=True)
-        try:
-            bootstrap_via_http(deploy_dir, admin_dir)
-            bootstrap_done.write_text("1\n")
-            os.chmod(bootstrap_done, 0o600)
-            print("  PriceTag bootstrap OK", flush=True)
-            logger.info("PriceTag bootstrap OK")
-        except Exception as e:
-            print(f"  WARN: bootstrap failed: {e}; check metering logs", flush=True)
-            logger.warning("bootstrap failed: %s", e)
-            if LOG_FD:
-                LOG_FD.write(f"bootstrap failed: {e}\n")
+        # Required policy/users/budgets must succeed; bootstrap_via_http raises.
+        bootstrap_via_http(deploy_dir, admin_dir)
+        bootstrap_done.write_text("1\n")
+        os.chmod(bootstrap_done, 0o600)
+        print("  PriceTag bootstrap OK", flush=True)
+        logger.info("PriceTag bootstrap OK")
     else:
         print("  PriceTag bootstrap already done (idempotent)", flush=True)
 
@@ -1976,34 +1990,27 @@ def start_services(args: argparse.Namespace, state: dict[str, Any]) -> None:
     print("  Waiting for gateway https://localhost:8443/login ...", flush=True)
     import ssl
     ca_pem = deploy_dir / "ca.pem"
-    if ca_pem.is_file():
-        context = ssl.create_default_context(cafile=str(ca_pem))
-    else:
-        context = ssl._create_unverified_context()
+    if not ca_pem.is_file():
+        raise RuntimeError(f"gateway CA missing: {ca_pem}; cannot verify TLS readiness")
+    context = ssl.create_default_context(cafile=str(ca_pem))
+    ready = False
     for _ in range(60):
         try:
             import urllib.request
             opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=context))
             with opener.open("https://localhost:8443/login", timeout=2) as resp:
                 if resp.status == 200:
-                    print("  Gateway HTTPS OK", flush=True)
-                    logger.info("Gateway HTTPS OK")
+                    ready = True
                     break
         except Exception:
-            try:
-                ctx2 = ssl._create_unverified_context()
-                opener2 = urllib.request.build_opener(urllib.request.HTTPSHandler(context=ctx2))
-                with opener2.open("https://localhost:8443/login", timeout=2) as resp:
-                    if resp.status == 200:
-                        print("  Gateway HTTPS OK (unverified CA)", flush=True)
-                        break
-            except Exception:
-                pass
             time.sleep(0.5)
-    else:
-        print("  WARN: gateway HTTPS not ready (https://localhost:8443/login); check logs: podman-compose logs pricetag-gateway", flush=True)
-        print(f"  HINT: CA: {deploy_dir / 'ca.pem'} - copy to clients and trust, or curl -k", flush=True)
-        logger.warning("gateway HTTPS not ready")
+    if not ready:
+        raise RuntimeError(
+            "gateway HTTPS did not pass verified CA readiness "
+            f"(https://localhost:8443/login, CA {ca_pem}); "
+            "check logs: podman-compose logs pricetag-gateway")
+    print("  Gateway HTTPS OK (verified CA)", flush=True)
+    logger.info("Gateway HTTPS OK")
 
     print("\nInstallation complete", flush=True)
     print(f"  Dashboard: https://{args.hostname}:8443/login", flush=True)
@@ -2044,12 +2051,10 @@ def bootstrap_via_http(deploy_dir: Path, admin_dir: Path) -> None:
         except urllib.error.HTTPError as e:
             raise RuntimeError(f"metering {resource} returned HTTP {e.code}") from None
 
-    try:
-        request("PUT", "policy", {"default_monthly_usd": config["monthly_usd"], "enforced": True,
-                                   "allowed_over_limit_models": []})
-    except RuntimeError as e:
-        print(f"  WARN: policy put failed: {e}", flush=True)
-        logger.warning("policy put failed: %s", e)
+    # Required state: a failed policy/user/budget PUT must fail installation.
+    # Prices are optional (fallback is documented); policy/users are not.
+    request("PUT", "policy", {"default_monthly_usd": config["monthly_usd"], "enforced": True,
+                               "allowed_over_limit_models": []})
 
     try:
         existing = request("GET", "prices") or []
@@ -2065,7 +2070,7 @@ def bootstrap_via_http(deploy_dir: Path, admin_dir: Path) -> None:
             request("PUT", "prices", {"model": billed, "provider": model["provider"], "source_model": source})
             existing_models.add(billed)
     except Exception as e:
-        print(f"  WARN: price bootstrap failed: {e}", flush=True)
+        print(f"  WARN: price bootstrap failed (optional): {e}", flush=True)
         logger.warning("price bootstrap failed: %s", e)
 
     def provision(subject: str, name: str | None, budget: float | None, admin: bool = False) -> None:
@@ -2074,23 +2079,34 @@ def bootstrap_via_http(deploy_dir: Path, admin_dir: Path) -> None:
             body["name"] = name
         if admin:
             body["role"] = "super_admin"
-        try:
-            request("PUT", "users", body)
-        except Exception as e:
-            print(f"  WARN: provision {subject} failed: {e}", flush=True)
-            logger.warning("provision %s failed: %s", subject, e)
+        request("PUT", "users", body)
         if budget is not None:
-            try:
-                request("PUT", "budgets", {"subject": subject, "monthly_usd": budget})
-            except Exception as e:
-                print(f"  WARN: budget for {subject} failed: {e}", flush=True)
-                logger.warning("budget for %s failed: %s", subject, e)
+            request("PUT", "budgets", {"subject": subject, "monthly_usd": budget})
 
     provision("admin", "Administrator", None, admin=True)
     monthly = config.get("monthly_usd", 5)
     if (deploy_dir / "sample-users").read_text().strip() == "yes":
         for subj in ("alice", "bob"):
             provision(subj, subj.capitalize(), monthly)
+
+    # Verify required state before the caller writes bootstrap.done.
+    try:
+        policy = request("GET", "policy") or {}
+        if policy.get("default_monthly_usd") != config["monthly_usd"]:
+            raise RuntimeError("policy verification failed")
+        users = request("GET", "users") or []
+        subjects = {u.get("subject") for u in users if isinstance(u, dict)}
+        for subj in ("admin", *(("alice", "bob") if (deploy_dir / "sample-users").read_text().strip() == "yes" else ())):
+            if subj not in subjects:
+                raise RuntimeError(f"user {subj} missing after bootstrap")
+        budgets = request("GET", "budgets") or []
+        budget_subjects = {b.get("subject") for b in budgets if isinstance(b, dict)}
+        if monthly is not None and (deploy_dir / "sample-users").read_text().strip() == "yes":
+            for subj in ("alice", "bob"):
+                if subj not in budget_subjects:
+                    raise RuntimeError(f"budget for {subj} missing after bootstrap")
+    except Exception as e:
+        raise RuntimeError(f"management bootstrap verification failed: {e}") from e
 
 
 # ---------------------------------------------------------------------------
