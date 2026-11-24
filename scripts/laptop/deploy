@@ -1541,6 +1541,8 @@ def prepare_deployment(args: argparse.Namespace, arch: str) -> dict[str, Any]:
         shim_dst_dir = deploy_dir / "shims"
         shim_dst_dir.mkdir(mode=0o750, exist_ok=True)
         for item in shim_src_dir.iterdir():
+            if not item.is_file():
+                continue
             dst = shim_dst_dir / item.name
             if not dst.exists():
                 shutil.copyfile(item, dst)

@@ -4,9 +4,12 @@ import http.client
 import importlib.machinery
 import importlib.util
 import json
+import sys
 import threading
 from http.server import ThreadingHTTPServer
 from pathlib import Path
+
+sys.dont_write_bytecode = True
 
 ROOT = Path(__file__).resolve().parents[2]
 SHIM = ROOT / "scripts/laptop/shims/responses_shim.py"
