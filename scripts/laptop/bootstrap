@@ -16,8 +16,9 @@ WITH_LLM=""
 RUN_TESTS=""
 DO_WIPE=""
 DO_STATUS=""
+DO_START=""
 
-usage(){ echo "Usage: $0 [--yes] [--from-scratch] [--with-llm-katan] [--run-tests] [--wipe] [--status]"; exit 0; }
+usage(){ echo "Usage: $0 [--yes] [--from-scratch] [--with-llm-katan] [--run-tests] [--wipe] [--status] [--start]"; exit 0; }
 for a in "$@"; do case "$a" in
   --yes) YES=--yes;;
   --from-scratch) FROM_SCRATCH=--from-scratch;;
@@ -25,6 +26,7 @@ for a in "$@"; do case "$a" in
   --run-tests) RUN_TESTS=1;;
   --wipe) DO_WIPE=1;;
   --status) DO_STATUS=1;;
+  --start) DO_START=1;;
   -h|--help) usage;;
   *) echo "unknown $a" >&2; usage;;
 esac; done
@@ -65,6 +67,12 @@ status(){
 
 do_install(){
   check_deps; ensure_machine
+  if [[ -f "$COMPOSE" ]] && ! is_deployed; then
+    echo "existing deployment found but containers stopped (after reboot?) → starting"
+    podman-compose -f "$COMPOSE" up -d 2>&1 | tail -n 5
+    status
+    exit 0
+  fi
   if is_deployed; then
     echo "already deployed $COMPOSE $(podman ps --format "{{.Names}} {{.Status}}" | grep pricetag-db | head)"
     if [[ -z "$FROM_SCRATCH" ]]; then
@@ -95,6 +103,13 @@ do_tests(){
 
 [[ -n "$DO_STATUS" ]] && status
 [[ -n "$DO_WIPE" ]] && { python3 "$TEARDOWN" --purge-volumes --yes; echo "wiped"; exit 0; }
+if [[ -n "$DO_START" ]]; then
+  check_deps; ensure_machine
+  [[ -f "$COMPOSE" ]] || { echo "not deployed yet; run without --start"; exit 1; }
+  podman-compose -f "$COMPOSE" up -d 2>&1 | tail -n 5
+  echo "started existing deployment; status:"
+  status
+fi
 
 if [[ -n "$RUN_TESTS" ]]; then do_install; do_tests; exit 0; fi
 if [[ $# -gt 0 ]]; then do_install; exit 0; fi
