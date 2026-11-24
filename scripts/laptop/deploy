@@ -559,6 +559,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--compose-file", type=Path, default=DEFAULT_COMPOSE_FILE,
                    help=f"compose file to generate (default: {DEFAULT_COMPOSE_FILE})")
     p.add_argument("--no-pull", action="store_true", help="skip image pulls (use local images)")
+    p.add_argument("--latest", action="store_true",
+                   help="resolve the newest active metering tag from quay.io for this deploy (not pinned)")
 
     args = p.parse_args(argv)
 
@@ -607,6 +609,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             LOG_FD.write(f"Using published MaaS image on MBP arm64 (manifest list, Rosetta fallback OK): {args.maas_image}\n")
     if not args.metering_image:
         args.metering_image = PUBLISHED_METERING_IMAGE
+    if args.latest:
+        # Resolve newest active tag from quay.io for this deployment only.
+        # --latest is intentionally not written back to the pinned constant.
+        try:
+            import ssl as _ssl
+            import urllib.request as _ur
+            url = ("https://quay.io/api/v1/repository/redhat-et/"
+                   "secure-single-server-pricetag-metering/tag/?limit=1&onlyActiveTags=true")
+            ctx = _ssl._create_unverified_context()
+            with _ur.urlopen(url, timeout=15, context=ctx) as resp:
+                data = json.load(resp)
+            tag = data["tags"][0]
+            digest = tag["manifest_digest"]
+            args.metering_image = (
+                "quay.io/redhat-et/secure-single-server-pricetag-metering@" + digest)
+            print(f"  --latest metering: {tag['name']} {digest}", flush=True)
+        except Exception as e:
+            print(f"  WARN: --latest metering resolve failed ({e}); using pinned {PUBLISHED_METERING_IMAGE}", flush=True)
 
     if args.image_mode == "published":
         for field in ("maas_image", "metering_image"):

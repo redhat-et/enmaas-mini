@@ -17,8 +17,9 @@ RUN_TESTS=""
 DO_WIPE=""
 DO_STATUS=""
 DO_START=""
+LATEST=""
 
-usage(){ echo "Usage: $0 [--yes] [--from-scratch] [--with-llm-katan] [--run-tests] [--wipe] [--status] [--start]"; exit 0; }
+usage(){ echo "Usage: $0 [--yes] [--from-scratch] [--with-llm-katan] [--run-tests] [--wipe] [--status] [--start] [--latest]"; exit 0; }
 for a in "$@"; do case "$a" in
   --yes) YES=--yes;;
   --from-scratch) FROM_SCRATCH=--from-scratch;;
@@ -27,6 +28,7 @@ for a in "$@"; do case "$a" in
   --wipe) DO_WIPE=1;;
   --status) DO_STATUS=1;;
   --start) DO_START=1;;
+  --latest) LATEST=--latest;;
   -h|--help) usage;;
   *) echo "unknown $a" >&2; usage;;
 esac; done
@@ -82,7 +84,7 @@ do_install(){
     fi
   fi
   # deploy is idempotent via flock $LOCK, disk ≥20GiB gate, postgres volume pre-create, maas-db-url absolute
-  exec python3 "$DEPLOY" --mode mock --hostname localhost $FROM_SCRATCH $YES $WITH_LLM
+  exec python3 "$DEPLOY" --mode mock --hostname localhost $FROM_SCRATCH $YES $WITH_LLM $LATEST
 }
 
 do_tests(){
@@ -141,8 +143,8 @@ while true; do
   echo "q) quit"
   read -rp "choice: " c
   case "$c" in
-    1) python3 "$DEPLOY" --mode mock --hostname localhost --yes $WITH_LLM;;
-    2) python3 "$DEPLOY" --mode mock --hostname localhost --from-scratch --yes $WITH_LLM;;
+    1) python3 "$DEPLOY" --mode mock --hostname localhost --yes $WITH_LLM $LATEST;;
+    2) python3 "$DEPLOY" --mode mock --hostname localhost --from-scratch --yes $WITH_LLM $LATEST;;
     3) python3 "$TEARDOWN" --purge-volumes --yes;;
     4) status;;
     5) do_tests;;
