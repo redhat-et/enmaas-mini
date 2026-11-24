@@ -2097,16 +2097,33 @@ def bootstrap_via_http(deploy_dir: Path, admin_dir: Path) -> None:
         if policy.get("default_monthly_usd") != config["monthly_usd"]:
             raise RuntimeError("policy verification failed")
         users = request("GET", "users") or []
-        subjects = {u.get("subject") for u in users if isinstance(u, dict)}
+        subjects: set[str] = set()
+        for item in users:
+            if not isinstance(item, dict):
+                continue
+            if item.get("subject"):
+                subjects.add(str(item["subject"]))
+            for login in item.get("logins") or []:
+                subjects.add(str(login))
+            first_name = (item.get("tags") or {}).get("first_name")
+            if first_name:
+                subjects.add(str(first_name).lower())
         for subj in ("admin", *(("alice", "bob") if (deploy_dir / "sample-users").read_text().strip() == "yes" else ())):
             if subj not in subjects:
-                raise RuntimeError(f"user {subj} missing after bootstrap")
+                raise RuntimeError(f"user {subj} missing after bootstrap (saw {sorted(subjects)})")
         budgets = request("GET", "budgets") or []
-        budget_subjects = {b.get("subject") for b in budgets if isinstance(b, dict)}
+        budget_subjects: set[str] = set()
+        for item in budgets:
+            if not isinstance(item, dict):
+                continue
+            if item.get("subject"):
+                budget_subjects.add(str(item["subject"]))
+            if item.get("principal"):
+                budget_subjects.add(str(item["principal"]))
         if monthly is not None and (deploy_dir / "sample-users").read_text().strip() == "yes":
             for subj in ("alice", "bob"):
                 if subj not in budget_subjects:
-                    raise RuntimeError(f"budget for {subj} missing after bootstrap")
+                    raise RuntimeError(f"budget for {subj} missing after bootstrap (saw {sorted(budget_subjects)})")
     except Exception as e:
         raise RuntimeError(f"management bootstrap verification failed: {e}") from e
 
