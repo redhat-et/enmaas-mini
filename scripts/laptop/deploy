@@ -1766,6 +1766,16 @@ def start_services(args: argparse.Namespace, state: dict[str, Any]) -> None:
 
     admin_dir: Path = state["admin_dir"]
     admin_key = admin_dir / "admin.key"
+    # --from-scratch recreates the MaaS database; old keys in ADMIN are invalid.
+    if getattr(args, "from_scratch", False):
+        for key_name in ("admin.key", "alice.key", "bob.key"):
+            old_key = admin_dir / key_name
+            if old_key.exists():
+                try:
+                    old_key.unlink()
+                except OSError:
+                    pass
+        print("  --from-scratch: cleared old MaaS keys (admin/alice/bob)", flush=True)
     if not admin_key.exists() or not admin_key.stat().st_size:
         print(f"  Creating MaaS admin key at {admin_key} ...", flush=True)
         maas_key_script = ROOT / "scripts/pricetag/maas-key"
