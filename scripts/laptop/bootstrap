@@ -87,18 +87,32 @@ do_install(){
 
 do_tests(){
   CA="$DEPLOY_DIR/ca.pem"; [[ -f "$CA" ]] || CA="$ADMIN_DIR/tls/ca.pem"
-  echo "— perf smoke 20×200 —"
-  # Laptop has no sudo/praxis-svc, so create bench user directly via gateway (host 127.0.0.1:18086 403 on Darwin NAT)
-  rm -rf /tmp/perf-bootstrap; mkdir -p /tmp/perf-bootstrap
-  SUBJ=perf-bootstrap-00
+  echo "— perf smoke 20×200 (fixture 2+3=5) —"
+  # unique user per run avoids double-count from previous runs (expected vs actual mismatch)
+  SUBJ="perf-bootstrap-$(date +%Y%m%d-%H%M%S)"
+  TOKENS="/tmp/$SUBJ"; REPORT="/tmp/$SUBJ.json"
+  rm -rf "$TOKENS" "$REPORT"; mkdir -p "$TOKENS"
   TOKEN=$(podman exec pricetag-gateway curl -s -X POST -H "X-MaaS-Username: $SUBJ" -H "X-MaaS-Group: [\"system:authenticated\"]" -H "Content-Type: application/json" -d "{\"name\":\"$SUBJ\",\"expiresIn\":\"90d\"}" http://pricetag-maas:8080/v1/api-keys 2>/dev/null | python3 -c "import sys,json;print(json.load(sys.stdin).get(\"key\",\"\"))")
-  if [[ -z "$TOKEN" ]]; then echo "perf user create failed (MaaS not ready)"; return 1; fi
-  echo "$TOKEN" > /tmp/perf-bootstrap/$SUBJ.key; chmod 600 /tmp/perf-bootstrap/$SUBJ.key
-  MGMT=$(cat "$DEPLOY_DIR/management-secret"); curl -s -X PUT -H "Authorization: Bearer $MGMT" -H "Content-Type: application/json" -d "{\"subject\":\"$SUBJ\",\"name\":\"$SUBJ\"}" http://127.0.0.1:18087/api/v1/management/users >/dev/null; curl -s -X PUT -H "Authorization: Bearer $MGMT" -H "Content-Type: application/json" -d "{\"subject\":\"$SUBJ\",\"monthly_usd\":100}" http://127.0.0.1:18087/api/v1/management/budgets >/dev/null
-  echo "bench user $SUBJ ready"
-  rm -f /tmp/perf-bootstrap.json
-  python3 "$ROOT/scripts/pricetag/perf" run --model fixture --url https://localhost:8443 --ca "$CA" --tokens /tmp/perf-bootstrap --concurrency 1 --requests 20 --think 0 --output /tmp/perf-bootstrap.json 2>&1 | tail -n 5
-  python3 "$ROOT/scripts/pricetag/perf" verify --report /tmp/perf-bootstrap.json --database pricetag-db 2>&1 | tail -n 5
+  if [[ -z "$TOKEN" ]]; then echo "FAIL: could not create MaaS key (is MaaS healthy?)"; return 1; fi
+  echo "$TOKEN" > "$TOKENS/$SUBJ.key"; chmod 600 "$TOKENS/$SUBJ.key"
+  MGMT=$(cat "$DEPLOY_DIR/management-secret")
+  curl -s -X PUT -H "Authorization: Bearer $MGMT" -H "Content-Type: application/json" -d "{\"subject\":\"$SUBJ\",\"name\":\"$SUBJ\"}" http://127.0.0.1:18087/api/v1/management/users >/dev/null
+  curl -s -X PUT -H "Authorization: Bearer $MGMT" -H "Content-Type: application/json" -d "{\"subject\":\"$SUBJ\",\"monthly_usd\":100}" http://127.0.0.1:18087/api/v1/management/budgets >/dev/null
+  echo "  user: $SUBJ"
+  python3 "$ROOT/scripts/pricetag/perf" run --model fixture --url https://localhost:8443 --ca "$CA" --tokens "$TOKENS" --concurrency 1 --requests 20 --think 0 --output "$REPORT" >/dev/null 2>&1 || { echo "FAIL: perf run failed"; tail -n 5 "$REPORT" 2>/dev/null; return 1; }
+  python3 - "$REPORT" <<'PY'
+import json, sys
+d=json.load(open(sys.argv[1])); p=d['phases'][0]
+print(f"  result: {p['successes']}/{p['attempts']} succeeded  statuses={p['statuses']}")
+print(f"  latency: p50 {p['p50_seconds']:.2f}s  p95 {p['p95_seconds']:.2f}s  p99 {p['p99_seconds']:.2f}s")
+PY
+  if python3 "$ROOT/scripts/pricetag/perf" verify --report "$REPORT" --database pricetag-db >/dev/null 2>&1; then
+    echo "  ledger: PASS (2 prompt + 3 completion = 5 tokens per request)"
+  else
+    echo "  ledger: FAIL (expected 2+3=5; check usage_events for $SUBJ)"
+    python3 "$ROOT/scripts/pricetag/perf" verify --report "$REPORT" --database pricetag-db 2>&1 | tail -n 3
+    return 1
+  fi
 }
 
 [[ -n "$DO_STATUS" ]] && status
