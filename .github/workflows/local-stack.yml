@@ -1,0 +1,93 @@
+name: Local stack qualification
+
+on:
+  pull_request:
+    paths:
+      - 'tests/external-services/**'
+      - 'tests/common/provider.py'
+      - 'scripts/pricetag/**'
+      - '.github/workflows/local-stack.yml'
+  workflow_dispatch:
+    inputs:
+      qualification:
+        description: Service contracts or mock streaming benchmark
+        type: choice
+        options: [services, benchmark]
+        default: services
+      phase_seconds:
+        description: Sustained benchmark phase duration
+        type: choice
+        options: ['65', '600']
+        default: '65'
+
+permissions:
+  contents: read
+
+jobs:
+  contracts:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-venv openssl zsh
+          python3 -m venv .state/test-venv
+          .state/test-venv/bin/pip install -r tests/aws/requirements.txt -r tests/external-services/stress-requirements.txt
+          PYTHONPATH=tests/external-services .state/test-venv/bin/python -m unittest discover -s tests/external-services/unit
+          .state/test-venv/bin/python tests/pricetag/install.py
+          .state/test-venv/bin/python tests/pricetag/install-orchestration.py
+
+  runtime:
+    # Full builds and services run explicitly; PRs always run the contracts above.
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      ENMAAS_LAB_INSTANCE: external-ci
+      PHASE_SECONDS: ${{ inputs.phase_seconds }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install tools and browser
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y podman apparmor-utils python3-yaml python3-venv openssl
+          python3 -m venv .state/test-venv
+          .state/test-venv/bin/pip install -r tests/aws/requirements.txt -r tests/external-services/stress-requirements.txt
+          npm ci --prefix tests/pricetag/browser --ignore-scripts
+          sudo tests/pricetag/browser/node_modules/.bin/playwright install --with-deps chromium
+      - name: Configure confined CI container profile
+        run: |
+          sudo apparmor_parser --replace tests/pricetag/ci.apparmor
+          sudo install -d -m 0755 /etc/containers/containers.conf.d
+          printf '[containers]\napparmor_profile="pricetag-demo-ci"\n' | sudo tee /etc/containers/containers.conf.d/99-pricetag-demo.conf >/dev/null
+      - name: Build reviewed OIDC and telemetry fixture sources
+        run: |
+          git init "$RUNNER_TEMP/metering"
+          git -C "$RUNNER_TEMP/metering" fetch --depth 1 https://github.com/Ladas/pricetag-metering.git 2281e1a84bfc3b998e7db36bc01bae88130bfcdd
+          git -C "$RUNNER_TEMP/metering" checkout --detach FETCH_HEAD
+          # The full SSO fixture has an explicit qualification pin, separate
+          # from the default installer source candidate (see services.py).
+          sudo python3 scripts/pricetag/build-metering --source "$RUNNER_TEMP/metering" \
+            --revision 2281e1a84bfc3b998e7db36bc01bae88130bfcdd \
+            --tag localhost/pricetag-metering:upstream-2281e1a
+          git init "$RUNNER_TEMP/maas"
+          git -C "$RUNNER_TEMP/maas" fetch --depth 1 https://github.com/Ladas/models-as-a-service.git 6ac4c80ebc95f590e5f24593ac15bb80c7f9fa1d
+          git -C "$RUNNER_TEMP/maas" checkout --detach FETCH_HEAD
+          sudo scripts/pricetag/build-maas --source "$RUNNER_TEMP/maas" --expected-commit 6ac4c80ebc95f590e5f24593ac15bb80c7f9fa1d
+      - name: Qualify isolated local stack
+        if: inputs.qualification == 'services'
+        run: sudo env ENMAAS_LAB_INSTANCE=external-ci python3 tests/external-services/local-qualification.py
+      - name: Qualify benchmark alert timing
+        if: inputs.qualification == 'benchmark'
+        run: sudo .state/test-venv/bin/python tests/external-services/test-benchmark-alerts.py
+      - name: Qualify mock streaming benchmark
+        if: inputs.qualification == 'benchmark'
+        run: sudo env ENMAAS_LAB_INSTANCE=external-ci .state/test-venv/bin/python tests/external-services/ci-runtime.py --duration "$PHASE_SECONDS"
+      - name: Remove only owned containers and secrets
+        if: always()
+        run: sudo env ENMAAS_LAB_INSTANCE=external-ci python3 tests/external-services/local.py down

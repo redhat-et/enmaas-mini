@@ -114,7 +114,7 @@ def plan(config):
               '--metering-database-url-file','/root/pricetag-external-db/metering.url',
               '--external-database-ca-file','/root/pricetag-external-db/ca.crt'] if config['external_database'] else []
     command('gateway-install','gateway','python3','scripts/pricetag/install.py','--non-interactive','--yes',
-            '--mode','mock','--hostname',public['gateway'],'--no-sample-users','--monthly-usd','5',
+            '--mode','mock','--mock-profiles','--hostname',public['gateway'],'--no-sample-users','--monthly-usd','5',
             '--image-mode','source','--maas-revision',installer.MAAS_COMMIT,'--metering-revision',OIDC_METERING_COMMIT,
             '--praxis-image',TELEMETRY_PRAXIS_IMAGE,'--praxis-revision',TELEMETRY_PRAXIS_REVISION,
             '--tls-bundle','/root/enmaas-tls','--oidc-config','/root/enmaas-inputs/oidc.json',*database)
@@ -174,6 +174,7 @@ def access_summary(config):
             'browser_password':instruction('keycloak','python3','tests/external-services/keycloak-password.py',
                 '--population','/root/enmaas-test-users','--index','1','--stdout')},
         'bootstrap_administrator_key':instruction('gateway','cat','/root/pricetag-admin/admin.key'),
+        'mock_benchmark':instruction('gateway','python3','tests/external-services/benchmark.py','--detach','--duration','600','--offered-rps','100'),
         'provider_inventory':instruction('gateway','python3','scripts/pricetag/providers','list'),
         'provider_replacement':{
             'before_running':'Stop the benchmark, verify cleanup and save its report first. Run a replacement command in your private terminal; credentials are prompted without echo. Review prices and refresh clients afterward. Historical mock usage remains.',

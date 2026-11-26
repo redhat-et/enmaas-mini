@@ -74,6 +74,16 @@ nav:
           - Bootc image deployment: bootc/VLLM.md
       - Remote gateway with PriceTag:
           - Guided installation: docs/quickstarts/remote-gateway-pricetag/README.md
+          - Deployment choices: docs/quickstarts/remote-gateway-pricetag/deployment-options.md
+          - External services: docs/quickstarts/remote-gateway-pricetag/full-deployment.md
+          - Non-interactive installation: docs/quickstarts/remote-gateway-pricetag/headless.md
+          - OIDC and supplied TLS: docs/quickstarts/remote-gateway-pricetag/external-auth.md
+          - Workload sizing: docs/quickstarts/remote-gateway-pricetag/sizing.md
+          - Mock-to-real provider replacement: docs/testing/external-services/providers.md
+          - Test users and identity lifecycle: docs/testing/external-services/keycloak-users.md
+          - External-service topology: docs/testing/external-services/topology.md
+          - Test certificate bundles: docs/testing/external-services/certificates.md
+          - Deployment security acceptance: docs/testing/external-services/security-acceptance.md
           - Architecture and OpenShift comparison: docs/quickstarts/remote-gateway-pricetag/architecture.md
           - Manual installation: docs/quickstarts/remote-gateway-pricetag/manual.md
           - External PostgreSQL databases: docs/quickstarts/remote-gateway-pricetag/external-database.md
@@ -105,6 +115,19 @@ nav:
       - Observability test host: docs/testing/external-services/observability-rhel.md
       - Operational monitoring: docs/testing/external-services/monitoring.md
       - Three-host test installation: docs/testing/external-services/three-host-install.md
+      - Mock benchmark scenarios: docs/testing/external-services/benchmark.md
+      - Database profiling: docs/testing/external-services/database-profiling.md
+      - Inspect local dashboards: docs/testing/external-services/local-dashboards.md
+      - Benchmark reports: docs/testing/external-services/report.md
+      - Storage and retention: docs/testing/external-services/storage.md
+      - Local stack qualification: docs/testing/external-services/local-podman.md
+      - AWS infrastructure: docs/testing/external-services/aws.md
+      - Dedicated network and hosts: docs/testing/external-services/infrastructure.md
+      - Scoped AWS operator access: docs/testing/external-services/operator-access.md
+      - AWS cleanup: docs/testing/external-services/cleanup.md
+      - Deployment DNS: docs/testing/external-services/dns.md
+      - External RDS: docs/testing/external-services/rds.md
+      - Private peer network: docs/testing/external-services/network.md
 
 extra_css:
   - assets/stylesheets/redhat.css

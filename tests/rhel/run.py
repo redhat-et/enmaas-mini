@@ -76,7 +76,7 @@ def bundle():
     with tarfile.open(fileobj=output, mode="w:gz", format=tarfile.USTAR_FORMAT) as archive:
         for directory in ("configs", "scripts", "tests"):
             for path in sorted((ROOT / directory).rglob("*")):
-                if "__pycache__" in path.parts or path.suffix in (".pyc", ".secret", ".local"):
+                if {"__pycache__", "node_modules", ".venv"}.intersection(path.relative_to(ROOT).parts) or path.suffix in (".pyc", ".secret", ".local"):
                     continue
                 if path.is_symlink():
                     raise ValueError(f"symlink in test bundle: {path}")

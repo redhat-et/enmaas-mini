@@ -152,3 +152,41 @@ real OIDC/PKCE/group enforcement, telemetry mTLS, privacy, payload bounds,
 Perses provisioning and signal storage. They do **not** qualify the RHEL
 Quadlet lifecycle, cloud/firewalld packet paths, retention over time or browser
 cookie behavior. See the [test commands](../../../tests/external-services/README.md).
+
+
+## Host samples and diagnostic access
+
+The host timer reads aggregate `/proc/stat`, `/proc/meminfo`, load averages and
+`/var` filesystem capacity. It does not read process arguments, environments or
+user identities. It sends directly over mTLS using systemd credentials and a
+restricted destination IP. Inspect it on the gateway:
+
+```sh
+sudo systemctl start enmaas-host-metrics.service
+sudo systemctl status enmaas-host-metrics.timer enmaas-host-metrics.service --no-pager
+sudo journalctl -u enmaas-host-metrics.service -n 20 --no-pager
+```
+
+Memory unavailable is total minus `MemAvailable`; cached memory is reported
+separately and must not be added to unavailable. Filesystem sampling does not
+measure external RDS storage. Use a stable nonsecret `--host-id` per gateway.
+
+The relay reads only the three configured service log files, with persistent
+offsets in a separate volume. It begins at the end of a new file. Rotation,
+crashes and receiver outages can lose or duplicate telemetry. Exported log text
+is replaced by a constant; inspect original messages over SSH. No journal group
+or Podman socket is granted to the relay.
+
+Perses proxies Tempo/Loki queries through the same observability SSO gate. Trace
+IDs support detail navigation, while bodies, arbitrary error text, identities and
+span-event text are removed. Missing sampled traces or logs do not establish
+missing accounting records; reconcile PriceTag's ledger separately.
+
+The optional `host-metrics-runtime.py` probe exercises generated temporary systemd
+units in the **local Podman VM only**. Read its prerequisites before running: it
+uses the local test service account and port 24443. Do not stop unrelated running
+fixtures to make space. It does not qualify a supplied RHEL host.
+
+See [telemetry topology](topology.md) and [certificate scope](certificates.md#telemetry-credential-scope)
+for the trust boundaries. The telemetry client CA authenticates a trusted producer;
+it does not bind individual metric labels to a certificate subject.

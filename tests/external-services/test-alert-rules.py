@@ -132,13 +132,14 @@ def suite():
     return {'rule_files':['/rules.yaml'],'evaluation_interval':'15s','fuzzy_compare':True,'tests':tests}
 
 
-def main():
+def main(*, ruleset=None, cases=None):
     image=json.loads((HERE/'images.json').read_text())['prometheus']['image']
     prefix='enmaas-rule-test-'+uuid.uuid4().hex[:10]
     names=[]
     try:
         mounts=[]
-        for suffix,content in [('rules',yaml.safe_dump(monitor.rules(),sort_keys=False)),('tests',yaml.safe_dump(suite()))]:
+        for suffix,content in [('rules',yaml.safe_dump(monitor.rules() if ruleset is None else ruleset,sort_keys=False)),
+                               ('tests',yaml.safe_dump(suite() if cases is None else cases))]:
             name=prefix+'-'+suffix
             subprocess.run(['podman','secret','create',name,'-'],input=content.encode(),check=True,stdout=subprocess.DEVNULL,timeout=30)
             names.append(name);mounts+=['--secret',name+',target=/'+suffix+'.yaml,mode=0444']

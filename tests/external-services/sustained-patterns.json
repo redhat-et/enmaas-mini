@@ -1,0 +1,49 @@
+{
+  "mock_only": true,
+  "phase_seconds": 600,
+  "phases": [
+    {
+      "name": "baseline",
+      "users": 1,
+      "streams_per_user": 1,
+      "rate_limit_rps": 1000,
+      "offered_rps": 2
+    },
+    {
+      "name": "team",
+      "users": 25,
+      "streams_per_user": 1,
+      "rate_limit_rps": 1000,
+      "offered_rps": 15
+    },
+    {
+      "name": "parallel",
+      "users": 25,
+      "streams_per_user": 4,
+      "rate_limit_rps": 1000,
+      "offered_rps": 30
+    },
+    {
+      "name": "sustained_high",
+      "users": 25,
+      "streams_per_user": 4,
+      "rate_limit_rps": 1000,
+      "offered_rps": 60
+    },
+    {
+      "name": "rate_limited",
+      "users": 25,
+      "streams_per_user": 4,
+      "rate_limit_rps": 5,
+      "offered_rps": 30
+    },
+    {
+      "name": "recovery",
+      "users": 1,
+      "streams_per_user": 1,
+      "rate_limit_rps": 1000,
+      "offered_rps": 2
+    }
+  ],
+  "runner": "tests/external-services/benchmark.py"
+}

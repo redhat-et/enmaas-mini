@@ -11,7 +11,7 @@ remains the production installation entry point.
 - Use three fresh RHEL hosts with distinct public and private IPv4 addresses,
   a non-root SSH account and passwordless `sudo`.
 - Permit SSH from your workstation only. Permit workstation HTTPS on TCP 8443;
-  allow issuer TCP 8443 between the private peers and collector TCP 4318 from
+  allow issuer TCP 8443 between the private peers and collector TCP 24443 from
   the gateway to observability. Do not expose the collector publicly.
 - Provide a DNS name for the issuer resolving only to its public IPv4 on your
   workstation. The services use the same TLS name with private address mapping.
@@ -98,7 +98,8 @@ different credentials.
 The pinned metering source is
 [2281e1a](https://github.com/Ladas/pricetag-metering/commit/2281e1a84bfc3b998e7db36bc01bae88130bfcdd),
 matching the [OIDC guide](../../quickstarts/remote-gateway-pricetag/external-auth.md).
-The installer's older default metering source is not assumed to support this setup.
+The coordinator supplies this exact revision explicitly rather than relying on
+future installer defaults.
 
 For OTLP metrics and traces, the coordinator explicitly selects the pinned
 `quay.io/opendatahub/praxis-experimental` image. The ordinary installer's tenant
