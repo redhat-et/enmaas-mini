@@ -52,7 +52,7 @@ def main():
             protected = []
             run(PODMAN + ['network', 'create', network])
             run(PODMAN + ['run', '-d', '--name', container, '--network', network,
-                 '--network-alias', 'external-db.test', '--env', 'POSTGRES_PASSWORD=' + password,
+                 '--network-alias', 'external-db.test', '--network-alias', 'wrong-db.test', '--env', 'POSTGRES_PASSWORD=' + password,
                  POSTGRES])
             wait_for_postgres(container)
             for source, target in ((certificate, '/tmp/server.crt'), (key, '/tmp/server.key')):
@@ -134,8 +134,22 @@ def main():
                     check=True, text=True, stdout=subprocess.PIPE).stdout.strip()
                 if result != f'{role}:{role}':
                     raise RuntimeError(f'unexpected connection identity: {result}')
-            print('PASS: external MaaS and metering URLs connected over verified TLS '
-                  'with deployment-shaped password permissions')
+                # Use the same permissions and client identity so rejection
+                # proves hostname verification, not an unreadable password.
+                wrong_environment = dict(environment, PGHOST='wrong-db.test')
+                wrong_file = certificates / f'{role}-wrong-host.env'
+                wrong_file.write_text(''.join(f'{name}={value}\n' for name, value in wrong_environment.items()))
+                wrong_client = list(client)
+                wrong_client[wrong_client.index('--env-file') + 1] = wrong_file
+                rejected = subprocess.run(
+                    PODMAN + ['run', '--user', '999:0', *wrong_client,
+                              POSTGRES, 'sh', '-c', shell_command],
+                    text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                if rejected.returncode == 0 or 'does not match host name' not in rejected.stderr:
+                    raise RuntimeError('expected certificate hostname rejection was not observed')
+            print('PASS: external MaaS and metering connections verify TLS with '
+                  'deployment-shaped password permissions; wrong server hostname rejected')
+
         finally:
             # Restore the original owner and group so TemporaryDirectory
             # cleanup never depends on foreign-owned files; best-effort so a

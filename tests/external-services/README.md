@@ -82,3 +82,10 @@ SELinux, firewall, restart, storage and network qualification.
 Use the [three-host installation guide](../../docs/testing/external-services/three-host-install.md)
 for an offline plan, verified SSH transfers, per-stage receipts and access commands.
 It creates no AWS resources and refuses existing deployments.
+
+## AWS infrastructure
+
+Start with [scoped operator access](../../docs/testing/external-services/operator-access.md),
+then [dedicated infrastructure](../../docs/testing/external-services/infrastructure.md).
+[Cleanup](../../docs/testing/external-services/cleanup.md) lists owned resources and
+which deletion operations remain manual. Live IAM and RHEL qualification is pending.

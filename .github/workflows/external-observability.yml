@@ -38,7 +38,7 @@ jobs:
       - name: Install test tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y podman openssl shellcheck python3-yaml util-linux
+          sudo apt-get install -y podman openssl shellcheck python3-yaml zsh util-linux
       - name: Check inputs and installers
         run: |
           python3 -m unittest discover -s tests/external-services/unit -v

@@ -174,6 +174,15 @@ class Services(unittest.TestCase):
             (root/(s.plan(config)[0]['id']+'.json')).unlink()
             with self.assertRaises(ValueError):s.apply(config,root,confirm='install '+config['deployment'])
 
+    def test_outside_repository_command_keeps_arguments_without_checkout(self):
+        config=self.config()
+        with patch.object(s.transfer,'ssh_options',return_value=['ssh']), \
+                patch.object(s.subprocess,'run',return_value=Mock(returncode=0)) as run:
+            s.remote(config,'gateway',['dnf','install','-y','python3'],in_repository=False)
+        self.assertEqual(run.call_args.args[0],
+            ['ssh',config['hosts']['gateway']['ssh'],'sudo -n dnf install -y python3'])
+        self.assertEqual(run.call_args.kwargs['timeout'],60)
+
     def test_execute_uses_fixed_transfers_and_bounded_remote_commands(self):
         config=self.config()
         with patch.object(s.certificates,'generate') as certificates,patch.object(s.transfer,'transfer_bundle') as bundle,patch.object(s.transfer,'transfer') as client,patch.object(s,'remote') as remote:
