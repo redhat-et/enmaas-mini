@@ -113,6 +113,19 @@ class RunnerTest(unittest.TestCase):
             self.assertTrue(archive.getmember("scripts/common/quota-status").mode & 0o111)
             self.assertTrue(archive.getmember("scripts/common/quota-set").mode & 0o111)
 
+    def test_bundle_excludes_generated_dependencies_but_rejects_source_symlinks(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary)
+            for name in ('configs','scripts','tests'):(root/name).mkdir()
+            dependencies=root/'tests/browser/node_modules/.bin';dependencies.mkdir(parents=True)
+            (dependencies/'playwright').symlink_to('/not-a-source-file')
+            source=root/'scripts/run';source.write_text('reviewed source')
+            with patch.object(runner,'ROOT',root):
+                _,manifest=runner.bundle()
+                self.assertEqual(set(manifest),{'scripts/run'})
+                (root/'scripts/unsafe').symlink_to(source)
+                with self.assertRaisesRegex(ValueError,'symlink'):runner.bundle()
+
     def test_candidate_override_rejects_other_phases_and_mutable_tags_before_ssh(self):
         image = "registry.example/vllm@sha256:" + "1" * 64
         for phase, candidate, message in (("real-test", image, "only to real-setup"),

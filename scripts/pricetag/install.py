@@ -183,6 +183,7 @@ def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--mode', choices=('real', 'mock'), default='real',
                    help='real providers (default); use mock for synthetic benchmarks')
+    p.add_argument('--mock-profiles', action='store_true', help='mock the standard openai/external profiles for later real-provider replacement')
     p.add_argument('--demo-fixture', action='store_true', help='mock mode only: two model aliases for the UI demo')
     p.add_argument('--hostname', help='public IPv4 or DNS name; no scheme, path or port')
     p.add_argument('--provider', action='append', choices=('openai', 'external', 'pricetag'), default=[],
@@ -259,6 +260,10 @@ def parse_args(argv=None):
             args.provider = ['openai', 'external'] if selected == 'both' else [selected]
         else:
             p.error('real mode requires --provider openai and/or --provider external')
+    if args.mock_profiles and (args.mode != 'mock' or args.demo_fixture):
+        p.error('--mock-profiles requires --mode mock without --demo-fixture')
+    # Fresh benchmark installs use the same provider identities as real installs.
+    args.mock_profiles = args.mode == 'mock' and not args.demo_fixture
     if args.demo_fixture and args.mode != 'mock':
         p.error('--demo-fixture requires --mode mock')
     if args.mode == 'mock' and args.provider:
@@ -424,7 +429,7 @@ def install(args):
                  'pricetag': 'External (legacy PriceTag profile)'}
     print('\nRemote gateway with PriceTag\n' + '=' * 54)
     print(f'  Gateway    https://{args.hostname}:8443')
-    print('  Providers  ' + ('Mock providers (benchmark)' if args.mode == 'mock' else
+    print('  Providers  ' + ('OpenAI (mock), External OpenAI/Messages (mock)' if args.mock_profiles else 'Mock providers (benchmark)' if args.mode == 'mock' else
                             ', '.join(providers[name] for name in args.provider)))
     print(f'  Images     {args.image_mode}')
     print('  Praxis     ' + args.praxis_image)
@@ -494,6 +499,9 @@ def install(args):
     for name, settings, key in prepared:
         helper.save_provider(name, settings, key)
     prepared.clear()
+    if args.mock_profiles:
+        from mock_profiles import save_inputs
+        save_inputs(helper)
     command = [sys.executable, ROOT / 'scripts/pricetag/prepare.py', '--hostname', args.hostname,
                '--praxis-image', ids[0], '--maas-image', ids[1], '--metering-image', ids[2],
                '--monthly-usd', str(args.monthly_usd)]
@@ -509,7 +517,12 @@ def install(args):
     if not args.sample_users:
         command += ['--no-sample-users']
     if args.mode == 'mock':
-        command += ['--mock-provider', '--price-sources', ROOT / 'configs/pricetag/perf-price-sources.json']
+        command += ['--mock-provider']
+        if args.mock_profiles:
+            command += ['--mock-profiles', '--provider-unit', INPUTS / 'provider-secrets.container',
+                        '--price-sources', INPUTS / 'prices.json']
+        else:
+            command += ['--price-sources', ROOT / 'configs/pricetag/perf-price-sources.json']
         if args.demo_fixture:
             subprocess.run([*prefix, 'podman', 'secret', 'create', 'pricetag-mock-ui-v1', '-'],
                            input=b'synthetic-anthropic', check=True, stdout=subprocess.DEVNULL, cwd='/tmp')
@@ -552,7 +565,8 @@ def main():
         install(args)
 
 
-if __name__ == '__main__':
+def cli():
+    """Report failures consistently and close the private log on every exit."""
     try:
         main()
     except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError, EOFError, KeyboardInterrupt) as error:
@@ -566,3 +580,7 @@ if __name__ == '__main__':
     finally:
         if LOG is not None:
             LOG.close()
+
+
+if __name__ == '__main__':
+    cli()

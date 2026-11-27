@@ -105,6 +105,7 @@ nav:
       - Observability test host: docs/testing/external-services/observability-rhel.md
       - Operational monitoring: docs/testing/external-services/monitoring.md
       - Three-host test installation: docs/testing/external-services/three-host-install.md
+      - Local stack qualification: docs/testing/external-services/local-podman.md
 
 extra_css:
   - assets/stylesheets/redhat.css

@@ -1,5 +1,9 @@
 # External identity and observability tests
 
+For a fresh loopback-only gateway, issuer and observability stack, follow
+[local Podman qualification](../../docs/testing/external-services/local-podman.md).
+It includes source builds, browser/API checks, telemetry and scoped cleanup.
+
 The issuer slice provides a shared realm generator, protected RHEL Quadlet
 inputs, a dedicated-host installer and isolated security probes.
 

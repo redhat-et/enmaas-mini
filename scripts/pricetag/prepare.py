@@ -238,6 +238,7 @@ def main():
                         help='expose only local vLLM; do not mount cloud provider secrets')
     mode.add_argument('--mock-provider', action='store_true',
                       help='isolated synthetic provider for a fresh performance-test VM')
+    parser.add_argument('--mock-profiles', action='store_true', help='mock standard replaceable provider profiles')
     parser.add_argument('--managed-mock', action='store_true', help='authenticated mock providers for the management demo')
     parser.add_argument('--mock-secret', default='pricetag-mock-ui-v1', help='existing synthetic credential Podman secret')
     parser.add_argument('--sample-users', action=argparse.BooleanOptionalAction, default=True,
@@ -258,6 +259,8 @@ def main():
     args = parser.parse_args()
     if os.geteuid() != 0:
         parser.error('run as root on the RHEL host')
+    if args.mock_profiles and (not args.mock_provider or args.managed_mock or args.provider_unit is None):
+        parser.error('--mock-profiles requires --mock-provider and --provider-unit, without --managed-mock')
     if args.managed_mock and not args.mock_provider:
         parser.error('--managed-mock requires --mock-provider')
     if args.managed_mock and not re.fullmatch(r'pricetag-mock-ui-v[0-9]+', args.mock_secret):
@@ -284,7 +287,12 @@ def main():
         if not directory.is_absolute() or re.search(r'[\s%]', str(directory)) or directory.exists():
             parser.error('use new absolute directories without whitespace or percent signs')
     owner = pwd.getpwnam('praxis-svc')
-    if args.mock_provider:
+    if args.mock_profiles:
+        from mock_profiles import configuration
+        from demo_config import native_inputs
+        document = configuration()
+        original, models = native_inputs(document), document['models']
+    elif args.mock_provider:
         original, models = mock_inputs(managed=args.managed_mock)
     else:
         models = json.loads(args.models.read_text())
@@ -299,7 +307,7 @@ def main():
     if not args.mock_provider and any(m['id'] == sources.get(m['id'], m['model']) for m in models):
         parser.error('use distinct gateway aliases to keep their initial pricing snapshot stable')
     provider_secrets = [f'Secret={args.mock_secret},type=env,target=CUSTOM_MOCK_API_KEY'] if args.managed_mock else []
-    for line in ([] if args.mock_provider else args.provider_unit.read_text().splitlines()):
+    for line in ([] if args.mock_provider and not args.mock_profiles else args.provider_unit.read_text().splitlines()):
         if re.fullmatch(r'Secret=[A-Za-z0-9_.-]+,type=env,target=[A-Z0-9_]+_API_KEY', line):
             provider_secrets.append(line)
     needed = {entry['env_var'] for chain in config['filter_chains'] for f in chain['filters']
@@ -463,9 +471,12 @@ def main():
         fixtures.mkdir()
         shutil.copyfile(ROOT / 'tests/common/provider.py', fixtures / 'provider.py')
         shutil.copyfile(ROOT / 'tests/pricetag/provider.py', fixtures / 'run.py')
+        if args.mock_profiles:
+            (fixtures / 'mock-profiles.json').write_text(json.dumps(document))
         container('pricetag-provider', 'Synthetic LLM for performance testing only', '',
             f'Image={PYTHON}\nVolume={fixtures}:/fixtures:ro\nEnvironment=MOCK_STREAM_DELAY=1\n' +
             ('Environment=MOCK_MANAGEMENT=1\n' if args.managed_mock else '') +
+            ('Environment=MOCK_PROFILES=1\n' if args.mock_profiles else '') +
             'Exec=python3 /fixtures/run.py\n' + app, '1G', network='pricetag-mock.network')
         dependencies += ' pricetag-provider.service'
     container('pricetag-gateway', 'Praxis HTTPS gateway with MaaS identity and USD budgets',
