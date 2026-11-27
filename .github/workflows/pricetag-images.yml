@@ -1,11 +1,10 @@
-name: Build standalone MaaS and PriceTag images
+name: Build standalone PriceTag metering image
 
 on:
   pull_request:
     paths:
       - .github/workflows/pricetag-images.yml
       - configs/pricetag/Containerfile.metering
-      - scripts/pricetag/build-maas
       - scripts/pricetag/build-metering
       - tests/pricetag/component-images.py
   push:
@@ -13,7 +12,6 @@ on:
     paths:
       - .github/workflows/pricetag-images.yml
       - configs/pricetag/Containerfile.metering
-      - scripts/pricetag/build-maas
       - scripts/pricetag/build-metering
       - tests/pricetag/component-images.py
   workflow_dispatch:
@@ -32,11 +30,10 @@ jobs:
     environment: ${{ github.repository == 'redhat-et/enmaas-mini' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && 'bootc-image-main' || 'bootc-image-pr' }}
     timeout-minutes: 60
     env:
-      MAAS_REVISION: 6ac4c80ebc95f590e5f24593ac15bb80c7f9fa1d
       # Metering builds from the pinned revision of redhat-et/pricetag-metering;
-      # main has carried it since PR #149 merged.
+      # main has carried it since PR #149 merged. MaaS is no longer built here:
+      # the installer pins the published quay.io/redhat-et/enmaas-api image.
       METERING_REVISION: e4ba826d5b1469d7f1167428792e498ffb4d92c7
-      MAAS_IMAGE: quay.io/redhat-et/secure-single-server-maas-standalone
       METERING_IMAGE: quay.io/redhat-et/secure-single-server-pricetag-metering
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -46,55 +43,43 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y podman python3
-      - name: Fetch pinned application sources
+      - name: Fetch pinned metering source
         shell: bash
         run: |
           set -euo pipefail
-          for component in maas metering; do
-            directory="${RUNNER_TEMP}/${component}-source"
-            git init "$directory"
-            if [[ "$component" == maas ]]; then
-              # Fetch the reviewed standalone-runtime branch by its explicit
-              # ref and require its tip to equal the pin: branch motion or
-              # deletion fails loudly here instead of relying on
-              # reachable-SHA fetching.
-              git -C "$directory" remote add origin https://github.com/Ladas/models-as-a-service.git
-              if ! git -C "$directory" fetch --depth=1 origin feat/standalone-runtime-minimal; then
-                echo "::error::maas branch feat/standalone-runtime-minimal is not fetchable from Ladas/models-as-a-service; update the pin and the ref" >&2
-                exit 1
-              fi
-              git -C "$directory" checkout --detach FETCH_HEAD
-              if [[ "$(git -C "$directory" rev-parse HEAD)" != "$MAAS_REVISION" ]]; then
-                echo "::error::maas revision $MAAS_REVISION is no longer the tip of feat/standalone-runtime-minimal; review and update the pin" >&2
-                exit 1
-              fi
-            else
-              # Fetch the immutable pinned commit from the canonical repository;
-              # main has carried it since PR #149 merged.
-              git -C "$directory" remote add origin https://github.com/redhat-et/pricetag-metering.git
-              if ! git -C "$directory" fetch --depth=1 origin "$METERING_REVISION"; then
-                echo "::error::metering revision $METERING_REVISION is not reachable in redhat-et/pricetag-metering; update the pin to a commit carried by main or the PR branch" >&2
-                exit 1
-              fi
-              git -C "$directory" checkout --detach FETCH_HEAD
-              test "$(git -C "$directory" rev-parse HEAD)" = "$METERING_REVISION"
-            fi
-          done
-      - name: Build pinned amd64 images
+          directory="${RUNNER_TEMP}/metering-source"
+          git init "$directory"
+          # Fetch the immutable pinned commit from the canonical repository;
+          # main has carried it since PR #149 merged.
+          git -C "$directory" remote add origin https://github.com/redhat-et/pricetag-metering.git
+          if ! git -C "$directory" fetch --depth=1 origin "$METERING_REVISION"; then
+            echo "::error::metering revision $METERING_REVISION is not reachable in redhat-et/pricetag-metering; update the pin to a commit carried by main or the PR branch" >&2
+            exit 1
+          fi
+          git -C "$directory" checkout --detach FETCH_HEAD
+          test "$(git -C "$directory" rev-parse HEAD)" = "$METERING_REVISION"
+      - name: Build pinned amd64 metering image
         run: |
           set -euo pipefail
-          sudo scripts/pricetag/build-maas --source "${RUNNER_TEMP}/maas-source" \
-            --expected-commit "$MAAS_REVISION" --platform linux/amd64 --tag localhost/maas:ci
           sudo python3 scripts/pricetag/build-metering --source "${RUNNER_TEMP}/metering-source" \
             --platform linux/amd64 --revision "$METERING_REVISION" --tag localhost/metering:ci
-          test "$(sudo podman image inspect localhost/maas:ci --format '{{index .Labels "org.opencontainers.image.revision"}}')" = "$MAAS_REVISION"
           test "$(sudo podman image inspect localhost/metering:ci --format '{{index .Labels "org.opencontainers.image.revision"}}')" = "$METERING_REVISION"
-          for image in localhost/maas:ci localhost/metering:ci; do
-            test "$(sudo podman image inspect "$image" --format '{{.Architecture}}')" = amd64
-          done
-      - name: Test both services with PostgreSQL
-        run: sudo python3 tests/pricetag/component-images.py --maas-image localhost/maas:ci --metering-image localhost/metering:ci
-      - name: Publish tested images
+          test "$(sudo podman image inspect localhost/metering:ci --format '{{.Architecture}}')" = amd64
+      - name: Test the metering image with the pinned MaaS image and PostgreSQL
+        run: |
+          set -euo pipefail
+          # The MaaS digest is pinned visibly in this workflow and compared
+          # textually against the installer constant — no repository Python
+          # is imported — so CI fails rather than silently following an
+          # install.py change that points at a different digest.
+          maas=quay.io/redhat-et/enmaas-api@sha256:fb8e02ab32223ca91507b112e8aa21b5281445100c7ce2023d06065c70a3ac82
+          grep -qF "PUBLISHED_MAAS_IMAGE = '$maas'" scripts/pricetag/install.py
+          sudo podman pull "$maas"
+          # Mirror the metering image's checks: the MaaS digest must resolve
+          # to the linux/amd64 image this job builds and tests against.
+          test "$(sudo podman image inspect "$maas" --format '{{.Architecture}}')" = amd64
+          sudo python3 tests/pricetag/component-images.py --maas-image "$maas" --metering-image localhost/metering:ci
+      - name: Publish tested metering image
         if: github.repository == 'redhat-et/enmaas-mini' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
         env:
           QUAY_USERNAME: ${{ secrets.QUAY_USERNAME }}
@@ -109,13 +94,10 @@ jobs:
           printf '{}\n' > "$authfile"
           printf '%s' "$QUAY_TOKEN" | sudo podman login --authfile "$authfile" \
             --username "$QUAY_USERNAME" --password-stdin quay.io
-          for component in maas metering; do
-            if [[ "$component" == maas ]]; then repository="$MAAS_IMAGE"; else repository="$METERING_IMAGE"; fi
-            tag="sha-${GITHUB_SHA}"
-            digestfile="${RUNNER_TEMP}/${component}.digest"
-            sudo podman push --authfile "$authfile" --digestfile "$digestfile" \
-              "localhost/${component}:ci" "docker://${repository}:${tag}"
-            digest="$(sudo cat "$digestfile")"
-            [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
-            printf '%s\n' "- ${repository}@${digest} (linux/amd64; tag ${tag})" >> "$GITHUB_STEP_SUMMARY"
-          done
+          tag="sha-${GITHUB_SHA}"
+          digestfile="${RUNNER_TEMP}/metering.digest"
+          sudo podman push --authfile "$authfile" --digestfile "$digestfile" \
+            "localhost/metering:ci" "docker://${METERING_IMAGE}:${tag}"
+          digest="$(sudo cat "$digestfile")"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          printf '%s\n' "- ${METERING_IMAGE}@${digest} (linux/amd64; tag ${tag})" >> "$GITHUB_STEP_SUMMARY"

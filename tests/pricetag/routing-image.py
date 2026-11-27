@@ -14,6 +14,17 @@ from unittest.mock import patch
 
 if not os.environ.get('PRAXIS_IMAGE'):
     raise SystemExit('Set PRAXIS_IMAGE to the PriceTag deployment image before running this test')
+# Mirror tests/common/gateway.py's exact repository-name discriminator: the
+# praxis-ai fork takes the split health listener and the body_authoritative
+# routing switch, while praxis-experimental pins and unrelated praxis-*
+# images reject both keys at config parse.
+
+
+def praxis_ai(reference):
+    return reference.rsplit('/', 1)[-1].split('@', 1)[0].split(':', 1)[0] == 'praxis-ai'
+
+
+HEALTH_METRICS_SPLIT = praxis_ai(os.environ['PRAXIS_IMAGE'])
 
 ROOT = Path(__file__).resolve().parents[2]
 spec = importlib.util.spec_from_file_location('unified_image', ROOT / 'tests/rhel/unified-image.py')
@@ -33,8 +44,15 @@ def upgrade_contract(gateway):
     before = counts()
     for path, alias in (('/v1/responses', 'openai/gpt-5.4-mini'),
                         ('/v1/chat/completions', 'team/gpt-5.4-mini'),
-                        ('/v1/messages', 'team/gpt-5.4-mini'),
-                        ('/v1/messages/count_tokens', 'team/gpt-5.4-mini')):
+                        # The praxis-ai router resolves the body's model in a
+                        # pre-read pass before the filter chain runs, so an
+                        # alias without a route on this listener fails with the
+                        # router's 404 before reject_upgrade can answer. Probe
+                        # with an alias the listener serves, leaving the upgrade
+                        # guard as the only thing between the handshake and the
+                        # provider.
+                        ('/v1/messages', 'team/claude-sonnet-5'),
+                        ('/v1/messages/count_tokens', 'team/claude-sonnet-5')):
         for protocol in ('websocket', 'WebSocket', 'h2c', 'custom/1', 'h2c, websocket'):
             for method in ('GET', 'POST'):
                 # urllib forces Connection: close; use http.client so these are
@@ -88,6 +106,13 @@ def main():
         for chain in result['filter_chains']:
             chain['filters'] = pricetag_gateway.inference_guards(chain['name']) + [f for f in chain['filters']
                                 if f['filter'] not in ('token_rate_limit', 'policy', 'rate_limit')]
+            if HEALTH_METRICS_SPLIT:
+                # Mirror the deployment's praxis-ai routing contract: the body
+                # model, not a client-forged X-Gateway-Model, selects the
+                # upstream. Older images reject the unknown key at parse.
+                for item in chain['filters']:
+                    if item['filter'] == 'intelligent_route':
+                        item['body_authoritative'] = True
         return result
 
     with patch.object(unified_config, 'render', candidate_render):
@@ -113,10 +138,31 @@ def main():
                             status, payload, _ = gateway.request(path, body=body)
                             assert status == 200, (model['id'], path, stream, status)
                             fixture.check(path, payload, stream, tool=True, model=model['model'])
-            for path in ('/v1/responses', '/v1/chat/completions', '/v1/messages'):
-                for body in (b'{"model":"unknown"}', b'{}', b'{"model":'):
-                    status, _ = gateway.raw(path, body, **{'X-Gateway-Model': 'openai/gpt-5.4-mini'})
-                    assert status in (400, 404), (path, status)
+            # A client-forged routing header must not select or break the
+            # route. praxis-ai resolves X-Gateway-Model during the body
+            # pre-read pass, so the pinned deployment sets body_authoritative
+            # and the body model stays the only routing input. Legacy
+            # praxis-experimental images keep header-based routing — the
+            # exposure the switch removes — so both forged-header contracts
+            # are asserted only for the family whose render above sets the
+            # switch.
+            if HEALTH_METRICS_SPLIT:
+                for model in fixture.MODELS:
+                    for api in model['apis']:
+                        paths = ['/v1/messages'] if api == 'anthropic' else ['/v1/responses', '/v1/chat/completions']
+                        for path in paths:
+                            body = fixture.request_body(path, False, tools=True)
+                            body['model'] = model['id']
+                            if path == '/v1/chat/completions' and model['model'].startswith('gpt-'):
+                                body['max_completion_tokens'] = body.pop('max_tokens')
+                            status, _ = gateway.raw(path, json.dumps(body).encode(),
+                                                    **{'X-Gateway-Model': 'unknown/provider',
+                                                       'X-Gateway-Provider': 'unknown'})
+                            assert status == 200, ('forged routing header', model['id'], path, status)
+                for path in ('/v1/responses', '/v1/chat/completions', '/v1/messages'):
+                    for body in (b'{"model":"unknown"}', b'{}', b'{"model":'):
+                        status, _ = gateway.raw(path, body, **{'X-Gateway-Model': 'openai/gpt-5.4-mini'})
+                        assert status in (400, 404), (path, status)
             # Records contain only booleans and model IDs, never raw credentials.
             for port, upstream in ((19000, 'gpt-5.4-mini'), (19002, 'gpt-5.4-mini'), (19001, 'qwen3-8b')):
                 records = json.loads(fixture.run(fixture.ENGINE, 'exec', gateway.name + '-mock', 'python3', '-c',

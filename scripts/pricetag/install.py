@@ -17,24 +17,24 @@ import tempfile
 import time
 
 ROOT = Path(__file__).resolve().parents[2]
-MAAS_COMMIT = '6ac4c80ebc95f590e5f24593ac15bb80c7f9fa1d'
+# MaaS is always the published enmaas-api image (built from the private
+# redhat-et/enmaas-api source); its revision is only verified against the
+# image label here, never built from source.
+MAAS_COMMIT = 'aea9c56749117e78dc1a715f7d548b2d569b24d5'
 # Published image provenance remains separate from the source-build candidate.
 METERING_COMMIT = 'ce9c6c51b8dff178637003945b517255c54fc853'
 # The metering source line is the standalone-management branch of
 # redhat-et/pricetag-metering; PR #149 merged, and main also carries the
 # pinned revision. The branch remains the reviewed integration line.
 SOURCE_METERING_COMMIT = 'e4ba826d5b1469d7f1167428792e498ffb4d92c7'
-MAAS_REPO = 'https://github.com/Ladas/models-as-a-service.git'
-MAAS_BRANCH = 'feat/standalone-runtime-minimal'
 METERING_REPO = 'https://github.com/redhat-et/pricetag-metering.git'
 METERING_BRANCH = 'standalone-management'
-PRAXIS_IMAGE = 'quay.io/redhat-services-prod/enmaas-tenant/praxis-ai@sha256:bcc31cac1dbb5316ed57601d13d702997b3f4e3e6ead665c9fe01300e61db00a'
-PRAXIS_REVISION = 'd7ef08cea44bf1114160cb17e7f68189cdf2773e'
-MAAS_IMAGE = 'localhost/pricetag-maas:standalone'
+PRAXIS_IMAGE = 'quay.io/redhat-et/praxis-ai@sha256:240bcdaa73f4ca81a670dc0451db3072aa5190eca71f2af13c5ddfb75e49abdc'
+PRAXIS_REVISION = '548f61ccef002f275056982d5104dc161e886210'
 # Derive the local source-build tag from the pin so a re-pin cannot leave a
 # stale label behind (build-metering derives its standalone default the same way).
 METERING_IMAGE = 'localhost/pricetag-metering:standalone-' + SOURCE_METERING_COMMIT[:7]
-PUBLISHED_MAAS_IMAGE = 'quay.io/redhat-et/secure-single-server-maas-standalone@sha256:0bec6ef57fa5b10a7bef8f4df8d98f932c9d7fc96798f7bfc0cd77b504790fa8'
+PUBLISHED_MAAS_IMAGE = 'quay.io/redhat-et/enmaas-api@sha256:fb8e02ab32223ca91507b112e8aa21b5281445100c7ce2023d06065c70a3ac82'
 PUBLISHED_METERING_IMAGE = 'quay.io/redhat-et/secure-single-server-pricetag-metering@sha256:dabb2f35f54c30c2c387b3bf298b66f3b84a4110ddf3a78a204c7d59c5de2f1a'
 CACHE = Path('/var/cache/pricetag-installer')
 DEPLOY = Path('/etc/praxis-pricetag')
@@ -212,14 +212,14 @@ def parse_args(argv=None):
     p.add_argument('--non-interactive', action='store_true',
                    help='never prompt; require complete options and protected credential files')
     p.add_argument('--plan', action='store_true', help='print stages without credentials, discovery or host changes')
-    p.add_argument('--image-mode', choices=('source', 'published'), help='build source or pull digest-pinned images')
+    p.add_argument('--image-mode', choices=('source', 'published'),
+                   help='metering source build or digest-pinned published images; MaaS is always published')
     p.add_argument('--praxis-image', help='Praxis image with @sha256 digest; requires --praxis-revision')
     p.add_argument('--praxis-revision', help='expected full Git SHA in the selected Praxis image label')
-    p.add_argument('--maas-image', help='published MaaS image, including @sha256 digest')
+    p.add_argument('--maas-image', help='published enmaas-api MaaS image, including @sha256 digest')
     p.add_argument('--metering-image', help='published PriceTag image, including @sha256 digest')
-    maas_source = p.add_mutually_exclusive_group()
-    maas_source.add_argument('--maas-revision', help='full MaaS source SHA to build or verify')
-    maas_source.add_argument('--maas-branch', help='source mode: branch in the configured MaaS fork')
+    p.add_argument('--maas-revision',
+                   help='full enmaas-api source SHA expected in the published MaaS image label')
     metering_source = p.add_mutually_exclusive_group()
     metering_source.add_argument('--metering-revision', help='full PriceTag source SHA to build or verify')
     metering_source.add_argument('--metering-branch', help='source mode: branch in the PriceTag source repository')
@@ -315,11 +315,23 @@ def parse_args(argv=None):
         else:
             args.image_mode = 'published'
     for component in ('maas', 'metering'):
+        # MaaS is always the published enmaas-api image; source mode only
+        # selects the metering build.
+        image = getattr(args, component + '_image')
+        if args.image_mode == 'source' and component == 'metering':
+            if image:
+                p.error('--metering-image requires --image-mode published')
+        else:
+            if not image:
+                image = PUBLISHED_MAAS_IMAGE if component == 'maas' else PUBLISHED_METERING_IMAGE
+                setattr(args, component + '_image', image)
+            if not re.fullmatch(r'[a-z0-9][a-z0-9.:-]*/[a-z0-9_./-]+@sha256:[0-9a-f]{64}', image):
+                p.error('--' + component + '-image must include a registry/repository and sha256 digest')
         revision = getattr(args, component + '_revision')
-        branch = getattr(args, component + '_branch')
-        if args.image_mode == 'source' and not (revision or branch):
-            branch = MAAS_BRANCH if component == 'maas' else METERING_BRANCH
-            setattr(args, component + '_branch', branch)
+        branch = getattr(args, 'metering_branch', None) if component == 'metering' else None
+        if args.image_mode == 'source' and component == 'metering' and not (revision or branch):
+            branch = METERING_BRANCH
+            setattr(args, 'metering_branch', branch)
         if branch:
             if args.image_mode != 'source':
                 p.error('branch selection requires --image-mode source')
@@ -333,15 +345,6 @@ def parse_args(argv=None):
             setattr(args, component + '_revision', expected)
         if not re.fullmatch(r'[0-9a-f]{40}', getattr(args, component + '_revision')):
             p.error('--' + component + '-revision must be a full lowercase Git commit SHA')
-        image = getattr(args, component + '_image')
-        if args.image_mode == 'source' and image:
-            p.error('image references require --image-mode published')
-        if args.image_mode == 'published':
-            if not image:
-                image = PUBLISHED_MAAS_IMAGE if component == 'maas' else PUBLISHED_METERING_IMAGE
-                setattr(args, component + '_image', image)
-            if not image or not re.fullmatch(r'[a-z0-9][a-z0-9.:-]*/[a-z0-9_./-]+@sha256:[0-9a-f]{64}', image):
-                p.error('--' + component + '-image must include a registry/repository and sha256 digest')
     args.provider = list(dict.fromkeys(args.provider))
     return args
 
@@ -377,30 +380,30 @@ def collect_providers(args, helper):
 
 def acquire_images(args, arch):
     stage(3, 'Acquire application images')
+    # MaaS is always the published enmaas-api image; source mode only builds
+    # the metering component from its reviewed source line.
+    print('  MaaS image: ' + args.maas_image, flush=True)
+    run(['podman', 'pull', args.maas_image], label='Pulling MaaS')
     if args.image_mode == 'source':
-        print('  Resolving source refs and building; this can take several minutes.', flush=True)
+        print('  Resolving metering source and building; this can take several minutes.', flush=True)
         CACHE.mkdir(mode=0o700, parents=True, exist_ok=True)
-        for component, repository in (('maas', MAAS_REPO), ('metering', METERING_REPO)):
-            branch = getattr(args, component + '_branch')
-            revision = getattr(args, component + '_revision')
-            checkout(repository, CACHE / component, 'refs/heads/' + branch if branch else revision)
-            if branch:
-                revision = run(['git', '-C', CACHE / component, 'rev-parse', 'HEAD'], True)
-                if not re.fullmatch(r'[0-9a-f]{40}', revision):
-                    raise ValueError('Source branch did not resolve to a full commit')
-                setattr(args, component + '_revision', revision)
-            print(f'  {component}: {branch or "commit"} -> {revision}', flush=True)
-        run([ROOT / 'scripts/pricetag/build-maas', '--source', CACHE / 'maas',
-             '--expected-commit', args.maas_revision, '--platform', 'linux/' + arch], label='Building MaaS')
+        branch = args.metering_branch
+        revision = args.metering_revision
+        checkout(METERING_REPO, CACHE / 'metering', 'refs/heads/' + branch if branch else revision)
+        if branch:
+            revision = run(['git', '-C', CACHE / 'metering', 'rev-parse', 'HEAD'], True)
+            if not re.fullmatch(r'[0-9a-f]{40}', revision):
+                raise ValueError('Source branch did not resolve to a full commit')
+            args.metering_revision = revision
+        print(f'  metering: {branch or "commit"} -> {revision}', flush=True)
         run([sys.executable, ROOT / 'scripts/pricetag/build-metering', '--source', CACHE / 'metering',
              '--revision', args.metering_revision, '--tag', METERING_IMAGE,
              '--platform', 'linux/' + arch], label='Building PriceTag')
-        images = (MAAS_IMAGE, METERING_IMAGE)
+        images = (args.maas_image, METERING_IMAGE)
     else:
+        print('  PriceTag metering image: ' + args.metering_image, flush=True)
+        run(['podman', 'pull', args.metering_image], label='Pulling PriceTag metering')
         images = (args.maas_image, args.metering_image)
-        for component, image in zip(('MaaS', 'PriceTag metering'), images):
-            print(f'  {component} image: {image}', flush=True)
-            run(['podman', 'pull', image], label='Pulling ' + component)
     print('  Praxis image: ' + args.praxis_image, flush=True)
     run(['podman', 'pull', args.praxis_image], label='Pulling Praxis')
     for image, expected in zip((args.praxis_image, *images),
@@ -412,6 +415,23 @@ def acquire_images(args, arch):
         actual_arch = run(['podman', 'image', 'inspect', image, '--format', '{{.Architecture}}'], True)
         if actual_arch != arch:
             raise ValueError('Image architecture does not match this host: ' + image)
+        if image == args.maas_image:
+            # start runs `python -m app.migrate` from this image's working
+            # directory before the service starts. Assert that documented
+            # contract here — the working directory, the absence of an
+            # entrypoint (the migration is a plain command override on a
+            # CMD-based image), and that the module imports with no network
+            # or database — so a future pin bump to a differently laid-out
+            # image fails during installation instead of at every start.
+            layout = run(['podman', 'image', 'inspect', image, '--format',
+                          '{{.Config.WorkingDir}}|{{.Config.Entrypoint}}'], True)
+            workdir, _, entrypoint = layout.partition('|')
+            if workdir != '/srv/enmaas-api' or entrypoint not in ('', '[]'):
+                raise ValueError('MaaS image lacks the documented CMD-based migration layout '
+                                 '(/srv/enmaas-api, no entrypoint): ' + image)
+            run(['podman', 'run', '--rm', '--network', 'none', '--workdir', '/srv/enmaas-api',
+                 image, 'python', '-c', 'import app.migrate'],
+                label='Verifying MaaS migration layout')
     return images
 
 
@@ -429,13 +449,9 @@ def install(args):
     print(f'  Images     {args.image_mode}')
     print('  Praxis     ' + args.praxis_image)
     print('  PostgreSQL ' + ('external (pre-provisioned)' if args.maas_database_url_file else POSTGRES))
-    if args.image_mode == 'published':
-        print('  MaaS       ' + args.maas_image)
-        print('  PriceTag   ' + args.metering_image)
-    else:
-        print('  MaaS       ' + MAAS_IMAGE)
-        print('  PriceTag   ' + METERING_IMAGE)
-        print('  MaaS ref   ' + (args.maas_branch or args.maas_revision))
+    print('  MaaS       ' + args.maas_image)
+    print('  PriceTag   ' + (METERING_IMAGE if args.image_mode == 'source' else args.metering_image))
+    if args.image_mode == 'source':
         print('  PriceTag ref ' + (args.metering_branch or args.metering_revision))
     print('  Users      ' + ('admin, alice, bob' if args.sample_users else 'admin only'))
     print(f'  Budget     ${args.monthly_usd}/month per ordinary user')
@@ -443,8 +459,9 @@ def install(args):
     print('  2. Prepare RHEL             5. Configure gateway')
     print('  3. Build/pull images        6. Start and verify services')
     if args.plan:
-        if args.image_mode == 'published':
-            print('Expected MaaS commit: ' + args.maas_revision + '\nExpected PriceTag commit: ' + args.metering_revision)
+        print('Expected MaaS commit: ' + args.maas_revision)
+        if not args.metering_branch:
+            print('Expected PriceTag commit: ' + args.metering_revision)
         return
     if args.maas_database_url_file is not None:
         try:

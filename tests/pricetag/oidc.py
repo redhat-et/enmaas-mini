@@ -118,12 +118,25 @@ class OIDC(unittest.TestCase):
                      patch.object(prepare.pwd, 'getpwnam', return_value=SimpleNamespace(pw_gid=os.getgid())), \
                      patch.object(prepare.os, 'chown'), patch.object(prepare, 'validate_tls_bundle', return_value=files), \
                      patch.object(prepare, 'load_oidc', return_value=validated_oidc), \
+                     patch.object(prepare, 'praxis_image_source',
+                                  return_value='https://github.com/redhat-et/praxis-ai'), \
                      contextlib.redirect_stdout(output):
                     prepare.main()
             finally:
                 os.umask(old_umask)
             env = (config/'metering.env').read_text()
             self.assertIn('OIDC_ENABLED=true\n', env)
+            # The praxis-ai health/metrics listener is rendered alongside the
+            # admin API port; older images get no metrics_address at all.
+            gateway = json.loads((config/'gateway/gateway.json').read_text())
+            self.assertEqual(gateway['admin'], {'address': '127.0.0.1:9901',
+                                                'metrics_address': '127.0.0.1:9902'})
+            # praxis-ai images additionally route on the body model only, so
+            # a client-forged X-Gateway-Model cannot select the upstream.
+            routes = [f for chain in gateway['filter_chains'] for f in chain['filters']
+                      if f['filter'] == 'intelligent_route']
+            self.assertTrue(routes)
+            self.assertTrue(all(f['body_authoritative'] is True for f in routes))
             self.assertIn('OIDC_REDIRECT_URL=https://gateway.example:8443/oauth/callback\n', env)
             partner_secret = (config/'partner-secret').read_text().strip()
             self.assertIn('USER_MANAGEMENT_API_SECRET=' + partner_secret + '\n', env)

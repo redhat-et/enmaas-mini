@@ -4,12 +4,12 @@ For a new PriceTag source revision, use the [upgrade qualification sequence](pri
 before changing the released image pins.
 
 The [demo deployment workflow](../../.github/workflows/pricetag-demo.yml) runs on
-a disposable GitHub-hosted Linux runner. It builds the pinned MaaS and PriceTag
-demo sources, starts PostgreSQL and Praxis, and runs the API/browser/quota suite
-against synthetic inference. No provider keys, SSH credentials or publishing
-secrets are required.
+a disposable GitHub-hosted Linux runner. It builds the pinned PriceTag metering
+source, pulls the digest-pinned published MaaS and Praxis images, starts
+PostgreSQL, and runs the API/browser/quota suite against synthetic inference.
+No provider keys, SSH credentials or publishing secrets are required.
 
-CI builds the explicitly pinned application source revisions. Keep those pins
+CI builds the explicitly pinned metering source revision. Keep that pin
 aligned with the candidate under test; a passing run against an older pin does
 not qualify a source upgrade.
 

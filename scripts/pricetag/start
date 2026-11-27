@@ -43,6 +43,10 @@ fi
 if [[ "${external_database}" == 1 ]]; then
   as_service systemctl --user start pricetag-network.service
 else
+  # Starting the database unit transitively starts pricetag-network.service:
+  # the quadlet generator wires every Network= reference into the container
+  # unit's dependencies, so the private network exists for the inspect and
+  # the migration one-shot below.
   as_service systemctl --user start pricetag-db.service
   ready=0
   for ((attempt=0; attempt<60; attempt++)); do
@@ -54,6 +58,38 @@ else
   done
   [[ "${ready}" == 1 ]] || die 'PostgreSQL did not become ready'
 fi
+# Wait out — never kill — a migration one-shot left running by an
+# interrupted prior start: CREATE INDEX CONCURRENTLY cannot be interrupted
+# mid-run without risking an invalid index, and a legitimate build can
+# outlast any bound on a large or busy database. A running leftover is
+# allowed to finish — its advisory lock then serializes this start's own
+# migration — and the ten-minute bound stops only this start attempt,
+# loudly, leaving the container untouched for the operator to watch to
+# completion. Exited leftovers hold no lease and are simply removed.
+if as_service podman container exists pricetag-migrate; then
+  echo 'Waiting for the MaaS schema migration container left by an interrupted start...' >&2
+  state=true
+  for ((waited = 0; waited < 600; waited += 5)); do
+    state="$(as_service podman container inspect pricetag-migrate --format '{{.State.Running}}' 2>/dev/null)" ||
+      die 'could not inspect the leftover MaaS schema migration container'
+    [[ "${state}" == true ]] || break
+    sleep 5
+  done
+  if [[ "${state}" == true ]]; then
+    die 'the MaaS schema migration container left by an earlier start is still running after 10 minutes' \
+      'and was left running: interrupting CREATE INDEX CONCURRENTLY can leave an invalid index, and a' \
+      'build against a large or busy database can legitimately take longer. Let it finish (podman logs' \
+      'pricetag-migrate, run as the service account, shows its progress), then run scripts/pricetag/start again.'
+  fi
+  as_service podman rm pricetag-migrate >/dev/null 2>&1 || true
+fi
+# A verify one-shot left behind by an interrupted start holds the
+# migration's reserved address. Unlike the migration it is read-only,
+# so any leftover is simply removed — before the address selection
+# below, so it can neither skew that selection (podman 5 reports
+# in-use addresses) nor collide with the fresh claim (podman 4.9
+# does not).
+as_service podman rm -f pricetag-verify >/dev/null 2>&1 || true
 network_json="$(as_service podman network inspect --format json pricetag-private)" ||
   die 'could not inspect the private MaaS network'
 service_addresses="$(printf '%s' "${network_json}" | python3 "${SCRIPT_DIR}/private-network.py" addresses)" ||
@@ -61,7 +97,9 @@ service_addresses="$(printf '%s' "${network_json}" | python3 "${SCRIPT_DIR}/priv
 printf '%s' "${service_addresses}" | python3 "${SCRIPT_DIR}/private-network.py" configure \
   "${units}/pricetag-maas.container" "${units}/pricetag-gateway.container" \
   "${units}/pricetag-metering.container" ||
-  die 'could not restrict MaaS trusted peers to the host and required services'
+  die 'could not assign fixed private addresses to the MaaS, gateway and metering containers'
+migrate_address="$(printf '%s' "${service_addresses}" | python3 -c 'import json, sys; print(json.load(sys.stdin)["migrate"])')" ||
+  die 'could not select a private address for the MaaS schema migration'
 as_service systemctl --user daemon-reload
 if [[ "${external_database}" == 1 ]]; then
   python3 "${SCRIPT_DIR}/external-database" check ||
@@ -82,6 +120,53 @@ else
     install -m 0600 /dev/null "${DEPLOY_DIR}/postgres-bootstrap.done"
   fi
 fi
+# enmaas-api creates no tables at runtime: run its idempotent, advisory-locked
+# migration as the service account before the API starts. The quadlet image
+# reference is an immutable local ID, and the env file carries DATABASE_URL
+# (with sslrootcert for verify-full external databases); database readiness
+# is already established above. The image starts the API through CMD (no
+# ENTRYPOINT), so the migration is a plain command override; --workdir pins
+# the image's /srv/enmaas-api layout and PYTHONDONTWRITEBYTECODE=1 states
+# the no-writes contract. The one-shot carries a stable name so the wait-out
+# above can target it across starts. The explicit --ip address is disjoint
+# from the service units' static addresses, so a container left behind by a
+# failed cleanup cannot block them, and the run itself is the atomic claim —
+# netavark rejects an address taken in between with a loud IPAM error.
+maas_image="$(sed -n 's/^Image=//p' "${units}/pricetag-maas.container" | head -n 1)"
+[[ -n "${maas_image}" ]] || die 'could not read the MaaS image from the prepared quadlet'
+maas_ca_mount=()
+if [[ -f "${DEPLOY_DIR}/external-ca.crt" ]]; then
+  maas_ca_mount=(-v "${DEPLOY_DIR}/external-ca.crt:/etc/pricetag-external-ca.crt:ro")
+fi
+as_service podman run --rm --name pricetag-migrate --network pricetag-private --ip "${migrate_address}" \
+  --workdir /srv/enmaas-api -e PYTHONDONTWRITEBYTECODE=1 \
+  --env-file "${DEPLOY_DIR}/maas.env" "${maas_ca_mount[@]}" "${maas_image}" python -m app.migrate ||
+  die 'MaaS schema migration failed'
+# The migration's CREATE INDEX CONCURRENTLY IF NOT EXISTS cannot repair an
+# index left invalid by an interrupted build — the rerun finds the catalog
+# entry and skips it. An invalid index is ignored by the planner, so
+# queries stay correct while labels lookups silently lose their index.
+# Verify the end state through the same image, network, address and
+# credentials the migration itself used, before the service starts; the
+# check fails closed, and REINDEX INDEX CONCURRENTLY repairs the index.
+# The address reuse is safe — the sequential --rm run above released its
+# claim before returning. The check carries its own stable name so the
+# removal above can clear a leftover from an interrupted start; it is
+# read-only, so unlike the migration it needs no wait-out.
+as_service podman run --rm --name pricetag-verify --network pricetag-private --ip "${migrate_address}" \
+  --workdir /srv/enmaas-api -e PYTHONDONTWRITEBYTECODE=1 \
+  --env-file "${DEPLOY_DIR}/maas.env" "${maas_ca_mount[@]}" "${maas_image}" \
+  python -c 'import os, psycopg
+with psycopg.connect(os.environ["DATABASE_URL"]) as connection:
+    row = connection.execute("SELECT i.indisvalid FROM pg_index i"
+                             " JOIN pg_class c ON i.indexrelid = c.oid"
+                             " WHERE c.relname = %s",
+                             ("idx_api_keys_labels_gin",)).fetchone()
+if row is None or not row[0]:
+    raise SystemExit("idx_api_keys_labels_gin is missing or invalid after the"
+                     " migration; REINDEX INDEX CONCURRENTLY"
+                     " idx_api_keys_labels_gin repairs it")' ||
+  die 'MaaS schema verification failed'
 as_service systemctl --user restart pricetag-maas.service
 python3 - <<'PY'
 import time, urllib.request

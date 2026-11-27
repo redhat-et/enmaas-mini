@@ -11,32 +11,46 @@ one image at a time.
 
 EnMaaS-opps pins digest-identified images per environment. The
 `quay.io/redhat-services-prod/enmaas-tenant/*` mirrors are the set used by its
-app-sre-prod and app-sre-stage environments; they require Quay credentials with
-`redhat-services-prod` pull access (`sudo podman login quay.io` before install).
+app-sre-prod and app-sre-stage environments. Since 2026-11-26 this repository
+pulls every application image anonymously from public repositories (the
+`redhat-et/praxis-ai` mirror instead of the `enmaas-tenant` original), so no
+Quay login is required for installation.
 
-| Component | This repository (previous) | EnMaaS-opps app-sre pin | Status |
+| Component | This repository | EnMaaS-opps app-sre pin | Status |
 | --- | --- | --- | --- |
-| Praxis gateway | `quay.io/opendatahub/praxis-experimental@sha256:502f120f…` (praxis-proxy/experimental line, rev `5667c4ac`) | `quay.io/redhat-services-prod/enmaas-tenant/praxis-ai@sha256:bcc31cac…` (redhat-et/praxis-ai line, rev `d7ef08ce`) | Switched |
+| Praxis gateway | `quay.io/redhat-et/praxis-ai@sha256:240bcdaa…` (rev `548f61cc`; public mirror of the same source line) | `quay.io/redhat-services-prod/enmaas-tenant/praxis-ai@sha256:bcc31cac…` (redhat-et/praxis-ai line, rev `d7ef08ce`) | Switched — experimental → enmaas-tenant (2026-11-12) → public mirror (2026-11-26, anonymous pull) |
 | Metering | `quay.io/redhat-et/secure-single-server-pricetag-metering@sha256:dabb2f35…` | `quay.io/redhat-services-prod/enmaas-tenant/metering-service@sha256:4c2d485a…` | Unblocked — the standalone management layer is [PR #149](https://github.com/redhat-et/pricetag-metering/pull/149); this repository builds and deploys that source (validated 2026-11-12), and the tenant digest swap lands when the PR merges and Konflux rebuilds |
-| MaaS | `quay.io/redhat-et/secure-single-server-maas-standalone@sha256:0bec6ef5…` | `quay.io/enmaas/maas-api@sha256:bbf5b77a…` | Blocked — no standalone mode upstream (see below) |
+| MaaS | `quay.io/redhat-et/enmaas-api@sha256:fb8e02ab…` (rev `aea9c56`) | `quay.io/enmaas/maas-api@sha256:bbf5b77a…` | Switched (2026-11-26) — the published `redhat-et/enmaas-api` key-validation service runs standalone (FastAPI + psycopg, same `api_keys` schema, `X-MaaS-*` header contract and `/internal/v1/api-keys/validate`), so the Ladas Go fork is retired |
 | PostgreSQL | `registry.access.redhat.com/hi/postgresql@sha256:52e94353…` (`17.12-fips`, per-arch manifests) | CNPG cluster / RDS (Kubernetes-specific) | Not applicable |
 
 The `quay.io/modden/*` images used by the non-AppSRE EnMaaS-opps environments
 are private to that namespace; the `enmaas-tenant` mirrors build from the same
 `redhat-et/praxis-ai` source line and carry the same filter-config schema.
 
-## Why metering and MaaS cannot swap yet
+## Why metering cannot swap yet
 
 The praxis switch was a pin swap because praxis is a config-driven proxy with
-no Kubernetes dependency. The metering and MaaS images are different: the
-EnMaaS builds come from the upstream sources, which assume Kubernetes (CRD
-catalog, ConfigMap pipeline config, partner/session admin flows), while this
-repository's pins are **standalone forks** carrying small patch sets:
+no Kubernetes dependency. The MaaS switch (2026-11-26) was similar: the
+published `redhat-et/enmaas-api` image is a standalone FastAPI/psycopg
+key-validation service — no Kubernetes, no CRDs — that implements the same
+`api_keys` schema (maas-api migrations 0001–0006, `sk-oai-{id}_{secret}` key
+format), the `X-MaaS-Username`/`X-MaaS-Group` header contract and the
+`/internal/v1/api-keys/validate` endpoint. It reads `DATABASE_URL` (plus
+`TENANT`, `API_KEY_MAX_EXPIRATION_DAYS`, `METRICS_ENABLED` policy knobs) from a
+generated env file, and the installer runs its idempotent
+`python -m app.migrate` before the service starts. Identity headers are
+trusted from any peer on `pricetag-private`, so the private network topology
+is the trust boundary (the previous Go image enforced `MAAS_TRUSTED_PROXY_CIDRS`
+explicitly).
+
+Metering is the remaining holdout: the EnMaaS build comes from the upstream
+source, which assumes Kubernetes (CRD catalog, ConfigMap pipeline config,
+partner/session admin flows), while this repository's pin is a **standalone
+fork** carrying a small patch set:
 
 | Component | EnMaaS image source | Standalone fork | Fork-only patches |
 | --- | --- | --- | --- |
 | Metering | `redhat-et/pricetag-metering` (upstream main has no standalone layer as of 2026-11-12) | `Ladas/pricetag-metering` branch `feat/latest-upstream-standalone` | `/api/v1/management/*` (users, budgets, prices, keys), `GATEWAY_MODELS_FILE`, `MANAGEMENT_API_SECRET`/`MANAGEMENT_PUBLIC_ORIGIN`, `USER_DASHBOARDS_ENABLED` |
-| MaaS | `opendatahub-io/models-as-a-service` (no `MAAS_RUNTIME_MODE` upstream) | `Ladas/models-as-a-service` branch `feat/standalone-runtime-minimal` | `MAAS_RUNTIME_MODE=standalone`, `MAAS_SUBSCRIPTION_MODE=standalone` (run without Kubernetes) |
 
 ### Metering qualification against the EnMaaS tenant image
 
@@ -82,14 +96,11 @@ them), then switch the pins once EnMaaS builds include them:
    merges, follow `main`, let the image workflow publish, pin the
    digest, and the EnMaaS tenant digest follows on Konflux's next build
    cycle.
-2. MaaS: the official standalone home already exists — `redhat-et/maas-api`
-   with its `MAAS_DEPLOYMENT_PROFILE=enmaas` profile. What is missing is a
-   published image (no CI yet, though a `Dockerfile.konflux` is in tree).
-   Switching this repository to it additionally requires quadlet changes:
-   the profile uses `MAAS_DEPLOYMENT_PROFILE=enmaas` where the generated
-   unit sets `MAAS_RUNTIME_MODE=standalone`, and the supported environment
-   for the EnMaaS key-management API (database URL file, key expiry, admin
-   groups, trusted proxies) must be qualified against the profile.
+2. MaaS: **done** — `redhat-et/enmaas-api` publishes a standalone image
+   (`quay.io/redhat-et/enmaas-api@sha256:fb8e02ab…`, rev `aea9c56`); this
+   repository pins it since 2026-11-26 with a generated `maas.env`
+   (`DATABASE_URL` plus policy knobs) and an explicit pre-start
+   `python -m app.migrate`, and no longer builds the Ladas Go fork.
 3. Re-run the qualification above against the resulting builds and swap the
    pins; the installer and manage CLI then work unchanged for metering, and
    with the quadlet env changes for maas.
@@ -108,7 +119,7 @@ The EnMaaS project's repositories in `github.com/redhat-et` (verified
 | `redhat-et/pricetag-metering` | Metering service and dashboard; Konflux builds `enmaas-tenant/metering-service` from its internal mirror (no container workflow in the public repo) |
 | `redhat-et/maas-api` | **New (2026-11-05): dedicated public repo for the standalone maas-api used by EnMaaS** — extracted from the `maas-api/` subtree of `opendatahub-io/models-as-a-service` with history preserved, based on `yossiovadia/models-as-a-service:feat/standalone-api-key-mode`; adds the `MAAS_DEPLOYMENT_PROFILE=enmaas` profile (with `MAAS_SUBSCRIPTION_MODE=standalone`), hermetic vendored builds and a `Dockerfile.konflux`. No CI workflow or published image yet. |
 | `redhat-et/enmaas-platform` | Services monorepo: `apps/enmaas-policy` (stateless authorization and QoS policy service for praxis; publishes `quay.io/modden/enmaas-policy`), with `apps/enmaas-api` planned as a `git subtree` import from `redhat-et/enmaas-api` |
-| `redhat-et/enmaas-api` | Key-validation API service deployed in AppSRE (GitHub fork of `redhat-et/turnstile`) |
+| `redhat-et/enmaas-api` | Key-validation API service deployed in AppSRE (GitHub fork of `redhat-et/turnstile`); publishes `quay.io/redhat-et/enmaas-api`, this repo's maas pin since 2026-11-26 |
 | `redhat-et/EnMaaS-opps` | Deployment and operations repository (the gold standard) |
 | `redhat-et/enmaas-mini` | This repository — the single-host standalone deployment |
 | `redhat-et/pricetag` | PriceTag enterprise control-plane deployment and operations home (OpenShift) |
@@ -118,9 +129,9 @@ External origins and standalone forks:
 
 | Component | Origin | Standalone fork (this repo's pins) | New official standalone home |
 | --- | --- | --- | --- |
-| Praxis | `praxis-proxy/ai` (plus the separate `praxis-proxy/experimental` repo behind the previous pin) | none needed — switched to the EnMaaS build | — |
+| Praxis | `praxis-proxy/ai` (plus the separate `praxis-proxy/experimental` repo behind the previous pin) | none needed — switched to the public `redhat-et/praxis-ai` mirror | — |
 | Metering | `vishnoianil/pricetag-metering` (dormant since 2026-09-30) | `Ladas/pricetag-metering:feat/latest-upstream-standalone` (actively maintained) | none yet — the management layer exists only in the fork |
-| MaaS | `opendatahub-io/models-as-a-service` | `Ladas/models-as-a-service:feat/standalone-runtime-minimal` (builds on `yossiovadia`'s `feat/standalone-api-key-mode-v2`) | `redhat-et/maas-api` |
+| MaaS | `opendatahub-io/models-as-a-service` | none since 2026-11-26 — the pin is the published `redhat-et/enmaas-api` image (the Ladas Go fork is retired) | `redhat-et/enmaas-api` |
 
 ### Image build pipelines
 
@@ -129,9 +140,11 @@ inside each image, and which pipeline builds it — lives in the
 [image to repository correlation](image-repo-correlation.md) page. In short:
 Konflux builds the `enmaas-tenant` app-sre images from internal mirrors of
 `redhat-et/praxis-ai` and `redhat-et/pricetag-metering`; `redhat-et/praxis-ai`
-additionally publishes `quay.io/modden/praxis-ai` from its own workflow; and
-this repository's own `pricetag-images.yml` builds the standalone pins from
-the Ladas fork revisions pinned in that workflow.
+additionally publishes the public `quay.io/modden/praxis-ai` and its
+`quay.io/redhat-et/praxis-ai` mirror from its own workflow;
+`redhat-et/enmaas-api` publishes its own image; and this repository's own
+`pricetag-images.yml` builds the standalone metering pin from the revision
+pinned in that workflow.
 
 Consequences for making changes: the Konflux-built `enmaas-tenant` images
 follow the public repositories through the internal mirror, so code changes
@@ -177,6 +190,56 @@ Validated for the praxis switch on a fresh AWS RHEL 9 host (2026-11-12):
 Known difference: the `enmaas-tenant` build is compiled without the `otel`
 feature, so the generated telemetry settings produce a startup warning and
 OTLP export is disabled (the experimental image enabled `otel`).
+
+Validated for the published-image switch (`redhat-et/praxis-ai` rev `548f61cc`
+plus `redhat-et/enmaas-api` rev `aea9c56`, source-built metering `e4ba826`)
+on a fresh AWS RHEL 9 host (2026-11-26):
+
+- Anonymous pull of both public pins; revision-label checks pass; the
+  enmaas-api quadlet runs the generated `maas.env` and the installer's
+  pre-start `python -m app.migrate` applies migrations 0001–0006 idempotently.
+- The generated `gateway.json` loads with the split admin listener
+  (`admin.metrics_address`, label-gated) and `intelligent_route`
+  `body_authoritative` (label-gated): praxis-ai resolves `X-Gateway-Model`
+  during the body pre-read pass, so without `body_authoritative` a
+  client-forged routing header would select or 404 the route before any
+  filter strips it; with it, the body model stays the only routing input
+  (verified: forged headers + valid body → 200, invalid body → 404).
+- Full mock battery: benchmark (720 requests, exact per-user accounting),
+  acceptance (44 checks), routing (upgrade contract, catalog/protocol/
+  streaming/forged-alias and accounting groups), quota, pricing,
+  price-fallback, public-boundary and key-demotion all pass.
+- Container-demo qualification (the CI demo path, linux/amd64, source
+  metering `e4ba826`): 14 of 17 checks pass — key-demotion,
+  public-boundary, pricing-api, quota-matrix, the fixture lifecycle and
+  every browser scenario except key-lifecycle. The three failures
+  (native-routing, documented-cli-api, browser-key-lifecycle) all reduce
+  to the key-revocations gap below: the routing cleanup and the CLI
+  dry-run key-count call the endpoint directly, and the browser scenario
+  drives the dashboard's revoke-all action.
+- 100-user load: 100 concurrent users, one request each, 100/100 HTTP 200
+  in 3.3s; `perf verify` confirms exact per-user event and token totals.
+
+Known gap (upstream, blocks the key-revocations management feature): every
+metering revision implements revoke-all by calling
+`POST {maas}/v1/api-keys/bulk-revoke`, which the published enmaas-api does not
+implement (it offers create, search, get and `DELETE /v1/api-keys/{key_id}`
+only). With the new pin the metering therefore answers HTTP 502 for
+`POST /api/v1/management/key-revocations`, which fails `rhel-routing.py`'s
+cleanup, the admin dashboard's revoke-keys action and the `remote-demo.py`
+revocation step. A metering revision that revokes via search plus per-key
+DELETE (or an enmaas-api bulk-revoke endpoint) is required before the feature
+works again; the draft PR tracks that dependency.
+
+Architectural note (trust model): enmaas-api authorizes management calls by
+the `X-MaaS-Username`/`X-MaaS-Group` headers any network peer may present and
+offers no trusted-proxy restriction, so `pricetag-private` is the entire trust
+boundary. The previous Ladas image restricted those headers to the gateway
+and metering addresses via `MAAS_TRUSTED_PROXY_CIDRS` — exactly the two
+containers that hold the deployment secrets today — so the switch does not
+widen the internet-facing gateway's reach; the added peers (the PostgreSQL
+container and the one-shot migration) do not originate HTTP calls. A
+peer-restriction knob in enmaas-api would be needed to exclude them.
 
 ## Secrets
 

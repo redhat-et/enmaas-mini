@@ -94,6 +94,62 @@ class InstallTest(unittest.TestCase):
             self.assertIn('sudo scripts/pricetag/start', result.stdout)
             self.assertFalse((root / 'bootstrap.done').exists())
 
+    def test_start_migration_recovery_never_kills_a_running_migration(self):
+        # Execute the actual recovery block against a recording podman stub:
+        # an active long-running migration is never removed (the bound stops
+        # this start, not the container), a finished leftover is cleared, and
+        # an inspect failure stops the start loudly. No real containers.
+        source = (ROOT / 'scripts/pricetag/start').read_text()
+        block = source[source.index('if as_service podman container exists pricetag-migrate'):
+                       source.index('network_json=')]
+        for mode in ('running', 'exited', 'inspect-fail'):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                log = root / 'log'
+                script = root / 'check.sh'
+                script.write_text(
+                    'set -euo pipefail\n'
+                    'log="$1"; mode="$2"\n'
+                    'as_service() {\n'
+                    '  shift\n'
+                    '  case "$1 $2" in\n'
+                    '    "container exists") return 0 ;;\n'
+                    '    "container inspect")\n'
+                    '      [[ "${mode}" == inspect-fail ]] && return 1\n'
+                    '      [[ "${mode}" == running ]] && echo true || echo false\n'
+                    '      return 0 ;;\n'
+                    '    rm*) printf \'podman %s\\n\' "$*" >> "${log}"; return 0 ;;\n'
+                    '    *) printf \'unexpected podman %s\\n\' "$*" >> "${log}"; return 1 ;;\n'
+                    '  esac\n'
+                    '}\n'
+                    'die() { printf \'die: %s\\n\' "$*" >> "${log}"; exit 1; }\n'
+                    'sleep() { :; }\n'
+                    + block +
+                    'printf \'COMPLETED\\n\' >> "${log}"\n')
+                result = subprocess.run(['bash', str(script), str(log), mode],
+                                        text=True, capture_output=True)
+                calls = log.read_text()
+                if mode == 'running':
+                    self.assertEqual(result.returncode, 1)
+                    self.assertIn('still running after 10 minutes', calls)
+                    self.assertIn('was left running', calls)
+                    # A second invocation must never kill the first one's
+                    # migration: no removal of any kind may target it.
+                    self.assertNotIn('podman rm', calls)
+                    self.assertNotIn('COMPLETED', calls)
+                elif mode == 'exited':
+                    self.assertEqual(result.returncode, 0)
+                    self.assertIn('podman rm pricetag-migrate\n', calls)
+                    # The read-only verify leftover is cleared before the
+                    # address selection that follows the block.
+                    self.assertIn('podman rm -f pricetag-verify\n', calls)
+                    self.assertIn('COMPLETED', calls)
+                else:
+                    self.assertEqual(result.returncode, 1)
+                    self.assertIn('could not inspect the leftover', calls)
+                    self.assertNotIn('podman rm', calls)
+                    self.assertNotIn('COMPLETED', calls)
+
     def test_summary_shows_all_images_and_provider_choices(self):
         sys.path.insert(0, str(ROOT / 'scripts/pricetag'))
         from prepare import POSTGRES
@@ -167,18 +223,22 @@ class InstallTest(unittest.TestCase):
         self.assertIsNone(args.metering_branch)
         self.assertEqual(installer.METERING_REPO, 'https://github.com/redhat-et/pricetag-metering.git')
         source = self.image_args('--image-mode', 'source')
-        self.assertEqual(source.maas_branch, installer.MAAS_BRANCH)
+        self.assertEqual(source.maas_image, installer.PUBLISHED_MAAS_IMAGE)
         self.assertEqual(source.metering_branch, installer.METERING_BRANCH)
         self.assertEqual(args.metering_revision, installer.METERING_COMMIT)
+        self.assertEqual(args.maas_revision, installer.MAAS_COMMIT)
         self.assertEqual(source.metering_revision, installer.SOURCE_METERING_COMMIT)
         self.assertEqual(module('build-metering').REVISION, installer.SOURCE_METERING_COMMIT)
-        for flags in (['--image-mode', 'source', '--maas-branch', '../bad'],
-                      ['--image-mode', 'source', '--maas-branch', 'feature', '--maas-revision', 'a' * 40]):
+        for flags in (['--image-mode', 'source', '--metering-branch', '../bad'],
+                      ['--image-mode', 'source', '--metering-branch', 'feature',
+                       '--metering-revision', 'a' * 40],
+                      # MaaS has no source-build mode anymore.
+                      ['--maas-branch', 'feature']):
             with self.assertRaises(SystemExit):
                 self.image_args(*flags)
 
     def test_branch_build_records_resolved_commit(self):
-        args = self.image_args('--image-mode', 'source', '--maas-branch', 'feature/test')
+        args = self.image_args('--image-mode', 'source', '--metering-branch', 'feature/test')
         resolved = 'c' * 40
         with tempfile.TemporaryDirectory() as directory, \
                 patch.object(installer, 'CACHE', Path(directory)), patch.object(installer, 'checkout') as checkout:
@@ -188,19 +248,17 @@ class InstallTest(unittest.TestCase):
                 if capture:
                     if command[-1] == '{{.Architecture}}':
                         return 'amd64'
+                    if command[-1] == '{{.Config.WorkingDir}}|{{.Config.Entrypoint}}':
+                        return '/srv/enmaas-api|[]'
                     return {installer.PRAXIS_IMAGE: installer.PRAXIS_REVISION,
-                            installer.MAAS_IMAGE: resolved,
-                            installer.METERING_IMAGE: args.metering_revision}[command[3]]
+                            args.maas_image: args.maas_revision,
+                            installer.METERING_IMAGE: resolved}[command[3]]
             with patch.object(installer, 'run', side_effect=execute) as run:
                 installer.acquire_images(args, 'amd64')
+            self.assertEqual(len(checkout.call_args_list), 1)
             self.assertEqual(checkout.call_args_list[0].args[2], 'refs/heads/feature/test')
-            self.assertEqual(args.maas_revision, resolved)
-            self.assertEqual(checkout.call_args_list[1].args[2],
-                             'refs/heads/standalone-management')
             self.assertEqual(args.metering_revision, resolved)
             self.assertTrue(any('--revision' in c.args[0] and resolved in c.args[0]
-                                for c in run.call_args_list))
-            self.assertTrue(any('--expected-commit' in c.args[0] and resolved in c.args[0]
                                 for c in run.call_args_list))
 
     def test_demo_fixture_is_mock_only(self):
@@ -226,6 +284,8 @@ class InstallTest(unittest.TestCase):
             if capture:
                 if command[-1] == '{{.Architecture}}':
                     return 'amd64'
+                if command[-1] == '{{.Config.WorkingDir}}|{{.Config.Entrypoint}}':
+                    return '/srv/enmaas-api|[]'
                 return {installer.PRAXIS_IMAGE: installer.PRAXIS_REVISION,
                         args.maas_image: args.maas_revision,
                         args.metering_image: args.metering_revision}[command[3]]
@@ -237,6 +297,28 @@ class InstallTest(unittest.TestCase):
         with patch.object(installer, 'run', return_value='wrong-source'):
             with self.assertRaisesRegex(ValueError, 'source revision'):
                 installer.acquire_images(args, 'amd64')
+
+    def test_maas_image_layout_is_verified_at_acquire_time(self):
+        args = self.image_args('--image-mode', 'published',
+                               '--maas-image', 'quay.io/example/maas@sha256:' + 'a' * 64,
+                               '--metering-image', 'quay.io/example/metering@sha256:' + 'b' * 64)
+
+        def execute(command, capture=False, **kwargs):
+            if capture:
+                if command[-1] == '{{.Architecture}}':
+                    return 'amd64'
+                if command[-1] == '{{.Config.WorkingDir}}|{{.Config.Entrypoint}}':
+                    return layout
+                return {installer.PRAXIS_IMAGE: installer.PRAXIS_REVISION,
+                        args.maas_image: args.maas_revision,
+                        args.metering_image: args.metering_revision}[command[3]]
+        # start's `python -m app.migrate --workdir /srv/enmaas-api` contract
+        # — a CMD-based image with no entrypoint — must be caught at acquire
+        # time, before deployment.
+        for layout in ('/elsewhere|[]', '/srv/enmaas-api|[./wrapper.sh]'):
+            with self.subTest(layout=layout), patch.object(installer, 'run', side_effect=execute):
+                with self.assertRaisesRegex(ValueError, 'migration layout'):
+                    installer.acquire_images(args, 'amd64')
 
     def test_praxis_override_requires_digest_and_matching_revision_option(self):
         image = 'quay.io/example/praxis@sha256:' + 'c' * 64
@@ -262,7 +344,11 @@ class InstallTest(unittest.TestCase):
                      args.metering_image: args.metering_revision}
         def execute(command, capture=False, **kwargs):
             if capture:
-                return 'amd64' if command[-1] == '{{.Architecture}}' else revisions[command[3]]
+                if command[-1] == '{{.Architecture}}':
+                    return 'amd64'
+                if command[-1] == '{{.Config.WorkingDir}}|{{.Config.Entrypoint}}':
+                    return '/srv/enmaas-api|[]'
+                return revisions[command[3]]
         with patch.object(installer, 'run', side_effect=execute) as runner:
             installer.acquire_images(args, 'amd64')
         self.assertTrue(any(c.args[0] == ['podman', 'pull', image] for c in runner.call_args_list))
@@ -284,15 +370,20 @@ class InstallTest(unittest.TestCase):
                 if capture:
                     if command[-1] == '{{.Architecture}}':
                         return 'amd64'
+                    if command[-1] == '{{.Config.WorkingDir}}|{{.Config.Entrypoint}}':
+                        return '/srv/enmaas-api|[]'
                     return {installer.PRAXIS_IMAGE: installer.PRAXIS_REVISION,
-                            installer.MAAS_IMAGE: args.maas_revision,
+                            args.maas_image: args.maas_revision,
                             installer.METERING_IMAGE: args.metering_revision}[command[3]]
             with patch.object(installer, 'run', side_effect=execute) as run:
                 installer.acquire_images(args, 'amd64')
-            self.assertEqual([call.args[2] for call in checkout.call_args_list], ['a' * 40, 'b' * 40])
+            # Only metering is built from source; the MaaS revision merely
+            # verifies the published image label.
+            self.assertEqual([call.args[2] for call in checkout.call_args_list], ['b' * 40])
             commands = [list(map(str, call.args[0])) for call in run.call_args_list]
             self.assertTrue(any('--revision' in c and 'b' * 40 in c for c in commands))
-            self.assertTrue(any('--expected-commit' in c and 'a' * 40 in c for c in commands))
+            self.assertTrue(any(c[:2] == ['podman', 'pull'] and args.maas_image in c
+                                for c in commands))
 
     def test_source_build_tags_the_metering_image_that_is_imported(self):
         args = self.image_args('--image-mode', 'source', '--maas-revision', 'a' * 40,
@@ -304,15 +395,17 @@ class InstallTest(unittest.TestCase):
                 if capture:
                     if command[-1] == '{{.Architecture}}':
                         return 'amd64'
+                    if command[-1] == '{{.Config.WorkingDir}}|{{.Config.Entrypoint}}':
+                        return '/srv/enmaas-api|[]'
                     return {installer.PRAXIS_IMAGE: installer.PRAXIS_REVISION,
-                            installer.MAAS_IMAGE: args.maas_revision,
+                            args.maas_image: args.maas_revision,
                             installer.METERING_IMAGE: args.metering_revision}[command[3]]
             with patch.object(installer, 'run', side_effect=execute) as run:
                 images = installer.acquire_images(args, 'amd64')
             commands = [list(map(str, call.args[0])) for call in run.call_args_list]
             built = next(command for command in commands if command[1].endswith('build-metering'))
             self.assertEqual(built[built.index('--tag') + 1], installer.METERING_IMAGE)
-            self.assertEqual(images, (installer.MAAS_IMAGE, installer.METERING_IMAGE))
+            self.assertEqual(images, (args.maas_image, installer.METERING_IMAGE))
             # A standalone build without --tag must still land on the imported
             # tag, and a --revision override derives its own matching tag.
             builder = module('build-metering')

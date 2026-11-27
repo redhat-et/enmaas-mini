@@ -1,18 +1,18 @@
 # Application images
 
 The installer defaults to the previous qualified, digest-pinned release.
-Use source mode for the latest-upstream account/UI candidate before publication.
-Praxis and PostgreSQL remain pinned published images in either mode.
+Use source mode for the latest metering candidate before publication. Praxis,
+MaaS and PostgreSQL remain pinned published images in either mode; only the
+PriceTag metering image has a source-build mode.
 
 | Mode | MaaS and PriceTag |
 | --- | --- |
-| `--image-mode published` (default) | Pull the pinned MaaS and PriceTag demo images. No application source checkout or Go build. |
-| `--image-mode source` | Build from a branch or commit on RHEL to test a new version. |
+| `--image-mode published` (default) | Pull the pinned MaaS and PriceTag demo images. No application source checkout. |
+| `--image-mode source` | Build PriceTag from a branch or commit on RHEL to test a new version; MaaS is still the published `enmaas-api` image. |
 
-The installer checks image source labels and CPU architecture.
-
-Application images retain their existing `secure-single-server-*` registry
-names; moving the source repository does not change installed image digests.
+The installer checks image source labels and CPU architecture. MaaS is the
+published `quay.io/redhat-et/enmaas-api` image (built from the private
+`redhat-et/enmaas-api` source); it is never built from source here.
 
 ## Open the installation session
 
@@ -31,7 +31,8 @@ Run examples below in **this SSH session**. New shell? Restore
 Publication repositories:
 
 ```text
-quay.io/redhat-et/secure-single-server-maas-standalone
+quay.io/redhat-et/praxis-ai
+quay.io/redhat-et/enmaas-api
 quay.io/redhat-et/secure-single-server-pricetag-metering
 ```
 
@@ -58,16 +59,14 @@ options](providers.md). Never put provider keys in command-line arguments.
 </details>
 
 <details markdown="1">
-<summary>Build from the latest demo branches</summary>
+<summary>Build from the latest metering branch</summary>
 
-Source mode defaults to these fork branches:
-
-- [MaaS: feat/standalone-runtime-minimal](https://github.com/Ladas/models-as-a-service/tree/feat/standalone-runtime-minimal).
-- [PriceTag: feat/latest-upstream-standalone](https://github.com/Ladas/pricetag-metering/tree/feat/latest-upstream-standalone).
+Source mode defaults to the
+[PriceTag standalone-management branch](https://github.com/redhat-et/pricetag-metering/tree/standalone-management).
 
 The candidate reuses upstream **My usage** and **API keys** at `/account`, with
 the standalone administration and authorization changes. The previous published
-image has **My keys** at `/management`. Each branch resolves to a full commit
+image has **My keys** at `/management`. The branch resolves to a full commit
 before building, recorded in the image label and checked on import.
 
 For the exact reviewed candidate, use
@@ -83,24 +82,21 @@ sudo scripts/pricetag/install --hostname "$GATEWAY_HOST" --image-mode source
 </details>
 
 <details markdown="1">
-<summary>Build another branch or commit</summary>
+<summary>Build another metering branch or commit</summary>
 
-For branches, add `--maas-branch BRANCH` and/or `--metering-branch BRANCH`
-to source mode. For pinned commits, use the block below. Sources: [MaaS fork](https://github.com/Ladas/models-as-a-service) and
-[PriceTag demo fork](https://github.com/Ladas/pricetag-metering).
+For branches, add `--metering-branch BRANCH` to source mode. For pinned commits,
+use the block below. Source: [PriceTag metering](https://github.com/redhat-et/pricetag-metering).
 
 ```console
 cd ~/secure-single-server
 read -r -p 'Gateway IP or DNS: ' GATEWAY_HOST
-read -r -p 'MaaS source commit: ' MAAS_REVISION
 read -r -p 'PriceTag source commit: ' METERING_REVISION
 sudo scripts/pricetag/install --hostname "$GATEWAY_HOST" \
-  --image-mode source --maas-revision "$MAAS_REVISION" --metering-revision "$METERING_REVISION"
+  --image-mode source --metering-revision "$METERING_REVISION"
 ```
 
-Use a branch **or** a full SHA per component, never both. Branches resolve to a
-printed commit before building. MaaS must include the standalone runtime;
-PriceTag schema/API changes need compatibility testing.
+Use a branch **or** a full SHA, never both. Branches resolve to a printed commit
+before building. PriceTag schema/API changes need compatibility testing.
 
 </details>
 

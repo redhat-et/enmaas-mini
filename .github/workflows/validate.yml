@@ -26,9 +26,6 @@ jobs:
             shellcheck_sha256: 68a8133197a50beb8803f8d42f9908d1af1c5540d4bb05fdfca8c1fa47decefc
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 35
-    env:
-      ENMAAS_TENANT_REGISTRY_USERNAME: ${{ secrets.ENMAAS_TENANT_REGISTRY_USERNAME }}
-      ENMAAS_TENANT_REGISTRY_PASSWORD: ${{ secrets.ENMAAS_TENANT_REGISTRY_PASSWORD }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -62,19 +59,14 @@ jobs:
       - name: Check external-client TLS, caller fixtures, isolation and cancellation
         run: python3 -B tests/remote-client/unit.py
       - name: Verify anonymous pulls of released installer images
+        # Every installer pin moved to a public repository with the
+        # redhat-et switch, so no credentialed (tenant-registry) pull path
+        # remains in the deployment to verify. The legacy Praxis
+        # references elsewhere in the tree (the common installer default
+        # and the external-services fixtures, both in the public
+        # quay.io/opendatahub repository) also pull anonymously.
         if: matrix.arch == 'amd64'
         run: python3 tests/pricetag/published-images.py --engine docker
-      - name: Verify the private Praxis tenant image with registry credentials
-        if: matrix.arch == 'amd64' && env.ENMAAS_TENANT_REGISTRY_USERNAME != '' && env.ENMAAS_TENANT_REGISTRY_PASSWORD != ''
-        run: |
-          set -euo pipefail
-          auth_dir="$(mktemp -d "${RUNNER_TEMP}/praxis-auth.XXXXXX")"
-          trap 'rm -rf "${auth_dir}"' EXIT
-          chmod 700 "${auth_dir}"
-          token="$(printf '%s:%s' "${ENMAAS_TENANT_REGISTRY_USERNAME}" "${ENMAAS_TENANT_REGISTRY_PASSWORD}" | base64 -w0)"
-          printf '{"auths":{"quay.io":{"auth":"%s"}}}\n' "${token}" > "${auth_dir}/config.json"
-          chmod 600 "${auth_dir}/config.json"
-          python3 tests/pricetag/published-images.py --engine docker --praxis-authfile "${auth_dir}/config.json"
       - name: Check bootc build contract without registry credentials
         run: |
           python3 bootc/tests/build.py

@@ -173,7 +173,6 @@ def main():
         for path in (DEPLOY / 'gateway').iterdir():
             path.chmod(0o644)
         (DEPLOY / 'gateway').chmod(0o755)
-        (DEPLOY / 'maas-db-url').chmod(0o644)
         (DEPLOY / 'm2m-secret').chmod(0o644)
         (DEPLOY / 'catalog').chmod(0o755)
         (DEPLOY / 'catalog/models.json').chmod(0o644)
@@ -183,7 +182,6 @@ def main():
             networks.append(name)
         private, mock = networks
         subnet = json.loads(podman('network', 'inspect', private))[0]['subnets'][0]
-        gateway = subnet['gateway']
         praxis_ip = str(ipaddress.ip_network(subnet['subnet']).network_address + 11)
         def start(role, image, network, *options):
             name = prefix + '-' + role
@@ -206,34 +204,54 @@ def main():
                    '-e', 'PGDATA=/var/lib/postgresql/data/pgdata')
         bootstrap_database(db)
         stage = 'maas'
+        # enmaas-api creates no tables at runtime: run its idempotent
+        # migration before the API, exactly as scripts/pricetag/start does.
+        # The hardened read-only rootfs is sufficient: app.migrate only
+        # executes DDL over the database connection; PYTHONDONTWRITEBYTECODE=1
+        # makes that no-writes contract explicit instead of relying on
+        # CPython silently skipping __pycache__ writes it cannot make on
+        # the read-only rootfs. DATABASE_URL's `pricetag-db`
+        # host resolves through the network alias start() gives the database
+        # container; the one-shot needs no alias of its own because name
+        # resolution is network-wide. The image starts the API via CMD (no
+        # ENTRYPOINT), so the migration is a plain command override from the
+        # pinned /srv/enmaas-api workdir, and the deployment's generated
+        # maas.env is the image's complete runtime contract — the
+        # MAAS_RUNTIME_MODE-style flags previously passed here belonged to
+        # the retired Ladas image. The plain-HTTP /health readiness below
+        # asserts the standalone binding. The one-shot takes a fixed address
+        # reserved from the TOP of the subnet: netavark's host-local IPAM
+        # hands dynamically attached containers — here only the database —
+        # addresses sequentially from the bottom of the range, and podman
+        # network inspect reports per-container addresses only on podman 5
+        # (the CI runner's 4.9 output has no containers map), so selecting
+        # from live state would silently degrade to the bottom of the range
+        # there and collide with the database's dynamic lease. The top host
+        # is beyond any allocation for this demo's handful of containers on
+        # every engine version and disjoint from the gateway's later static
+        # claim (and from the network and broadcast addresses the scan
+        # never touches), so the explicit --ip cannot collide, and the run
+        # itself is the atomic claim: netavark rejects an address taken in
+        # between with a loud IPAM error rather than double-allocating it.
+        network = ipaddress.ip_network(subnet['subnet'])
+        reserved = {ipaddress.ip_address(subnet['gateway']), ipaddress.ip_address(praxis_ip)}
+        migrate_ip = next(
+            str(ipaddress.ip_address(address))
+            for address in range(int(network.broadcast_address) - 1, int(network.network_address), -1)
+            if ipaddress.ip_address(address) not in reserved)
+        podman('run', '--rm', '--network', private, '--read-only', '--user', '1001:1001',
+               '--cap-drop', 'all', '--security-opt', 'no-new-privileges',
+               '--ip', migrate_ip, '--workdir', '/srv/enmaas-api',
+               '-e', 'PYTHONDONTWRITEBYTECODE=1',
+               '--env-file', DEPLOY / 'maas.env', images[1], 'python', '-m', 'app.migrate')
         maas = start('maas', images[1], private, '--read-only', '--user', '1001:1001',
-                    '-p', '127.0.0.1:18086:8080',
-                    '-v', str(DEPLOY / 'maas-db-url') + ':/run/secrets/db:ro,Z',
-                    '-e', 'DB_CONNECTION_URL_FILE=/run/secrets/db',
-                    '-e', 'MAAS_RUNTIME_MODE=standalone', '-e', 'MAAS_SUBSCRIPTION_MODE=standalone',
-                    '-e', 'ADDRESS=:8080', '-e', 'SECURE=false', '-e', 'API_KEY_MAX_EXPIRATION_DAYS=90',
-                    '-e', 'MAAS_ADMIN_GROUPS=single-server-admin',
-                    '-e', 'METRICS_SECURE=false', '-e', 'METRICS_ADDRESS=127.0.0.1:9090',
-                    '-e', 'MAAS_TRUSTED_PROXY_CIDRS=' + gateway + '/32')
+                    '-p', '127.0.0.1:18086:8080', '--env-file', DEPLOY / 'maas.env')
         ready('http://127.0.0.1:18086/health')
         # Only the metering container and loopback-published host mint keys.
         stage = 'metering'
         meter = start('metering', images[2], private, '--read-only', '--user', '1001:1001',
                       '-p', '127.0.0.1:18087:8080', '--env-file', DEPLOY / 'metering.env',
                       '-v', str(DEPLOY / 'catalog') + ':/etc/gateway-catalog:ro,Z')
-        meter_ip = json.loads(podman('inspect', meter))[0]['NetworkSettings']['Networks'][private]['IPAddress']
-        podman('rm', '-f', maas)
-        containers.remove(maas)
-        # Recreate with the specific metering peer address, not the whole subnet.
-        maas = start('maas', images[1], private, '--read-only', '--user', '1001:1001',
-                    '-p', '127.0.0.1:18086:8080', '-v', str(DEPLOY / 'maas-db-url') + ':/run/secrets/db:ro,Z',
-                    '-e', 'DB_CONNECTION_URL_FILE=/run/secrets/db',
-                    '-e', 'MAAS_RUNTIME_MODE=standalone', '-e', 'MAAS_SUBSCRIPTION_MODE=standalone',
-                    '-e', 'ADDRESS=:8080', '-e', 'SECURE=false', '-e', 'API_KEY_MAX_EXPIRATION_DAYS=90',
-                    '-e', 'MAAS_ADMIN_GROUPS=single-server-admin',
-                    '-e', 'METRICS_SECURE=false', '-e', 'METRICS_ADDRESS=127.0.0.1:9090',
-                    '-e', 'MAAS_TRUSTED_PROXY_CIDRS=' + gateway + '/32,' + meter_ip + '/32,' + praxis_ip + '/32')
-        ready('http://127.0.0.1:18086/health')
         ready('http://127.0.0.1:18087/ready')
         stage = 'bootstrap APIs'
         run([sys.executable, ROOT / 'scripts/pricetag/maas-key', 'create', '--subject', 'admin',

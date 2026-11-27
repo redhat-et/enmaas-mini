@@ -26,6 +26,23 @@ ROOT = Path(__file__).resolve().parents[2]
 ENGINE = os.environ.get("CONTAINER_ENGINE", "podman")
 IMAGE = os.environ.get("PRAXIS_IMAGE", "quay.io/opendatahub/praxis-experimental@sha256:"
                        "227d421e963c477038a884dc51ec880c5d0afa30098ae31028ecf85e963e40d5")
+# Praxis 0.7.4+ serves /healthy, /ready and /metrics on a dedicated
+# admin.metrics_address listener instead of the admin API port, and the older
+# praxis-experimental pins reject the new admin key at config parse. Configure
+# the split listener only for praxis-ai images.
+
+
+def praxis_ai(reference):
+    """Exact repository-name check for the praxis-ai fork.
+
+    The last path component before any :tag or @digest must be exactly
+    praxis-ai; praxis-experimental pins and unrelated praxis-* images take
+    the legacy configuration.
+    """
+    return reference.rsplit('/', 1)[-1].split('@', 1)[0].split(':', 1)[0] == 'praxis-ai'
+
+
+HEALTH_METRICS_SPLIT = praxis_ai(IMAGE)
 TOOL = ROOT / "scripts/remote-gateway/credentials"
 VALKEY_IMAGE = "docker.io/valkey/valkey@sha256:63346cb24a61221e76bdf41acce99b3968a9fa83d8122144deab45394b27b4f2"
 MOCK_IMAGE = "docker.io/library/python@sha256:519591d6871b7bc437060736b9f7456b8731f1499a57e22e6c285135ae657bf7"
@@ -246,6 +263,11 @@ class Gateway:
         return run(ENGINE, "port", self.name + "-mock", f"{port}/tcp").rsplit(":", 1)[1]
 
     def boot(self):
+        if HEALTH_METRICS_SPLIT:
+            self.config.setdefault("admin", {}).setdefault("metrics_address", "127.0.0.1:9902")
+            # The work-dir configuration is bind-mounted live, so a late boot()
+            # addition reaches the container started below.
+            (self.work / "gateway.json").write_text(json.dumps(self.config))
         run(*self.arguments, IMAGE, "-c", "/etc/praxis/shared-gateway.yaml")
         self.openai_port = self.port(8443 if self.scenario == "remote" else 8080)
         self.anthropic_port = self.openai_port if self.scenario == "remote" else self.port(8081)
@@ -255,12 +277,17 @@ class Gateway:
         if self.scenario == "remote":
             wait_for_gateway(lambda path, method: self.request(path, method=method, bearer="")[0])
             return
+        admin = self.config.get("admin") or {}
+        health = admin.get("metrics_address") or admin.get("address") or "127.0.0.1:9901"
+        port = health.rsplit(":", 1)[-1]
         for _ in range(40):
             try:
-                # GET /v1/models traverses this profile's unconditional
-                # quota filter and consumes a reservation without usage.
+                # The gateway shares the -mock container's network namespace
+                # (boot passes --network container:...-mock), so probing the
+                # gateway's loopback admin listener from the -mock container
+                # is correct. /healthy consumes no quota reservation.
                 run(ENGINE, "exec", self.name + "-mock", "python3", "-c",
-                    'import urllib.request; urllib.request.urlopen("http://127.0.0.1:9901/healthy", timeout=1).read()')
+                    'import urllib.request; urllib.request.urlopen("http://127.0.0.1:' + port + '/healthy", timeout=1).read()')
                 return
             except (OSError, urllib.error.URLError, RuntimeError):
                 pass

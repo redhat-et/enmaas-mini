@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Assign fixed peers and restrict MaaS identity trust to required services."""
+"""Assign fixed private addresses to the MaaS, gateway and metering containers."""
 import argparse
 import ipaddress
 from itertools import chain
@@ -21,6 +21,13 @@ def service_addresses(networks):
     if not subnet.is_private:
         raise ValueError('MaaS network must use a private IPv4 subnet')
     gateway = ipaddress.ip_address(subnet_data['gateway'])
+    # podman 5's network inspect lists attached containers with their
+    # interfaces; podman 4.9 omits the map entirely. The degradation is
+    # harmless: the preferred addresses selected below (and the migration's
+    # .13) sit above the bottom of the range where the dynamically attached
+    # database leases sequentially, so the selection stays collision-free
+    # on both versions — the map only preserves already-running units'
+    # addresses and guards against foreign containers on podman 5.
     containers = network.get('containers') or {}
     used = set()
     current = {}
@@ -56,6 +63,22 @@ def service_addresses(networks):
             raise ValueError('no free private addresses for MaaS, Praxis and PriceTag')
         selected[name] = address
         used.add(address)
+    # The one-shot schema-migration container joins the same network before
+    # the service units start. Give it a fixed address of its own, disjoint
+    # from every service address above, so its dynamic allocation can never
+    # take a preferred service address and a failed cleanup that leaves the
+    # container behind cannot collide with the static addresses the units
+    # claim afterwards.
+    preferred = ipaddress.ip_address(int(subnet.network_address) + 13)
+    hosts = subnet.hosts()
+    candidates = chain([preferred] if preferred in subnet else [],
+                       (candidate for candidate in hosts if candidate > preferred),
+                       (candidate for candidate in subnet.hosts() if candidate < preferred))
+    migration = next((candidate for candidate in candidates
+                      if candidate not in used and candidate != gateway), None)
+    if migration is None:
+        raise ValueError('no free private address for the MaaS schema migration')
+    selected['pricetag-migrate'] = migration
     return {name.removeprefix('pricetag-'): str(address) for name, address in selected.items()}
 
 
@@ -76,13 +99,6 @@ def configure_units(maas_path, gateway_path, metering_path, addresses):
     else:
         container = maas_lines.index('[Container]')
         maas_lines.insert(container + 1, entry)
-    indexes = [i for i, line in enumerate(maas_lines)
-               if line.startswith('Environment=MAAS_TRUSTED_PROXY_CIDRS=')]
-    if len(indexes) != 1:
-        raise ValueError('expected exactly one MaaS trusted-proxy setting')
-    maas_lines[indexes[0]] = ('Environment=MAAS_TRUSTED_PROXY_CIDRS=127.0.0.1/32,'
-                              + ','.join(str(parsed[name]) + '/32'
-                                         for name in ('maas', 'metering', 'gateway')))
     for lines, name, label in ((gateway_lines, 'gateway', 'gateway'),
                                (metering_lines, 'metering', 'metering')):
         networks = [i for i, line in enumerate(lines)

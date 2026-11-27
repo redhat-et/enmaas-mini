@@ -30,8 +30,6 @@ def pull_and_inspect(engine, image, revision, env, pull):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--engine', choices=('docker', 'podman'), default='docker')
-    parser.add_argument('--praxis-authfile', type=Path, default=None,
-                        help='registry credentials (config.json) for the private Praxis tenant image')
     args = parser.parse_args()
     # Load deployment dependencies only in the standalone CLI process. Unit
     # discovery also imports a test fixture named gateway in its own process.
@@ -41,10 +39,10 @@ def main():
     sys.path.insert(0, str(ROOT / 'scripts/pricetag'))
     from prepare import POSTGRES
 
-    # The Praxis tenant image lives in a private registry repository, so it
-    # cannot be part of the anonymous-pull evidence; CI verifies it with
-    # dedicated credentials via --praxis-authfile instead.
+    # Every installer image now lives in a public repository, so anonymous
+    # pull evidence covers the complete released set, Praxis included.
     images = (
+        ('Praxis', installer.PRAXIS_IMAGE, installer.PRAXIS_REVISION),
         ('MaaS', installer.PUBLISHED_MAAS_IMAGE, installer.MAAS_COMMIT),
         ('PriceTag', installer.PUBLISHED_METERING_IMAGE, installer.METERING_COMMIT),
         ('PostgreSQL', POSTGRES, None),
@@ -62,18 +60,6 @@ def main():
                 pull += ['--authfile', str(authfile)]
             pull_and_inspect(args.engine, image, revision, env, pull)
     print('PASS: all public installer images are anonymous-pullable linux/amd64 images with expected application revisions')
-    if args.praxis_authfile:
-        print(f'Checking private Praxis image: {installer.PRAXIS_IMAGE}', flush=True)
-        env = {**os.environ}
-        pull = [args.engine, 'pull', '--platform', 'linux/amd64']
-        if args.engine == 'podman':
-            pull += ['--authfile', str(args.praxis_authfile)]
-        else:
-            env['DOCKER_CONFIG'] = str(args.praxis_authfile.parent)
-        pull_and_inspect(args.engine, installer.PRAXIS_IMAGE, installer.PRAXIS_REVISION, env, pull)
-        print('PASS: Praxis tenant image verified with registry credentials')
-    else:
-        print('SKIP: private Praxis tenant image not verified (no --praxis-authfile)')
 
 
 if __name__ == '__main__':
