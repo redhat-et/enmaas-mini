@@ -78,7 +78,7 @@ def main():
     if args.command == 'list':
         result = request('POST', '/v1/api-keys/search', {'filters': {'status': ['active']}})
         for item in result.get('data') or []:
-            print(f"{item.get('id')}\t{item.get('name')}\t{item.get('status')}\t{item.get('expiresAt')}")
+            print(f"{item.get('id')}\t{item.get('name')}\t{item.get('status')}\t{item.get('expirationDate')}")
         return
     if args.command == 'revoke':
         request('DELETE', '/v1/api-keys/' + urllib.parse.quote(args.key_id, safe=''))

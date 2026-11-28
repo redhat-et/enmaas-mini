@@ -175,6 +175,10 @@ def external_application_url(url_text, ca_configured):
     config = validate_external_database_url(url_text, ca_required=False)
     query = list(config['query'])
     if ca_configured:
+        # Fixed in-container path: the generated MaaS quadlet and the one-shot
+        # migration container in scripts/pricetag/start both bind-mount the
+        # copied CA file at this exact location, so every consumer of the
+        # rendered URL (application and migration) resolves it.
         query.append(('sslrootcert', '/etc/pricetag-external-ca.crt'))
     host = f'[{config["host"]}]' if ':' in config['host'] else config['host']
     authority = (f'{quote(config["username"], safe="")}:{quote(config["password"], safe="")}'
@@ -221,6 +225,66 @@ def gateway_quadlet_body(image, provider_secrets, mount, mock_provider):
         + '\n'.join(provider_secrets) + '\n'
         + mount + 'Exec=-c /etc/praxis/gateway.json\n'
     )
+
+
+def praxis_image_source(praxis_image):
+    """Return the pinned Praxis image's org.opencontainers.image.source label.
+
+    The installer imports every application image into the service account
+    (stage 3, acquire_images) before prepare.py runs (stage 5), so the
+    inspected image is always local; a missing image fails loudly here
+    instead of producing an unbootable deployment later. import_image
+    copies into the praxis-svc store (rootful save | service-account
+    load) without removing the rootful original, and the imported ID
+    equals the rootful image's ID (identical content, content-addressed),
+    so this inspect — run by the installing root, like every other podman
+    call in this script — resolves in the rootful store whether it is
+    given the original pull reference or the imported ID that install.py
+    passes as --praxis-image.
+    """
+    return subprocess.run(['podman', 'image', 'inspect', praxis_image, '--format',
+                           '{{index .Labels "org.opencontainers.image.source"}}'],
+                          capture_output=True, text=True, check=True, timeout=30).stdout.strip()
+
+
+def praxis_family(praxis_image):
+    """Return the image's Praxis family, failing closed on unknown labels.
+
+    praxis-ai 0.7.4+ serves /healthy, /ready and /metrics on
+    admin.metrics_address and resolves X-Gateway-Model during the body
+    pre-read pass, while the older praxis-experimental images reject both
+    new keys at config parse. The pinned image's own source label decides,
+    so local sha256 IDs and repository overrides both work. An
+    unrecognized or missing label raises instead of silently selecting the
+    legacy configuration, which would drop the forged-header protection
+    from a praxis-ai-derived image.
+    """
+    source = praxis_image_source(praxis_image).rstrip('/')
+    if source.endswith('/praxis-ai'):
+        return 'praxis-ai'
+    if source.endswith('/experimental'):
+        return 'experimental'
+    raise ValueError('unrecognized Praxis image source label ' + (source or '<missing>') +
+                     '; supported families are praxis-ai and praxis-experimental')
+
+
+def praxis_metrics_address(family):
+    """Return the health/metrics listener for the family, if it needs a split one."""
+    return '127.0.0.1:9902' if family == 'praxis-ai' else None
+
+
+def praxis_body_authoritative(family):
+    """Return whether intelligent_route needs body_authoritative for the family.
+
+    praxis-ai resolves X-Gateway-Model during the body pre-read pass, before
+    request filters can strip a client-forged copy, so a spoofed routing
+    header would otherwise select (and 404) ahead of the body's model. The
+    fork's body_authoritative switch keeps inference selection on the body.
+    Older praxis-experimental images overwrite the header during model
+    promotion instead and reject the unknown intelligent_route key at config
+    parse, so the flag is injected only for praxis-ai images.
+    """
+    return family == 'praxis-ai'
 
 
 def main():
@@ -291,8 +355,11 @@ def main():
         original = json.loads(args.providers.read_text())
     if args.vllm_only:
         original, models = vllm_only(original, models)
+    family = praxis_family(args.praxis_image)
     config = render(original, models,
-                    list(dict.fromkeys([f'https://{args.hostname}:8443', 'https://localhost:8443'])))
+                    list(dict.fromkeys([f'https://{args.hostname}:8443', 'https://localhost:8443'])),
+                    metrics_address=praxis_metrics_address(family),
+                    body_authoritative=praxis_body_authoritative(family))
     sources = json.loads(args.price_sources.read_text())
     if not isinstance(sources, dict) or any(not isinstance(v, str) for v in sources.values()):
         parser.error('price-sources must map aliases to model names')
@@ -399,7 +466,55 @@ def main():
     (args.directory / 'm2m-secret').write_text(m2m_secret + '\n')
     maas_url = (maas_url if external_database else
                 f'postgres://maas:{maas_password}@pricetag-db:5432/maas?sslmode=disable')
-    (args.directory / 'maas-db-url').write_text(maas_url + '\n')
+    # enmaas-api reads its runtime contract from DATABASE_URL plus the policy
+    # knobs below; PORT pins the plain-HTTP listener the loopback health
+    # checks and the gateway's MAAS_VALIDATE_URL expect. It creates no
+    # tables at startup, so start runs the idempotent app.migrate before the
+    # service. Metrics stay disabled to keep the prior exposure posture
+    # (nothing scraped the loopback port).
+    # Trust is network-scoped and deliberately wider than the previous
+    # per-peer restriction: enmaas-api honors X-MaaS-Username/X-MaaS-Group
+    # from any peer and offers no trusted-proxy restriction (verified
+    # against its published source), so every container on
+    # pricetag-private — the PostgreSQL, the gateway, the metering and
+    # the one-shot migration, not just the secret-holding gateway and
+    # metering the Ladas image's MAAS_TRUSTED_PROXY_CIDRS admitted — is
+    # trusted to speak the identity headers. The private network is the
+    # boundary: it belongs to this deployment's service account (whose
+    # members can read maas.env directly, so a compromised peer
+    # presupposes that compromise), nothing else attaches to it, and the
+    # key-management API is reachable only there and on the host loopback
+    # (PublishPort=127.0.0.1:18086) — the gateway's 8443 is the sole
+    # externally exposed listener, so untrusted networks and public
+    # routes cannot reach it.
+    # Admin-group policy likewise moved off the MaaS: enmaas-api stores the
+    # X-MaaS-Group values pass-through (it only requires key creation to
+    # carry at least one group), and the metering — configured above with
+    # SUPERADMIN_USERS and the key-service headers — owns administrator
+    # authorization; maas-key's --admin-group default merely picks the
+    # group string that lands on the administrator key.
+    # DATABASE_URL can carry the external database credential, and
+    # enmaas-api reads it only from the environment (its published config
+    # has no *_FILE variant), so it lands in this env file — the same
+    # pattern the metering's own DATABASE_URL has always used. The
+    # recursive chown/chmod pass below gives the file 0640 root:praxis-svc,
+    # identical to the mode the previous image's maas-db-url secret file
+    # received on main: readable by root and by the service account whose
+    # user-manager reads EnvironmentFile (and which mounted that secret
+    # file before), and by no one else. The 0077 umask set at the top of
+    # main() means the file is born 0600 root:root inside a 0700 root:root
+    # tree — stricter than the final mode — and only widens to the service
+    # account in the same final pass that grants it the directory; the
+    # quadlet copy under /etc/containers/systemd/users never contains it.
+    # User=1001/UserNS=keep-id apply to the container process only:
+    # EnvironmentFile is read at start by the service account's manager
+    # and podman client (the group grant above is the only access the
+    # file ever needs), and the container-internal UID never opens host
+    # paths — with keep-id its host-side identity is the service account
+    # anyway.
+    env('maas.env', {'DATABASE_URL': maas_url, 'TENANT': 'models-as-a-service',
+                     'API_KEY_MAX_EXPIRATION_DAYS': '90', 'METRICS_ENABLED': 'false',
+                     'PORT': '8080'})
     (args.directory / 'sample-users').write_text('yes\n' if args.sample_users else 'no\n')
     (args.directory / 'admin-directory').write_text(str(args.admin_directory) + '\n')
     (args.directory / 'management-secret').write_text(management_secret + '\n')
@@ -440,14 +555,8 @@ def main():
         f'Image={args.maas_image}\nPull=never\nNetworkAlias=pricetag-maas\n'
         'IP=10.77.0.10\n'
         'PublishPort=127.0.0.1:18086:8080\n'
-        f'Volume={args.directory}/maas-db-url:/run/secrets/maas-db-url:ro\n'
-        + external_ca_mount +
-        'Environment=MAAS_RUNTIME_MODE=standalone\nEnvironment=MAAS_SUBSCRIPTION_MODE=standalone\n'
-        'Environment=ADDRESS=:8080\nEnvironment=SECURE=false\n'
-        'Environment=DB_CONNECTION_URL_FILE=/run/secrets/maas-db-url\n'
-        'Environment=API_KEY_MAX_EXPIRATION_DAYS=90\nEnvironment=MAAS_ADMIN_GROUPS=single-server-admin\n'
-        'Environment=MAAS_TRUSTED_PROXY_CIDRS=127.0.0.1/32,10.77.0.10/32,10.77.0.11/32,10.77.0.12/32\n'
-        'Environment=METRICS_SECURE=false\nEnvironment=METRICS_ADDRESS=127.0.0.1:9090\n' + app, '1G')
+        f'EnvironmentFile={args.directory}/maas.env\n'
+        + external_ca_mount + app, '1G')
     container('pricetag-metering', 'PriceTag metering and dashboards', application_dependency,
         f'Image={args.metering_image}\nPull=never\nNetworkAlias=pricetag-metering\n'
         f'EnvironmentFile={args.directory}/metering.env\nPublishPort=127.0.0.1:18087:8080\n'

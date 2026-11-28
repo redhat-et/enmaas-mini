@@ -42,17 +42,35 @@ assert 'prepare' not in sys.modules
     def test_publisher_and_installer_use_the_same_repositories_and_pinned_sources(self):
         workflow = yaml.safe_load((ROOT / '.github/workflows/pricetag-images.yml').read_text())
         job = workflow['jobs']['build-test-publish']
-        for component in ('MAAS', 'METERING'):
-            image = getattr(installer, 'PUBLISHED_' + component + '_IMAGE')
-            self.assertEqual(image.split('@')[0], job['env'][component + '_IMAGE'])
-            # Publication must precede switching the installer to the new digest.
-            # These pins can differ; published-images.py verifies the installer's
-            # digest against its own source revision, not the next build target.
-            self.assertRegex(getattr(installer, component + '_COMMIT'), r'^[0-9a-f]{40}$')
-            self.assertRegex(job['env'][component + '_REVISION'], r'^[0-9a-f]{40}$')
-            self.assertRegex(image, r'@sha256:[0-9a-f]{64}$')
-            self.assertIn(image, (ROOT / 'docs/quickstarts/remote-gateway-pricetag/manual.md').read_text())
-        publish = next(step for step in job['steps'] if step.get('name') == 'Publish tested images')
+        # This repository builds and publishes only the metering image; MaaS
+        # is published by the external enmaas-api pipeline, and the workflow
+        # pulls it straight from the installer's pin at run time.
+        image = installer.PUBLISHED_METERING_IMAGE
+        self.assertEqual(image.split('@')[0], job['env']['METERING_IMAGE'])
+        # Publication must precede switching the installer to the new digest.
+        # These pins can differ; published-images.py verifies the installer's
+        # digest against its own source revision, not the next build target.
+        self.assertRegex(installer.METERING_COMMIT, r'^[0-9a-f]{40}$')
+        self.assertRegex(job['env']['METERING_REVISION'], r'^[0-9a-f]{40}$')
+        self.assertRegex(image, r'@sha256:[0-9a-f]{64}$')
+        self.assertIn(image, (ROOT / 'docs/quickstarts/remote-gateway-pricetag/manual.md').read_text())
+        # The external MaaS image must still be a digest pin documented in the
+        # manual and exercised by the workflow's component test.
+        self.assertRegex(installer.PUBLISHED_MAAS_IMAGE, r'@sha256:[0-9a-f]{64}$')
+        self.assertIn(installer.PUBLISHED_MAAS_IMAGE,
+                      (ROOT / 'docs/quickstarts/remote-gateway-pricetag/manual.md').read_text())
+        self.assertNotIn('MAAS_IMAGE', job['env'])
+        test_step = next(step for step in job['steps'] if 'component-images.py' in str(step))
+        # The workflow pins the digest visibly, compares it textually with
+        # the installer constant, and runs the component test on exactly
+        # that reference — no repository Python is imported to check the pin.
+        # Assert on the raw run block: the dict repr escapes the quotes the
+        # textual comparison is required to carry.
+        run_block = test_step['run']
+        self.assertIn(installer.PUBLISHED_MAAS_IMAGE, run_block)
+        self.assertIn("grep -qF \"PUBLISHED_MAAS_IMAGE = '$maas'\"", run_block)
+        self.assertIn('--maas-image "$maas"', run_block)
+        publish = next(step for step in job['steps'] if step.get('name') == 'Publish tested metering image')
         for condition in (job['environment'], publish['if']):
             self.assertIn("github.repository == 'redhat-et/enmaas-mini'", condition)
             self.assertIn("github.ref == 'refs/heads/main'", condition)

@@ -35,13 +35,18 @@ def inference_guards(api):
     return filters
 
 
-def render(original, models, origins=None):
+def render(original, models, origins=None, metrics_address=None, body_authoritative=False):
     models = validate(models)
     public_catalog = catalog(models, 'openai')
     for entry, model in zip(public_catalog['data'], models):
         entry['praxis']['apis'] = model['apis']
     result = unified(original, models, intelligent_routing=True)
     result['admin'] = {'address': '127.0.0.1:9901'}
+    if metrics_address:
+        # Praxis 0.7.4+ serves /healthy, /ready and /metrics on a dedicated
+        # admin.metrics_address listener; older images reject the key at
+        # config parse, so callers add it only for praxis-ai images.
+        result['admin']['metrics_address'] = metrics_address
     result['insecure_options'] = {'allow_private_endpoints': True, 'allow_private_upstreams': True}
     result['listeners'] = [
         {'name': 'https', 'address': '0.0.0.0:8443', 'filter_chains': ['edge'],
@@ -84,6 +89,14 @@ def render(original, models, origins=None):
                     'model_policy_check': True,
                     'identity_header_prefix': 'x-tenant-', 'feature_key': 'inference-tokens'})
                 break
+        if body_authoritative:
+            # praxis-ai resolves X-Gateway-Model during the body pre-read
+            # pass, before request filters can strip a client-forged copy;
+            # body_authoritative keeps the body model the only routing
+            # input on those images. See praxis_body_authoritative().
+            for item in filters:
+                if item['filter'] == 'intelligent_route':
+                    item['body_authoritative'] = True
         if request_headers is not None and selected:
             load_balancer = next((i for i, item in enumerate(filters)
                                   if item['filter'] == 'load_balancer'), len(filters))

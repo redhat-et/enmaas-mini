@@ -53,7 +53,6 @@ def main():
     podman('network', 'create', prefix)
     try:
         network = json.loads(podman('network', 'inspect', prefix))[0]
-        gateway = network['subnets'][0]['gateway']
         with tempfile.TemporaryDirectory(prefix='pricetag-image-test-') as directory:
             root = Path(directory)
             # Synthetic credentials only; nothing is published beyond loopback.
@@ -61,8 +60,12 @@ def main():
             pg_env = root / 'postgres.env'
             pg_env.write_text('POSTGRES_PASSWORD=' + password + '\n')
             pg_env.chmod(0o600)
+            # The image account creates its own 0700 PGDATA below a writable
+            # tmpfs (root-owned on podman 5), so no chown of the mount is
+            # needed; 1 GiB holds bootstrap databases plus WAL.
             podman('run', '-d', '--name', db, '--network', prefix, '--network-alias', 'db',
-                   '--env-file', pg_env, '--tmpfs', '/var/lib/postgresql/data', POSTGRES)
+                   '--env-file', pg_env, '--tmpfs', '/var/lib/postgresql/data:rw,size=1g,mode=1777',
+                   '-e', 'PGDATA=/var/lib/postgresql/data/pgdata', POSTGRES)
             for _ in range(90):
                 if subprocess.run(['podman', 'exec', db, 'pg_isready', '-U', 'postgres'],
                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
@@ -72,22 +75,46 @@ def main():
                 raise RuntimeError('PostgreSQL did not become ready')
             for database in ('maas', 'metering'):
                 podman('exec', db, 'createdb', '-U', 'postgres', database)
-            dsn = root / 'maas-dsn'
-            dsn.write_text(f'postgres://postgres:{password}@db:5432/maas?sslmode=disable\n')
-            # Only this file is mounted; the host's temporary directory stays
-            # private while container UID 1001 can read the synthetic DSN.
-            dsn.chmod(0o644)
+            maas_env = root / 'maas.env'
+            # Synthetic credentials only; the env file is read client-side by
+            # podman, so it never needs to be readable inside a container.
+            maas_env.write_text(f'DATABASE_URL=postgres://postgres:{password}@db:5432/maas?sslmode=disable\n'
+                                'TENANT=models-as-a-service\nAPI_KEY_MAX_EXPIRATION_DAYS=90\n'
+                                'METRICS_ENABLED=false\nPORT=8080\n')
+            maas_env.chmod(0o600)
             common = ['--network', prefix, '--read-only', '--cap-drop', 'all',
                       '--security-opt', 'no-new-privileges', '--user', '1001:1001',
                       '-p', '127.0.0.1::8080']
+            # enmaas-api creates no tables at runtime: run its idempotent
+            # migration before the API, exactly as scripts/pricetag/start does.
+            # The hardened read-only rootfs is sufficient: app.migrate only
+            # executes DDL over the database connection; PYTHONDONTWRITEBYTECODE=1
+            # makes that no-writes contract explicit instead of relying on
+            # CPython silently skipping __pycache__ writes it cannot make on
+            # the read-only rootfs, and no writable mount (not even /tmp) is
+            # provided deliberately — the API container below runs with the
+            # same read-only rootfs and needs none either, so a migration
+            # that suddenly required one would fail loudly here instead of
+            # passing unnoticed. DATABASE_URL's `db` host
+            # resolves through the database container's --network-alias db
+            # above; the one-shot needs no alias of its own because name
+            # resolution is network-wide. The image starts the API via CMD
+            # (no ENTRYPOINT), so the migration is a plain command override
+            # from the pinned /srv/enmaas-api workdir, and maas_env is the
+            # image's complete runtime contract — the MAAS_RUNTIME_MODE-style
+            # flags previously passed here belonged to the retired Ladas
+            # image. The plain-HTTP /health readiness below asserts the
+            # standalone binding. Unlike scripts/pricetag/start, no fixed
+            # address is needed here: this run creates a fresh throwaway
+            # network, every container on it allocates dynamically, and the
+            # one-shot completes before the API container starts, so there
+            # is no static service address it could collide with.
+            podman('run', '--rm', '--network', prefix, '--read-only', '--cap-drop', 'all',
+                   '--security-opt', 'no-new-privileges', '--user', '1001:1001',
+                   '--workdir', '/srv/enmaas-api', '-e', 'PYTHONDONTWRITEBYTECODE=1',
+                   '--env-file', maas_env, args.maas_image, 'python', '-m', 'app.migrate')
             podman('run', '-d', '--name', maas, *common, '--network-alias', 'maas',
-                   '-v', str(dsn) + ':/run/secrets/db-url:ro,Z',
-                   '-e', 'MAAS_RUNTIME_MODE=standalone', '-e', 'MAAS_SUBSCRIPTION_MODE=standalone',
-                   '-e', 'ADDRESS=:8080', '-e', 'SECURE=false',
-                   '-e', 'DB_CONNECTION_URL_FILE=/run/secrets/db-url',
-                   '-e', 'MAAS_ADMIN_GROUPS=single-server-admin',
-                   '-e', 'MAAS_TRUSTED_PROXY_CIDRS=127.0.0.1/32,' + gateway + '/32',
-                   '-e', 'METRICS_SECURE=false', '-e', 'METRICS_ADDRESS=127.0.0.1:9090', args.maas_image)
+                   '--env-file', maas_env, args.maas_image)
             maas_url = 'http://' + podman('port', maas, '8080/tcp')
             ready(maas_url + '/health')
             env = root / 'metering.env'
@@ -101,7 +128,8 @@ def main():
             ready(metering_url + '/ready')
             if status(metering_url + '/api/v1/events', b'{}') != 401:
                 raise RuntimeError('Metering accepted a request without machine credentials')
-            # Both services migrated their own empty database without Kubernetes.
+            # Metering migrates itself at startup; the MaaS migration ran
+            # explicitly above, without Kubernetes.
             for database in ('maas', 'metering'):
                 count = podman('exec', db, 'psql', '-U', 'postgres', '-d', database, '-Atc',
                                "SELECT count(*) FROM information_schema.tables WHERE table_schema='public'")

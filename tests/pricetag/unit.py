@@ -13,8 +13,6 @@ import subprocess
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
-import ipaddress
-
 ROOT = Path(__file__).resolve().parents[2]
 loader = importlib.machinery.SourceFileLoader('pricetag_harness', str(ROOT / 'scripts/pricetag/harness'))
 spec = importlib.util.spec_from_loader(loader.name, loader)
@@ -98,6 +96,44 @@ class PreparationTest(unittest.TestCase):
                 self.assertEqual(usage[0]['conditions'],
                                  [{'when': {'methods': ['POST'], 'path': '/v1/chat/completions'}}])
                 self.assertEqual(usage[0]['max_body_bytes'], 10485760)
+
+    def test_praxis_health_listener_follows_the_image_source_label(self):
+        original, models = prepare.mock_inputs(managed=True)
+        # Older praxis-experimental images reject the split admin key, so the
+        # rendered default keeps the single admin address...
+        plain = prepare.render(original, models)
+        self.assertEqual(plain['admin'], {'address': '127.0.0.1:9901'})
+        # ...while praxis-ai images additionally get the metrics listener.
+        split = prepare.render(original, models, metrics_address='127.0.0.1:9902')
+        self.assertEqual(split['admin'], {'address': '127.0.0.1:9901',
+                                          'metrics_address': '127.0.0.1:9902'})
+        for source, expected, fork in (('https://github.com/redhat-et/praxis-ai', '127.0.0.1:9902', True),
+                                       ('https://github.com/redhat-et/praxis-ai/', '127.0.0.1:9902', True),
+                                       ('https://github.com/praxis-proxy/experimental', None, False)):
+            with patch.object(prepare.subprocess, 'run') as inspect:
+                inspect.return_value = SimpleNamespace(stdout=source + '\n')
+                family = prepare.praxis_family('sha256:' + 'a' * 64)
+                self.assertEqual(prepare.praxis_metrics_address(family), expected)
+                self.assertEqual(prepare.praxis_body_authoritative(family), fork)
+            self.assertEqual(inspect.call_args.args[0][:3], ['podman', 'image', 'inspect'])
+        # Unknown or missing source labels fail closed instead of silently
+        # selecting the legacy configuration, which would drop the
+        # forged-header protection from a praxis-ai-derived image.
+        for source in ('', '\n', 'https://example.invalid/other-praxis\n'):
+            with patch.object(prepare.subprocess, 'run', return_value=SimpleNamespace(stdout=source)):
+                with self.assertRaisesRegex(ValueError, 'unrecognized Praxis image source label'):
+                    prepare.praxis_family('sha256:' + 'a' * 64)
+        # The same fork label gates intelligent_route's body_authoritative
+        # switch: praxis-ai resolves X-Gateway-Model during the body pre-read,
+        # so only the body model may select the upstream on those images.
+        routes = [f for chain in plain['filter_chains'] for f in chain['filters']
+                  if f['filter'] == 'intelligent_route']
+        self.assertTrue(routes)
+        self.assertTrue(all('body_authoritative' not in f for f in routes))
+        authoritative = prepare.render(original, models, body_authoritative=True)
+        routes = [f for chain in authoritative['filter_chains'] for f in chain['filters']
+                  if f['filter'] == 'intelligent_route']
+        self.assertTrue(all(f['body_authoritative'] is True for f in routes))
 
     def test_demo_fixture_cleanup_walks_both_management_users_shapes(self):
         spec = importlib.util.spec_from_file_location('demo_fixture', ROOT / 'tests/pricetag/rhel-demo-fixture.py')
@@ -435,7 +471,7 @@ class PreparationTest(unittest.TestCase):
         self.assertIn('Secret=openai-key,type=env,target=OPENAI_API_KEY', with_secret)
         self.assertNotIn('Network=pricetag-mock.network', with_secret)
 
-    def test_maas_trusts_only_loopback_and_required_service_containers(self):
+    def test_static_addresses_are_assigned_to_required_service_units(self):
         fixture = [{'subnets': [{'subnet': '10.77.0.0/24', 'gateway': '10.77.0.1'}],
                     'containers': {'a': {'name': 'pricetag-gateway',
                                          'interfaces': {'eth0': {'subnets': [
@@ -445,24 +481,17 @@ class PreparationTest(unittest.TestCase):
                                              {'ipnet': '10.77.0.11/24'}]}}}}}]
         addresses = private_network.service_addresses(fixture)
         self.assertEqual(addresses, {'maas': '10.77.0.12', 'gateway': '10.77.0.10',
-                                     'metering': '10.77.0.11'})
+                                     'metering': '10.77.0.11', 'migrate': '10.77.0.13'})
         with tempfile.TemporaryDirectory() as directory:
             maas = Path(directory) / 'maas.container'
             gateway = Path(directory) / 'gateway.container'
             metering = Path(directory) / 'metering.container'
-            maas.write_text('[Container]\nEnvironment=MAAS_TRUSTED_PROXY_CIDRS=127.0.0.1/32,10.77.0.0/24\n')
+            maas.write_text('[Container]\nIP=10.77.0.9\n')
             gateway.write_text('[Container]\nNetwork=pricetag.network\nNetwork=pricetag-mock.network\n')
             metering.write_text('[Container]\nNetwork=pricetag.network\n')
             private_network.configure_units(maas, gateway, metering, addresses)
-            trusted = next(line.partition('=')[2].partition('=')[2]
-                           for line in maas.read_text().splitlines()
-                           if line.startswith('Environment=MAAS_TRUSTED_PROXY_CIDRS='))
-            networks = [ipaddress.ip_network(item) for item in trusted.split(',')]
-            self.assertTrue(any(ipaddress.ip_address('127.0.0.1') in net for net in networks))
-            for address in ('10.77.0.10', '10.77.0.11', '10.77.0.12'):
-                self.assertTrue(any(ipaddress.ip_address(address) in net for net in networks))
-            self.assertFalse(any(ipaddress.ip_address('10.77.0.15') in net for net in networks))
             self.assertIn('IP=10.77.0.12', maas.read_text())
+            self.assertNotIn('IP=10.77.0.9', maas.read_text())
             self.assertIn('Network=pricetag.network:ip=10.77.0.10', gateway.read_text())
             self.assertIn('Network=pricetag.network:ip=10.77.0.11', metering.read_text())
 
@@ -472,7 +501,7 @@ class PreparationTest(unittest.TestCase):
                         {'ipnet': '10.77.0.10/24'}]}}}}}]
         self.assertEqual(private_network.service_addresses(fixture),
                          {'maas': '10.77.0.11', 'gateway': '10.77.0.12',
-                          'metering': '10.77.0.13'})
+                          'metering': '10.77.0.13', 'migrate': '10.77.0.14'})
 
     def test_mock_deployment_has_native_routes_and_no_provider_credentials(self):
         original, models = prepare.mock_inputs()

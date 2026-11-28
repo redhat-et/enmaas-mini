@@ -16,9 +16,9 @@ SSH/8443 from your IP; Git, Python 3 and OpenCode on your workstation.
 The tested VM has 8 vCPUs, 32 GiB RAM and 150 GiB disk. No GPU is needed.
 
 > The default published images include the administration, user-key, quota and
-> pricing controls described below. To test newer source, choose **Build latest
-> demo branches** or add `--image-mode source`; see [image options](images.md).
-> The optional provider editor is not included.
+> pricing controls described below. To test a newer metering source, choose
+> **Build from the latest metering branch** or add `--image-mode source`;
+> see [image options](images.md). The optional provider editor is not included.
 
 ## 1. Set the connection
 
@@ -86,7 +86,7 @@ whose personal-key page is **My keys** (`/management`). The candidate uses
 | `--no-sample-users` | Create admin only; onboard users in Administration → Users. |
 | `--monthly-usd 10` | Set the default per-user monthly allowance. |
 | `--non-interactive --yes` | Disable prompts, including when SSH allocates a terminal; see [headless installation](headless.md). |
-| `--image-mode source` | Build application images; see [image options](images.md). |
+| `--image-mode source` | Build the PriceTag metering image from source (MaaS stays published); see [image options](images.md). |
 | `--mode mock` | Use synthetic providers for [benchmarks](../../testing/pricetag-perf.md). |
 | `--maas-database-url-file PATH` | Use an existing external MaaS database; see [external PostgreSQL](external-database.md). |
 | `--metering-database-url-file PATH` | Use an existing external metering database; both database flags are required together. |
